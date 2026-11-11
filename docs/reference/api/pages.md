@@ -22,7 +22,7 @@ import type { ErrorPageProps, PageError } from 'void/pages';
 
 All four adapters support typed URLs through [`routeUrl()`](./types.md#routeurl-path-options). Pass the returned string to `Link`'s `href`, which has the type [`Href`](./types.md#route-types).
 
-Public `useRouter()` returns a GET-only router: `visit()`, `refresh()`, and `prefetch()` return `Promise<void>`, while mutations use `action()` or `useForm()`. Internal action payloads and prefetch data are not exposed through the public router.
+Public `useRouter()` returns a GET-only router: `visit()`, `refresh()`, and `prefetch()` return `Promise<void>`, while mutations use `action()` or `useForm()`. Internal action payloads and prefetch data are not exposed through the public router. Options outside each public method's documented contract are ignored at runtime.
 
 The router's `visit(destination, options?)`, `prefetch(destination, options?)`, and `flush(destination)` accept [`RouteUrlInput`](./types.md#route-types): a string, `URL`, or typed destination object.
 

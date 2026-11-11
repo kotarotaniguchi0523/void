@@ -168,6 +168,8 @@ export type PageNavigationEngine = {
   prepareVisit(url: string, options?: VisitOptions): PageNavigationResource;
   visit(url: string, options: VisitOptions, apply: ApplyVisit): Promise<PageData | undefined>;
   setBrowserVisitHandler(handler: ApplyVisit | null): void;
+  /** Called after a renderer commit identifies the resources still in its tree. */
+  releaseRetiredResources(retainedIds: ReadonlySet<number>): void;
   prefetch(url: string, options?: PrefetchOptions): Promise<unknown>;
   flush(url: string): void;
   flushAll(): void;
@@ -1471,6 +1473,15 @@ export async function createPageNavigationEngine(
       return finished;
     },
 
+    releaseRetiredResources(retainedIds) {
+      for (const resource of retiredResources) {
+        if (!retainedIds.has(resource.id) && resource !== _pendingResource) {
+          retiredResources.delete(resource);
+          resource.dispose();
+        }
+      }
+    },
+
     setBrowserVisitHandler(handler) {
       browserVisitHandler = handler;
     },
@@ -1752,6 +1763,11 @@ export async function createPageNavigationEngine(
           event.signal.removeEventListener('abort', cancel);
           cancel();
           abortPendingResource(resource);
+          if (!own && !event.signal.aborted && !isAbortError(error)) {
+            // A native link still has its document response as a recovery path.
+            window.location.href = resource.destination();
+            return;
+          }
           if (!event.signal.aborted) {
             recoverUnrenderedEntry(resource.id);
           }

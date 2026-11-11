@@ -19,7 +19,7 @@ import {
   defineSharedIslandTests,
 } from '../../../../test/pages-island-contract.ts';
 import { PAGES_PROTOCOL_VERSION } from '../../../edge/src/pages-protocol.ts';
-import { decodePageData, deserializePageData } from '../../../void/src/pages/serialize.ts';
+import { decodePageData, deserializePageData, serializePageData } from '../../../void/src/pages/serialize.ts';
 
 declare global {
   interface Window {
@@ -411,6 +411,58 @@ function defineTransitionAwaitTests(getBase: () => string) {
         }
       },
     );
+  });
+  it('releases an uncommitted deferred Action after a failed successor leaves its render tree', async () => {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    try {
+      await page.goto(getBase() + '/transition-await');
+      await page.waitForSelector('#app[data-hydrated="true"]');
+      const payload = serializePageData({
+        component: 'transition-await', url: '/transition-await',
+        props: { revision: 'updated', waiting: null }, deferredKeys: { waiting: 'waiting' },
+      }) + '\n';
+      await page.evaluate((line) => {
+        const originalFetch = window.fetch;
+        window.fetch = (input, options) => {
+          if (String(input).includes('/transition-await?ping') && options?.method === 'POST') {
+            const stream = new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode(line));
+                document.body.dataset.deferredStream = 'reading';
+                // Model the fetch body's abort contract while keeping the reader pending.
+                options.signal!.addEventListener('abort', () => {
+                  document.body.dataset.deferredStream = 'aborted';
+                  controller.error(new DOMException('Navigation aborted', 'AbortError'));
+                }, { once: true });
+              },
+            });
+            return Promise.resolve(new Response(stream, {
+              headers: { 'content-type': 'application/x-ndjson', 'x-voidpages': 'true' },
+            }));
+          }
+          return originalFetch(input, options);
+        };
+      }, payload);
+      await page.route('**/users/1?retire-error=1', (route) =>
+        route.fulfill({ headers: { 'x-voidpages': 'true' }, body: '{' }),
+      );
+      await page.getByTestId('async-contract').click();
+      await page.waitForFunction(() => document.querySelector('[data-testid="data-ready"]')?.textContent === 'ready');
+      expect(await page.getByTestId('revision').textContent()).toBe('initial');
+      expect(await page.locator('body').getAttribute('data-deferred-stream')).toBe('reading');
+      await page.getByTestId('reject-next-navigation').click();
+      await page.waitForFunction(() => document.querySelector('[data-testid="navigation-failed"]')?.textContent === 'failed');
+      await page.waitForSelector('body[data-deferred-stream="aborted"]', { timeout: 5000 });
+      expect(page.url()).toBe(getBase() + '/transition-await');
+      expect(await page.getByTestId('revision').textContent()).toBe('initial');
+      await page.evaluate(() => {
+        window.dispatchEvent(new Event('finish-action'));
+        window.dispatchEvent(new Event('finish-render'));
+      });
+    } finally {
+      await context.close();
+    }
   });
 }
 
@@ -861,52 +913,52 @@ function registerClientTests(getBase: () => string, coverage: 'smoke' | 'full') 
     );
   }
 
-  for (const link of ['onclick-link', 'replace-link']) {
-    it(`${link} keeps the current page when precommit rejects`, async () => {
-      const page = await newPage();
+  it('explicit replace keeps the current page when precommit rejects', async () => {
+    const link = 'replace-link';
+    const page = await newPage();
 
-      try {
-        await page.goto(BASE + '/link-behavior');
-        await waitForHydration(page);
-        const heading = await page.textContent('h1');
-        const entry = await page.evaluate(() => {
-          navigation.addEventListener(
-            'navigateerror',
-            () => {
-              document.body.setAttribute('data-precommit-rejected', '');
-            },
-            { once: true },
-          );
-          return navigation.currentEntry?.key;
-        });
-        await page.route(
-          '**/users',
-          (route) =>
-            route.fulfill({
-              status: 200,
-              headers: { 'X-VoidPages': 'true', 'Content-Type': 'application/json' },
-              body: 'invalid JSON',
-            }),
-          { times: 1 },
+    try {
+      await page.goto(BASE + '/link-behavior');
+      await waitForHydration(page);
+      const heading = await page.textContent('h1');
+      const entry = await page.evaluate(() => {
+        navigation.addEventListener(
+          'navigateerror',
+          () => {
+            document.body.setAttribute('data-precommit-rejected', '');
+          },
+          { once: true },
         );
+        return navigation.currentEntry?.key;
+      });
+      await page.route(
+        '**/users',
+        (route) =>
+          route.fulfill({
+            status: 200,
+            headers: { 'X-VoidPages': 'true', 'Content-Type': 'application/json' },
+            body: 'invalid JSON',
+          }),
+        { times: 1 },
+      );
 
-        await page.getByTestId(link).click();
-        await page.waitForSelector('body[data-precommit-rejected]');
-        expect(await page.evaluate(() => navigation.currentEntry?.key)).toBe(entry);
-        await waitForIdle(page);
-        expect(await page.textContent('h1')).toBe(heading);
-        expect(page.url()).toBe(BASE + '/link-behavior');
+      await page.getByTestId(link).click();
+      await page.waitForSelector('body[data-precommit-rejected]');
+      expect(await page.evaluate(() => navigation.currentEntry?.key)).toBe(entry);
+      await waitForIdle(page);
+      expect(await page.textContent('h1')).toBe(heading);
+      expect(page.url()).toBe(BASE + '/link-behavior');
 
-        await page.click(`[data-testid="${link}"]`);
-        await page.waitForURL(BASE + '/users');
-        await page.waitForFunction(() =>
-          document.querySelector('h1')?.textContent?.includes('Users'),
-        );
-      } finally {
-        await page.context().close();
-      }
-    });
-  }
+      await page.click(`[data-testid="${link}"]`);
+      await page.waitForURL(BASE + '/users');
+      await page.waitForFunction(() =>
+        document.querySelector('h1')?.textContent?.includes('Users'),
+      );
+    } finally {
+      await page.context().close();
+    }
+  });
+
 }
 
 describe('react-pages client (dev)', () => {
