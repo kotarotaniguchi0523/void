@@ -967,6 +967,62 @@ export function registerSharedClientTests({
       await page.context().close();
     }
   });
+  it('releases scroll positions when a new visit discards forward history', async ({ expect }) => {
+    const page = await newPage();
+    try {
+      await page.goto(BASE + '/');
+      await waitForHydration(page);
+      const initial = await page.evaluate(() => navigation.currentEntry!.key);
+      await page.click('a[href="/users"]');
+      await page.getByRole('heading', { name: 'Users' }).waitFor();
+      const discarded = await page.evaluate(() => navigation.currentEntry!.key);
+      await page.goBack();
+      await page.getByRole('heading', { name: 'Welcome' }).waitFor();
+      expect(
+        await page.evaluate((key) => sessionStorage.getItem('void:scroll:' + key), discarded),
+      ).not.toBeNull();
+      await page.click('a[href="/users"]');
+      await page.getByRole('heading', { name: 'Users' }).waitFor();
+      await expect
+        .poll(() => page.evaluate((key) => sessionStorage.getItem('void:scroll:' + key), discarded))
+        .toBeNull();
+      expect(
+        await page.evaluate((key) => sessionStorage.getItem('void:scroll:' + key), initial),
+      ).not.toBeNull();
+    } finally {
+      await page.context().close();
+    }
+  });
+
+  for (const id of ['日本語', 'bad� value%']) {
+    it(`scrolls to the encoded ID ${id} after cross-page rendering`, async ({ expect }) => {
+      const page = await newPage();
+      try {
+        await page.goto(BASE + '/');
+        await waitForHydration(page);
+        await page.evaluate((id) => {
+          const target = document.createElement('div');
+          target.id = id;
+          target.textContent = 'Fragment target';
+          target.style.cssText = 'margin-top: 1800px; height: 1200px';
+          document.body.appendChild(target);
+          const anchor = document.createElement('a');
+          anchor.href = '/users#' + (id.startsWith('bad') ? 'bad%FF%20value%' : encodeURIComponent(id));
+          document.body.appendChild(anchor);
+          anchor.click();
+          anchor.remove();
+        }, id);
+        await page.getByRole('heading', { name: 'Users' }).waitFor();
+        await expect
+          .poll(() => page.evaluate((id) => document.getElementById(id)!.getBoundingClientRect().top, id))
+          .toBeCloseTo(0, 0);
+        expect(await page.evaluate(() => window.scrollY)).toBeGreaterThan(1000);
+      } finally {
+        await page.context().close();
+      }
+    });
+  }
+
   if (coverage === 'smoke') {
     return;
   }

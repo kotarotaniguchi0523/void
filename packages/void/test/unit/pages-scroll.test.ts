@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 import { createPageNavigationEngine } from '../../src/pages/navigation-engine.ts';
 import { parseCacheFor } from '../../src/pages/prefetch.ts';
+import { createScrollRestoration } from '../../src/pages/scroll-restoration.ts';
 
 async function setup(key = 'initial-entry', storage = new Map<string, string>()) {
+  const makeEntry = (key: string, url = 'http://localhost/') =>
+    Object.assign(new EventTarget(), { key, url, getState: () => undefined });
   const frames: Array<FrameRequestCallback> = [];
   const windowStub = Object.assign(new EventTarget(), {
     location: { origin: 'http://localhost', pathname: '/', search: '', hash: '' },
@@ -16,15 +19,17 @@ async function setup(key = 'initial-entry', storage = new Map<string, string>())
   });
   let nextKey = 0;
   const navigation = Object.assign(windowStub.navigation, {
-    currentEntry: { key, url: 'http://localhost/', getState: () => undefined },
+    currentEntry: makeEntry(key),
+    entries: () => [navigation.currentEntry],
     navigate: vi.fn((url: string, options: NavigationNavigateOptions) => {
       const committed = Promise.resolve().then(() => {
         const target = new URL(url, windowStub.location.origin);
-        navigation.currentEntry = {
-          key: options.history === 'replace' ? navigation.currentEntry.key : `entry-${++nextKey}`,
-          url: target.href,
-          getState: () => undefined,
-        };
+        const from = navigation.currentEntry;
+        navigation.currentEntry =
+          options.history === 'replace'
+            ? Object.assign(from, { url: target.href })
+            : makeEntry(`entry-${++nextKey}`, target.href);
+        navigation.dispatchEvent(new Event('currententrychange'));
         Object.assign(windowStub.location, {
           pathname: target.pathname,
           search: target.search,
@@ -36,12 +41,9 @@ async function setup(key = 'initial-entry', storage = new Map<string, string>())
     }),
   });
   const historyStub = { scrollRestoration: 'auto' };
-  function changeEntry(
-    entry: Omit<typeof navigation.currentEntry, 'getState'>,
-    navigationType = 'traverse',
-  ) {
+  function changeEntry(entry: { key: string; url: string }, navigationType = 'traverse') {
     const from = navigation.currentEntry;
-    navigation.currentEntry = { ...entry, getState: () => undefined };
+    navigation.currentEntry = makeEntry(entry.key, entry.url);
     windowStub.location.hash = new URL(entry.url).hash;
     navigation.dispatchEvent(
       Object.assign(new Event('currententrychange'), {
@@ -55,6 +57,7 @@ async function setup(key = 'initial-entry', storage = new Map<string, string>())
   vi.stubGlobal('sessionStorage', {
     getItem: (key: string) => storage.get(key) ?? null,
     setItem: (key: string, value: string) => storage.set(key, value),
+    removeItem: (key: string) => storage.delete(key),
   });
   vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => frames.push(callback));
   vi.stubGlobal('document', {
@@ -113,12 +116,102 @@ afterEach(() => {
 });
 
 describe('Pages scroll restoration', () => {
+  it('removes disposed entries from memory and storage without touching retained history', async () => {
+    const page = await setup();
+    const initial = page.navigation.currentEntry;
+    const forward = Object.assign(new EventTarget(), { key: 'forward' });
+    const hidden = 'void:scroll:cross-origin-gap';
+    page.storage.set(hidden, '{"x":0,"y":30}');
+    page.navigation.entries = () => [initial, forward] as Array<typeof initial>;
+    const scroll = createScrollRestoration();
+    scroll.start();
+    scroll.commit(initial.key);
+    page.window.scrollY = 120;
+    scroll.save();
+    scroll.commit(forward.key);
+    page.window.scrollY = 640;
+    scroll.save();
+    forward.dispatchEvent(new Event('dispose'));
+    scroll.save(); // pagehide must not recreate the disposed rendered entry.
+    expect(scroll.read(forward.key)).toBeNull();
+    expect(page.storage.has('void:scroll:forward')).toBe(false);
+    expect(scroll.read(initial.key)).toEqual({ x: 0, y: 120 });
+    expect(page.storage.has(hidden)).toBe(true);
+
+    page.changeEntry({ key: 'new-entry', url: 'http://localhost/new' }, 'push');
+    const current = page.navigation.currentEntry;
+    scroll.commit(current.key);
+    scroll.save();
+    current.dispatchEvent(new Event('dispose'));
+    expect(scroll.read(current.key)).toBeNull();
+  });
+
+  it.each([
+    ['#%E6%97%A5%E6%9C%AC%E8%AA%9E', '日本語'],
+    ['#a%20b', 'a b'],
+    ['#a%2Bb', 'a+b'],
+    ['#bad%FF%20value%', 'bad� value%'],
+    ['#%EF%BB%BFtitle', '\uFEFFtitle'],
+  ])('scrolls to the decoded ID for %s after page commit', async (hash, id) => {
+    const page = await setup();
+    const scrollIntoView = vi.fn();
+    const getElementById = document.getElementById.bind(document);
+    vi.spyOn(document, 'getElementById').mockImplementation((candidate) =>
+      candidate === id ? ({ scrollIntoView } as unknown as HTMLElement) : getElementById(candidate),
+    );
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        Response.json({ component: 'home', props: {} }, { headers: { 'X-VoidPages': 'true' } }),
+      ),
+    );
+    page.engine.start();
+    page.engine.commitInitialRender();
+    const visit = page.engine.prepareVisit('/next' + hash);
+    await visit.shell;
+    await visit.commit();
+    page.frame();
+    expect(scrollIntoView).toHaveBeenCalledOnce();
+  });
+
+  it('prefers a literal percent-encoded ID to the decoded ID', async () => {
+    const page = await setup();
+    const literal = vi.fn();
+    const decoded = vi.fn();
+    const getElementById = document.getElementById.bind(document);
+    vi.spyOn(document, 'getElementById').mockImplementation((id) =>
+      id === 'a%20b'
+        ? ({ scrollIntoView: literal } as unknown as HTMLElement)
+        : id === 'a b'
+          ? ({ scrollIntoView: decoded } as unknown as HTMLElement)
+          : getElementById(id),
+    );
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        Response.json({ component: 'home', props: {} }, { headers: { 'X-VoidPages': 'true' } }),
+      ),
+    );
+    page.engine.start();
+    page.engine.commitInitialRender();
+    const visit = page.engine.prepareVisit('/next#a%20b');
+    await visit.shell;
+    await visit.commit();
+    page.frame();
+    expect(literal).toHaveBeenCalledOnce();
+    expect(decoded).not.toHaveBeenCalled();
+  });
+
   it('saves the departing entry without mutating the incoming history entry on pagehide', async () => {
     const page = await setup('departing');
     page.engine.start();
     page.engine.commitInitialRender();
     const departing = page.navigation.currentEntry.key;
-    const incoming = { key: 'incoming', url: 'http://localhost/', getState: () => undefined };
+    const incoming = Object.assign(new EventTarget(), {
+      key: 'incoming',
+      url: 'http://localhost/',
+      getState: () => undefined,
+    });
     page.navigation.currentEntry = incoming;
     page.window.scrollX = 40;
     page.window.scrollY = 3500;
