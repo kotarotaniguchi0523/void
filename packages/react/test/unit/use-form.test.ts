@@ -14,7 +14,13 @@ import {
 } from 'react';
 import { createRoot, type Root, type RootOptions } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
-import { VoidActionError, type VoidRouter } from 'void/pages-client';
+import {
+  VoidActionError,
+  createActionClient,
+  createRouterFacade,
+  type RuntimeVoidRouter,
+  type VoidRouter,
+} from 'void/pages-client';
 import { RouterContext } from '../../src/runtime/context.ts';
 import { useForm } from '../../src/runtime/use-form.ts';
 import { useIslandForm, type IslandFormReturn } from '../../src/runtime/use-island-form.ts';
@@ -49,8 +55,8 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-function routerWithVisit(visit: VoidRouter['visit']): VoidRouter {
-  return {
+function routerWithVisit(visit: RuntimeVoidRouter['visit']): VoidRouter {
+  const runtime = {
     _hoverDelay: 75,
     get url() {
       return new URL('http://localhost/');
@@ -69,7 +75,9 @@ function routerWithVisit(visit: VoidRouter['visit']): VoidRouter {
     prefetch: vi.fn(),
     flush: vi.fn(),
     flushAll: vi.fn(),
-  };
+  } satisfies RuntimeVoidRouter;
+  createActionClient().setActionRouter(runtime);
+  return createRouterFacade(runtime, () => '/');
 }
 
 async function mountApp(app: ReactNode, options?: RootOptions) {
@@ -83,7 +91,7 @@ async function mountApp(app: ReactNode, options?: RootOptions) {
   return container;
 }
 
-async function mountForm(visit: VoidRouter['visit'], options?: FormOptions) {
+async function mountForm(visit: RuntimeVoidRouter['visit'], options?: FormOptions) {
   const router = routerWithVisit(visit);
   const formRef: { current: TestForm | null } = { current: null };
   function App() {
@@ -305,7 +313,7 @@ describe('useForm callbacks', () => {
   it.each(['success', 'error'] as const)(
     'uses the submitted %s callback when another render suspends',
     async (outcome) => {
-      const visit = deferred<Awaited<ReturnType<VoidRouter['visit']>>>();
+      const visit = deferred<Awaited<ReturnType<RuntimeVoidRouter['visit']>>>();
       const suspendForever = new Promise<void>(() => {});
       const callbacks = { A: vi.fn(), B: vi.fn() };
       const renderedVersions: Array<string> = [];

@@ -16,31 +16,33 @@ import {
   type PageData,
   type PageNavigationEngineConfig,
   type PageNavigationResult,
-  type VisitOptions,
+  type VisitOptions as InternalVisitOptions,
   type VoidRouterAdapter as PageNavigationAdapter,
-  type PrefetchOptions,
+  type PrefetchOptions as InternalPrefetchOptions,
 } from './navigation-engine.ts';
 import type { LinkPrefetchValue } from './prefetch.ts';
 import { deserializePageData, ISLAND_FRONTMATTER_ID } from './serialize.ts';
-import { isSameOrigin } from './url.ts';
+import { isPageUrlProtocol, isSameOrigin } from './url.ts';
 
-export { getValidationErrors, isModifiedEvent, mergeDataIntoHref } from './adapter-helpers.ts';
+export { getValidationErrors, isModifiedEvent } from './adapter-helpers.ts';
+export { isSameOrigin } from './url.ts';
 export {
+  createLinkClickHandler,
+  createLinkState,
   handleLinkClick,
   linkActiveAttributes,
   linkPendingAttributes,
+  linkPrefetchAttributes,
   linkPrefetchStrategies,
+  linkStateAttributes,
   observeLinkVisible,
   prefetchLink,
-  resolveLink,
   type BaseLinkProps,
   type LinkActiveAttributes,
   type LinkActiveMatch,
-  type LinkNavigateEvent,
   type LinkPendingAttributes,
   type LinkPrefetchValue,
   type LinkPrefetchStrategy,
-  type ResolvedLink,
 } from './link.ts';
 export {
   VoidActionError,
@@ -70,11 +72,20 @@ export type {
   PageNavigationEngine,
   PageNavigationResource,
   PageNavigationResult,
-  PrefetchOptions,
-  VisitOptions,
 } from './navigation-engine.ts';
 
 // --- Types ---
+
+/** Public GET-only navigation options; mutations are handled by actions. */
+export type VisitOptions = Pick<
+  InternalVisitOptions,
+  'preserveScroll' | 'preserveState' | 'replace' | 'viewTransition' | 'resolveOn'
+>;
+export type RefreshOptions = Pick<
+  VisitOptions,
+  'preserveScroll' | 'preserveState' | 'viewTransition' | 'resolveOn'
+>;
+export type PrefetchOptions = Pick<InternalPrefetchOptions, 'cacheFor'>;
 
 export type NavigationStateType = 'idle' | 'loading' | 'submitting';
 export type NavigationMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
@@ -85,20 +96,37 @@ export type NavigationState = {
   method: NavigationMethod | null;
 };
 
+/** Public GET-only Pages API. Completion resolves without exposing page payloads. */
 export type VoidRouter = {
-  _hoverDelay: number;
-  /** How Links without a `prefetch` prop prefetch. Absent during SSR. */
-  _prefetchDefaultStrategy?: LinkPrefetchValue;
   readonly url: URL;
   readonly path: string;
   readonly query: URLSearchParams;
   readonly params: Record<string, string>;
-  visit(url: RouteUrlInput, options?: VisitOptions): Promise<unknown>;
-  refresh(options?: VisitOptions): Promise<unknown>;
-  prefetch(url: RouteUrlInput, options?: PrefetchOptions): Promise<unknown>;
-  flush(url: RouteUrlInput, method?: string): void;
+  visit(url: RouteUrlInput, options?: VisitOptions): Promise<void>;
+  refresh(options?: RefreshOptions): Promise<void>;
+  prefetch(url: RouteUrlInput, options?: PrefetchOptions): Promise<void>;
+  flush(url: RouteUrlInput): void;
   flushAll(): void;
 };
+
+/** Internal route execution preserves action data and engine configuration. */
+export type RuntimeVoidRouter = Omit<VoidRouter, 'visit' | 'refresh' | 'prefetch'> & {
+  _hoverDelay: number;
+  _prefetchDefaultStrategy?: LinkPrefetchValue;
+  visit(url: RouteUrlInput, options?: InternalVisitOptions): Promise<unknown>;
+  refresh(options?: InternalVisitOptions): Promise<unknown>;
+  prefetch(url: RouteUrlInput, options?: InternalPrefetchOptions): Promise<unknown>;
+};
+
+type ActionVisitRouter = Pick<RuntimeVoidRouter, 'visit'>;
+
+// Form hooks use public router facades, while mutations need the data-returning visit.
+// Keep that transport private rather than exposing mutation options on useRouter().
+const actionTransports = new WeakMap<object, ActionVisitRouter>();
+
+function actionTransportOf(router: VoidRouter | RuntimeVoidRouter): ActionVisitRouter | undefined {
+  return actionTransports.get(router);
+}
 
 export type VoidRouterAdapter = PageNavigationAdapter & {
   applyUpdate(
@@ -120,7 +148,14 @@ function currentUrl(): string {
 }
 
 function getUrlOrigin(): string {
-  return typeof window === 'undefined' ? 'http://localhost' : window.location.origin;
+  if (typeof window === 'undefined') return 'http://localhost';
+  const { origin, href } = window.location;
+  // Capacitor WebViews may expose an opaque origin even for a local app.
+  if (origin === 'null' && href) {
+    const url = new URL(href);
+    if (url.protocol === 'capacitor:') return `capacitor://${url.host}`;
+  }
+  return origin;
 }
 
 /** Relative URLs such as `?page=2` resolve against the current page, as in an anchor. */
@@ -132,13 +167,16 @@ function toUrl(value: string | URL): URL {
   return value instanceof URL ? new URL(value.href) : new URL(value || '/', getUrlBase());
 }
 
-function normalizeUrl(value: RouteUrlInput): string {
+/** Normalize typed destinations uniformly across all Pages adapters. */
+export function normalizePageUrl(value: RouteUrlInput): string {
   const urlString = toUrlString(value);
   if (urlString.startsWith('#')) {
     return urlString;
   }
   const url = toUrl(urlString);
-  return isSameOrigin(url, getUrlOrigin()) ? url.pathname + url.search + url.hash : url.href;
+  return isPageUrlProtocol(url) && isSameOrigin(url, getUrlOrigin())
+    ? url.pathname + url.search + url.hash
+    : url.href;
 }
 
 function navigationMethod(method: string): NavigationMethod {
@@ -172,19 +210,11 @@ export function idleNavigationState(): NavigationState {
 }
 
 export function createRouterFacade(
-  router: VoidRouter,
+  router: VoidRouter | RuntimeVoidRouter,
   getCurrentUrl: () => string,
   getCurrentParams: () => Record<string, string> = () => router.params,
 ): VoidRouter {
-  return {
-    get _hoverDelay() {
-      return router._hoverDelay;
-    },
-
-    get _prefetchDefaultStrategy() {
-      return router._prefetchDefaultStrategy;
-    },
-
+  const facade: VoidRouter = {
     get url() {
       return new URL(getCurrentUrl() || '/', router.url);
     },
@@ -202,25 +232,28 @@ export function createRouterFacade(
     },
 
     visit(url, options = {}) {
-      return router.visit(url, options);
+      return router.visit(url, options).then(() => {});
     },
 
     refresh(options = {}) {
-      return router.refresh(options);
+      return router.refresh(options).then(() => {});
     },
 
     prefetch(url, options = {}) {
-      return router.prefetch(url, options);
+      return router.prefetch(url, options).then(() => {});
     },
 
-    flush(url, method = 'GET') {
-      router.flush(url, method);
+    flush(url) {
+      router.flush(url);
     },
 
     flushAll() {
       router.flushAll();
     },
   };
+  const transport = actionTransportOf(router);
+  if (transport) actionTransports.set(facade, transport);
+  return facade;
 }
 
 export function createSsrRouter(
@@ -229,7 +262,6 @@ export function createSsrRouter(
   requestUrl?: string,
 ): VoidRouter {
   const router = {
-    _hoverDelay: 75,
     get url() {
       return new URL(url || '/', requestUrl ?? getUrlBase());
     },
@@ -268,8 +300,8 @@ export const ssrProxy: VoidRouter = createSsrRouter();
 
 /** Refetch the current page in place: same history entry, URL hash, state and scroll. */
 export function refreshPage(
-  router: Pick<VoidRouter, 'visit'>,
-  options: VisitOptions = {},
+  router: ActionVisitRouter,
+  options: InternalVisitOptions = {},
 ): Promise<unknown> {
   const { pathname, search, hash } = window.location;
   return router.visit(pathname + search + hash, {
@@ -282,20 +314,16 @@ export function refreshPage(
 }
 
 export async function submitAction(
-  router: VoidRouter,
+  router: VoidRouter | RuntimeVoidRouter,
   url: string,
-  options: VisitOptions,
-  errorOptions?: { throwOnError?: boolean },
+  options: InternalVisitOptions,
 ): Promise<ActionResult> {
-  // An action on the page it runs on re-renders that page, so its loader sees the
-  // page query and the URL, scroll and history entry stay as they are.
-  const page = withPageQuery(url, window.location);
-  if (page.preserved) {
-    url = page.url;
-    options = { ...options, _preservedQuery: page.preserved };
+  const transport = actionTransportOf(router);
+  if (!transport) {
+    throw new Error('submitAction(): internal Pages action router is not available.');
   }
   try {
-    const pageData = await router.visit(url, options);
+    const pageData = await transport.visit(url, options);
     if (
       typeof pageData === 'object' &&
       pageData !== null &&
@@ -335,7 +363,7 @@ type ActionOptions<U extends string> = {
 } & (HasParams<U> extends true ? { params: ResolveActionParams<U> } : { params?: never });
 
 export type ActionClient = {
-  setActionRouter(router: VoidRouter): void;
+  setActionRouter(router: RuntimeVoidRouter): void;
   action<U extends ActionUrl & string>(
     url: U,
     ...args: HasParams<U> extends true ? [options: ActionOptions<U>] : [options?: ActionOptions<U>]
@@ -344,13 +372,14 @@ export type ActionClient = {
 
 /** Creates an action client with its own router for each framework adapter. */
 export function createActionClient(
-  defaults: Pick<VisitOptions, '_resolveOnShell'> = {},
+  defaults: Pick<InternalVisitOptions, '_resolveOnShell'> = {},
 ): ActionClient {
-  let _router: VoidRouter | null = null;
+  let _router: RuntimeVoidRouter | null = null;
 
   /** Called during app initialization to store the router instance */
-  function setActionRouter(router: VoidRouter): void {
+  function setActionRouter(router: RuntimeVoidRouter): void {
     _router = router;
+    actionTransports.set(router, router);
   }
 
   /** Programmatic page action call with a router update */
@@ -384,7 +413,7 @@ export function createActionClient(
 // --- createVoidRouter factory ---
 
 export async function createVoidRouter(config: VoidRouterConfig): Promise<{
-  router: VoidRouter;
+  router: RuntimeVoidRouter;
   initialPageData: PageData;
   initialComponent: unknown;
   initialLayouts: Array<unknown>;
@@ -424,6 +453,9 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
       if (!result) {
         return undefined;
       }
+      if (activeNavigationId !== resource.id) {
+        throw new DOMException('Navigation aborted', 'AbortError');
+      }
 
       setRouteState(
         result.pageData.url || resource.fetchUrl + resource.hash,
@@ -431,25 +463,30 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
       );
 
       const preserveState = resource.options.preserveState ?? resource.method !== 'GET';
-      const applyUpdate = () => {
+      let applied = true;
+      const applyUpdate = async () => {
+        if (activeNavigationId !== resource.id) {
+          applied = false;
+          return;
+        }
         renderedPage = result;
         failedRender = null;
-        return config.adapter.applyUpdate(result.pageData, result.component, result.layouts, {
-          preserveState,
-        });
+        try {
+          await config.adapter.applyUpdate(result.pageData, result.component, result.layouts, {
+            preserveState,
+          });
+        } catch (error) {
+          if (renderedPage === result) {
+            failedRender = { preserveState };
+          }
+          throw error;
+        }
       };
 
-      let applied = true;
       const useTransition = resource.options.viewTransition ?? config.viewTransitions;
       if (useTransition && document.startViewTransition) {
         // The callback runs on a later frame. A newer visit started by then renders instead.
-        const transition = document.startViewTransition(() => {
-          if (activeNavigationId !== resource.id) {
-            applied = false;
-            return;
-          }
-          return applyUpdate();
-        });
+        const transition = document.startViewTransition(applyUpdate);
         await transition.updateCallbackDone;
       } else {
         await applyUpdate();
@@ -468,6 +505,9 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
         }
       }
       if (!committed) {
+        if (applied && renderedPage === result) {
+          failedRender = { preserveState };
+        }
         throw new DOMException('Navigation aborted', 'AbortError');
       }
       committedPage = result;
@@ -519,7 +559,7 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
     }
   }
 
-  const router: VoidRouter = {
+  const router: RuntimeVoidRouter = {
     _hoverDelay: engine._hoverDelay,
     _prefetchDefaultStrategy: engine._prefetchDefaultStrategy,
 
@@ -540,8 +580,7 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
     },
 
     visit(url, options = {}) {
-      const resource = engine.prepareVisit(normalizeUrl(url), options);
-      return applyNavigationResource(resource);
+      return engine.visit(normalizePageUrl(url), options, applyNavigationResource);
     },
 
     refresh(options = {}) {
@@ -549,11 +588,11 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
     },
 
     prefetch(url, options = {}) {
-      return engine.prefetch(normalizeUrl(url), options);
+      return engine.prefetch(normalizePageUrl(url), options);
     },
 
-    flush(url, method = 'GET') {
-      engine.flush(normalizeUrl(url), method);
+    flush(url) {
+      engine.flush(normalizePageUrl(url));
     },
 
     flushAll() {
@@ -561,16 +600,17 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
     },
   };
 
-  engine.setPopStateHandler((url, options) => {
-    router.visit(url, options);
-  });
-
+  // Keep the mutation-capable visit separate from the public GET-only facade.
+  actionTransports.set(router, router);
   return {
     router,
     initialPageData: engine.initialPageData,
     initialComponent: engine.initialComponent,
     initialLayouts: engine.initialLayouts,
-    start: engine.start,
+    start() {
+      engine.setBrowserVisitHandler(applyNavigationResource);
+      engine.start();
+    },
     commitInitialRender: engine.commitInitialRender,
   };
 }

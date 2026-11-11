@@ -3,9 +3,9 @@ import { defineConfig } from 'vite-plus';
 export default defineConfig({
   pack: {
     entry: [
-      'src/runtime/PageErrorBoundary.ts',
       'src/index.ts',
       'src/plugin.ts',
+      'src/runtime/internal.ts',
       'src/runtime/use-deferred.ts',
     ],
     format: 'esm',

@@ -1,6 +1,6 @@
 import { createComponent, createRoot } from 'solid-js';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
-import type { VoidRouter } from 'void/pages-client';
+import { describe, expect, it } from 'vite-plus/test';
+import { createActionClient, createRouterFacade, type RuntimeVoidRouter } from 'void/pages-client';
 import { RouterContext } from '../../src/runtime/context.ts';
 import { useForm as typedUseForm } from '../../src/runtime/use-form.ts';
 
@@ -22,16 +22,18 @@ const useForm = typedUseForm as unknown as (
 function renderForm(url: string, params: Record<string, string>) {
   const visits: Array<string> = [];
   const router = {
+    _hoverDelay: 75,
     visit: async (target: string) => {
       visits.push(target);
       return {};
     },
-  } as unknown as VoidRouter;
+  } as unknown as RuntimeVoidRouter;
+  createActionClient().setActionRouter(router);
   let form!: ReturnType<typeof useForm>;
   // Rendering stays possible whatever the param holds; only a submit resolves it.
   createRoot(() =>
     createComponent(RouterContext.Provider, {
-      value: router,
+      value: createRouterFacade(router, () => '/'),
       get children() {
         form = useForm(url, {}, { params });
         return null;

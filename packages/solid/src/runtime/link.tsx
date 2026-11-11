@@ -1,208 +1,37 @@
-import { createMemo, onCleanup, onMount, splitProps, useContext } from 'solid-js';
+import { createMemo, splitProps, useContext } from 'solid-js';
 import type { JSX } from 'solid-js';
-import {
-  handleLinkClick,
-  linkActiveAttributes,
-  linkPendingAttributes,
-  linkPrefetchStrategies,
-  observeLinkVisible,
-  prefetchLink,
-  resolveLink,
-  type BaseLinkProps,
-} from 'void/pages-client';
+import { linkPrefetchAttributes, linkStateAttributes, type BaseLinkProps } from 'void/pages-client';
 import { NavigationContext, RouterContext } from './context.ts';
 
-type CommonProps = BaseLinkProps & {
-  children?: JSX.Element;
-};
-
+type CommonProps = BaseLinkProps & { children?: JSX.Element };
 export type LinkProps = CommonProps &
-  Omit<JSX.AnchorHTMLAttributes<HTMLAnchorElement>, keyof CommonProps> &
-  Omit<JSX.ButtonHTMLAttributes<HTMLButtonElement>, keyof CommonProps>;
-
-function mergeStyle(style: JSX.CSSProperties | string | undefined): JSX.CSSProperties | string {
-  if (typeof style === 'string') {
-    return `touch-action: manipulation; ${style}`;
-  }
-  return {
-    touchAction: 'manipulation',
-    ...style,
-  } as JSX.CSSProperties;
-}
-
-function callHandler(handler: unknown, event: Event): void {
-  if (Array.isArray(handler)) {
-    const [fn, data] = handler;
-    if (typeof fn === 'function') {
-      fn(data, event);
-    }
-  } else if (typeof handler === 'function') {
-    handler(event);
-  }
-}
+  Omit<JSX.AnchorHTMLAttributes<HTMLAnchorElement>, keyof CommonProps>;
 
 export function Link(props: LinkProps): JSX.Element {
   const [local, rest] = splitProps(props, [
-    'href',
-    'method',
-    'data',
-    'preserveScroll',
-    'preserveState',
-    'replace',
-    'reloadDocument',
-    'viewTransition',
-    'prefetch',
-    'cacheFor',
-    'activeMatch',
-    'onNavigate',
-    'children',
-    'style',
-    'onClick',
-    'onMouseEnter',
-    'onMouseLeave',
-    'onFocus',
-    'onMouseDown',
-    'onTouchStart',
+    'href', 'prefetch', 'cacheFor', 'activeMatch', 'children',
   ]);
   const router = useContext(RouterContext);
   const navigation = useContext(NavigationContext);
-
-  const link = createMemo(() => resolveLink(local));
-  const strategies = createMemo(() =>
-    linkPrefetchStrategies(local, link(), router?._prefetchDefaultStrategy),
+  const state = createMemo(() =>
+    linkStateAttributes(router, navigation?.(), local.href, local.activeMatch),
   );
-  const resolvedStyle = createMemo(() => mergeStyle(local.style));
-  // Reading router.url tracks the route URL, so this follows navigations.
-  const activeAttributes = createMemo(() =>
-    linkActiveAttributes(router, link(), local.activeMatch),
+  const prefetch = createMemo(() =>
+    linkPrefetchAttributes(router, {
+      prefetch: local.prefetch,
+      cacheFor: local.cacheFor,
+      reloadDocument: Object.hasOwn(rest, 'data-void-reload'),
+    }),
   );
-  // Calling navigation() tracks visits as they start and end.
-  const pendingAttributes = createMemo(() => linkPendingAttributes(router, navigation?.(), link()));
-
-  function doPrefetch() {
-    prefetchLink(router, link().href, local.cacheFor);
-  }
-
-  function onClick(event: MouseEvent) {
-    callHandler(local.onClick, event);
-    handleLinkClick(event, router, link(), local);
-  }
-
-  let hoverTimer: ReturnType<typeof setTimeout> | null = null;
-  let stopObserving: (() => void) | null = null;
-  let el: HTMLElement | undefined;
-
-  function onMouseEnter(event: MouseEvent) {
-    callHandler(local.onMouseEnter, event);
-    if (event.defaultPrevented) {
-      return;
-    }
-    if (hoverTimer) {
-      clearTimeout(hoverTimer);
-    }
-    hoverTimer = setTimeout(doPrefetch, router?._hoverDelay ?? 75);
-  }
-
-  function onMouseLeave(event: MouseEvent) {
-    callHandler(local.onMouseLeave, event);
-    if (hoverTimer) {
-      clearTimeout(hoverTimer);
-      hoverTimer = null;
-    }
-  }
-
-  function onFocus(event: FocusEvent) {
-    callHandler(local.onFocus, event);
-    if (!event.defaultPrevented) {
-      doPrefetch();
-    }
-  }
-
-  function onMouseDown(event: MouseEvent) {
-    callHandler(local.onMouseDown, event);
-    if (!event.defaultPrevented) {
-      doPrefetch();
-    }
-  }
-
-  function onTouchStart(event: TouchEvent) {
-    callHandler(local.onTouchStart, event);
-    if (!event.defaultPrevented) {
-      doPrefetch();
-    }
-  }
-
-  onMount(() => {
-    if (strategies().includes('mount')) {
-      doPrefetch();
-    }
-    if (strategies().includes('visible') && el) {
-      stopObserving = observeLinkVisible(el, doPrefetch);
-    }
-  });
-
-  onCleanup(() => {
-    if (hoverTimer) {
-      clearTimeout(hoverTimer);
-    }
-    stopObserving?.();
-  });
-
-  const eventHandlers = createMemo(() => {
-    const handlers = {
-      onClick,
-      onFocus: local.onFocus,
-      onMouseDown: local.onMouseDown,
-      onMouseEnter: local.onMouseEnter,
-      onMouseLeave: local.onMouseLeave,
-      onTouchStart: local.onTouchStart,
-    };
-
-    if (strategies().includes('hover')) {
-      handlers.onMouseEnter = onMouseEnter;
-      handlers.onMouseLeave = onMouseLeave;
-      handlers.onFocus = onFocus;
-      handlers.onTouchStart = onTouchStart;
-    }
-
-    if (strategies().includes('click')) {
-      handlers.onMouseDown = onMouseDown;
-      handlers.onTouchStart = onTouchStart;
-    }
-
-    return handlers;
-  });
 
   return (
-    <>
-      {link().isGet ? (
-        <a
-          ref={(r) => {
-            el = r;
-          }}
-          href={link().href}
-          {...activeAttributes()}
-          {...pendingAttributes()}
-          {...rest}
-          style={resolvedStyle()}
-          {...eventHandlers()}
-        >
-          {local.children}
-        </a>
-      ) : (
-        <button
-          ref={(r) => {
-            el = r;
-          }}
-          type="button"
-          {...pendingAttributes()}
-          {...(rest as JSX.ButtonHTMLAttributes<HTMLButtonElement>)}
-          style={resolvedStyle()}
-          {...eventHandlers()}
-        >
-          {local.children}
-        </button>
-      )}
-    </>
+    <a
+      href={local.href}
+      {...prefetch()}
+      {...state()}
+      {...rest}
+    >
+      {local.children}
+    </a>
   );
 }

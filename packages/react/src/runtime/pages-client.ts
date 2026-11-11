@@ -3,7 +3,6 @@ import React, {
   startTransition,
   use,
   useCallback,
-  useEffect,
   useInsertionEffect,
   useLayoutEffect,
   useMemo,
@@ -21,19 +20,15 @@ import {
   isAbortError,
   isCallSiteActionError,
   refreshPage,
-  pageBoundarySlots,
-  showTerminalPageError,
-  type BoundaryManifest,
-  toUrlString,
+  normalizePageUrl,
   type PageNavigationResource,
   type PageNavigationResult,
   type NavigationState,
-  type VisitOptions,
   type VoidRouter,
+  type RuntimeVoidRouter,
 } from 'void/pages-client';
 import type { CacheForResult, LinkPrefetchValue } from 'void/pages-prefetch';
 import type { PageObject } from 'void/pages-protocol';
-import type { RouteUrlInput } from 'void/routes';
 import { setActionRouter } from './action.ts';
 import {
   ErrorsContext,
@@ -91,6 +86,7 @@ type ReactPageResource = PageNavigationResource & {
 type VisitSettler = {
   resolve(pageData: ReactPageData | undefined): void;
   reject(error: unknown): void;
+  abort(): void;
 };
 
 type AppState = {
@@ -124,7 +120,7 @@ let activePendingNavigationId: number | null = null;
 // hydration commit clears it before effects run, so effects and later renders read the browser URL.
 let prerenderedUrl: string | null = null;
 let scheduleVisit:
-  | ((url: string, options?: VisitOptions) => Promise<ReactPageData | undefined>)
+  | ((resource: PageNavigationResource) => Promise<ReactPageData | undefined>)
   | null = null;
 
 function createDeferredResource(): DeferredResource {
@@ -163,16 +159,6 @@ function isDeferredResourceLoading(ref: unknown): boolean {
 
 function currentUrl(): string {
   return window.location.pathname + window.location.search + window.location.hash;
-}
-
-function normalizeUrl(value: RouteUrlInput): string {
-  const urlString = toUrlString(value);
-  if (urlString.startsWith('#')) {
-    return urlString;
-  }
-  // Relative URLs such as `?page=2` resolve against the current page, as in an anchor.
-  const url = new URL(urlString, window.location.href);
-  return url.origin === window.location.origin ? url.pathname + url.search + url.hash : url.href;
 }
 
 /** Page data holds a decoded path. Compare it with browser URLs in their encoded form. */
@@ -256,7 +242,9 @@ function appReducer(state: AppState, action: AppAction): AppState {
         return state;
       }
       return {
-        resource: action.resource.immediate ? state.resource : action.resource,
+        resource: action.resource.immediate
+          ? state.rollbackResource || state.resource
+          : action.resource,
         rollbackResource: null,
         pendingId: null,
         routeUrl: action.location,
@@ -288,8 +276,8 @@ function appReducer(state: AppState, action: AppAction): AppState {
   }
 }
 
-function createRouter(engine: Awaited<ReturnType<typeof createPageNavigationEngine>>): VoidRouter {
-  const router: VoidRouter = {
+function createRouter(engine: Awaited<ReturnType<typeof createPageNavigationEngine>>): RuntimeVoidRouter {
+  const router: RuntimeVoidRouter = {
     _hoverDelay: engine._hoverDelay,
     _prefetchDefaultStrategy: engine._prefetchDefaultStrategy,
     get url() {
@@ -308,16 +296,16 @@ function createRouter(engine: Awaited<ReturnType<typeof createPageNavigationEngi
       if (!scheduleVisit) {
         return Promise.reject(new Error('router.visit() called before router initialized'));
       }
-      return scheduleVisit(normalizeUrl(url), options);
+      return engine.visit(normalizePageUrl(url), options, scheduleVisit);
     },
     refresh(options = {}) {
       return refreshPage(router, options);
     },
     prefetch(url, options = {}) {
-      return engine.prefetch(normalizeUrl(url), options);
+      return engine.prefetch(normalizePageUrl(url), options);
     },
-    flush(url, method = 'GET') {
-      engine.flush(normalizeUrl(url), method);
+    flush(url) {
+      engine.flush(normalizePageUrl(url));
     },
     flushAll() {
       engine.flushAll();
@@ -428,6 +416,44 @@ function RouteResource({
   );
 }
 
+class RouteRenderBoundary extends React.Component<
+  {
+    resourceId: number;
+    pending: boolean;
+    onError(error: unknown): void;
+    children: React.ReactNode;
+  },
+  { resourceId: number; failure: { error: unknown } | null }
+> {
+  state: { resourceId: number; failure: { error: unknown } | null } = {
+    resourceId: this.props.resourceId,
+    failure: null,
+  };
+
+  static getDerivedStateFromProps(
+    { resourceId }: { resourceId: number },
+    state: { resourceId: number },
+  ) {
+    return resourceId === state.resourceId ? null : { resourceId, failure: null };
+  }
+
+  static getDerivedStateFromError(error: unknown) {
+    return { failure: { error } };
+  }
+
+  componentDidCatch(error: unknown) {
+    this.props.onError(error);
+  }
+
+  render() {
+    const failure = this.state.failure;
+    if (failure && !this.props.pending) {
+      throw failure.error;
+    }
+    return failure ? null : this.props.children;
+  }
+}
+
 function startViewTransition(
   resource: ReactPageResource,
   reveal: () => void,
@@ -458,7 +484,7 @@ function App({
 }: {
   config: ReactPagesConfig;
   engine: Awaited<ReturnType<typeof createPageNavigationEngine>>;
-  router: VoidRouter;
+  router: RuntimeVoidRouter;
   viewTransitions: boolean;
   navigationFallback?: ComponentType<{ initialPageData: PageObject }>;
 }): React.ReactNode {
@@ -478,6 +504,7 @@ function App({
         component: engine.initialComponent,
         layouts: engine.initialLayouts,
       }),
+      destination: currentUrl,
       abort() {},
       async commit() {
         engine.commitInitialRender();
@@ -553,6 +580,10 @@ function App({
             }
           }
           if (!committed) {
+            if (activePendingNavigationId === resource.id) {
+              activePendingNavigationId = null;
+              dispatch({ type: 'abandon', resource, location: currentUrl() });
+            }
             return;
           }
           if (activePendingNavigationId === resource.id) {
@@ -586,8 +617,15 @@ function App({
   );
 
   const schedule = useCallback(
-    (url: string, options: VisitOptions = {}) => {
-      const prepared = engine.prepareVisit(url, options) as ReactPageResource;
+    (resource: PageNavigationResource) => {
+      if (activePendingNavigationId !== null) {
+        pendingVisitSettlers.get(activePendingNavigationId)?.abort();
+        pendingVisitSettlers.delete(activePendingNavigationId);
+        viewTransitionWaiters.get(activePendingNavigationId)?.();
+        viewTransitionWaiters.delete(activePendingNavigationId);
+      }
+      const prepared = resource as ReactPageResource;
+      const options = prepared.options;
       const resolveOnData =
         prepared.options.resolveOn === 'data' || prepared.options._resolveOnShell;
       if (prepared.immediate) {
@@ -685,8 +723,17 @@ function App({
       const navigation = navigationForResource(next);
       navigationStore.set(navigation);
 
-      terminalResource = next;
-      pendingVisitSettlers.set(next.id, { resolve: resolveVisit, reject: rejectVisit });
+      pendingVisitSettlers.set(next.id, {
+        resolve: resolveVisit,
+        reject: rejectVisit,
+        abort() {
+          if (next.method === 'GET' && !options._resolveOnShell) {
+            resolveVisit(undefined);
+          } else {
+            rejectVisit(new DOMException('Navigation aborted', 'AbortError'));
+          }
+        },
+      });
       activePendingNavigationId = next.id;
       dispatch({ type: 'begin', resource: next, navigation });
 
@@ -736,23 +783,19 @@ function App({
       );
       return pagePromise;
     },
-    [engine, NavigationFallback, navigationStore, startTransition, viewTransitions],
+    [NavigationFallback, startTransition, viewTransitions],
   );
 
   useInsertionEffect(() => {
     scheduleVisit = schedule;
+    engine.setBrowserVisitHandler(schedule);
     return () => {
+      engine.setBrowserVisitHandler(null);
       if (scheduleVisit === schedule) {
         scheduleVisit = null;
       }
     };
-  }, [schedule]);
-
-  useEffect(() => {
-    engine.setPopStateHandler((url, options) => {
-      router.visit(url, options);
-    });
-  }, [engine, router]);
+  }, [engine, schedule]);
 
   const navigationValue = useMemo<NavigationState>(() => {
     if (state.navigation.state !== 'idle' || !isTransitionPending) {
@@ -788,11 +831,30 @@ function App({
               ? React.createElement(NavigationFallback, { initialPageData })
               : null,
         },
-        React.createElement(RouteResource, {
-          resource: state.resource,
-          onCommit: finishNavigation,
-          config,
-          onFailure: (url: string) => engine.flush(url),
+        React.createElement(RouteRenderBoundary, {
+          resourceId: state.resource.id,
+          pending: state.pendingId === state.resource.id,
+          onError(error) {
+            const resource = state.resource;
+            if (activePendingNavigationId !== resource.id) {
+              return;
+            }
+            activePendingNavigationId = null;
+            viewTransitionWaiters.get(resource.id)?.();
+            viewTransitionWaiters.delete(resource.id);
+            const settler = pendingVisitSettlers.get(resource.id);
+            pendingVisitSettlers.delete(resource.id);
+            if (settler) {
+              settler.reject(error);
+            } else {
+              reportError(error);
+            }
+            dispatch({ type: 'fail', resource, location: currentUrl() });
+          },
+          children: React.createElement(RouteResource, {
+            resource: state.resource,
+            onCommit: finishNavigation,
+          }),
         }),
       ),
     ),
@@ -898,5 +960,5 @@ export async function startReactPages(config: ReactPagesConfig): Promise<ReactPa
   });
   engine.start();
 
-  return { router };
+  return { router: createRouterFacade(router, currentUrl) };
 }

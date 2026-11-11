@@ -3,7 +3,7 @@
 import { act, createElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
-import type { LinkPrefetchValue, VoidRouter } from 'void/pages-client';
+import type { VoidRouter } from 'void/pages-client';
 import { RouterContext } from '../../src/runtime/context.ts';
 import { Link, type LinkProps } from '../../src/runtime/link.tsx';
 
@@ -18,11 +18,9 @@ afterEach(() => {
   }
 });
 
-function createRouter(defaultStrategy?: LinkPrefetchValue) {
+function createRouter() {
   const prefetch = vi.fn(() => Promise.resolve());
   const router: VoidRouter = {
-    _hoverDelay: 75,
-    _prefetchDefaultStrategy: defaultStrategy,
     get url() {
       return new URL(window.location.href);
     },
@@ -57,51 +55,31 @@ async function mountLink(router: VoidRouter, props: LinkProps) {
   return container.firstElementChild as HTMLElement;
 }
 
-describe('Link default prefetch strategy', () => {
-  it('prefetches a Link without a prefetch prop with the app default', async () => {
-    const { router, prefetch } = createRouter('mount');
-    await mountLink(router, { href: '/users' });
-
-    expect(prefetch).toHaveBeenCalledWith('/users', {});
-  });
-
-  it('lets the Link prop replace the default', async () => {
-    const { router, prefetch } = createRouter('mount');
-    const link = await mountLink(router, { href: '/users', prefetch: 'hover' });
-    expect(prefetch).not.toHaveBeenCalled();
-
-    await act(async () => {
-      link.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
-    });
-    expect(prefetch).toHaveBeenCalledWith('/users', {});
-  });
-
-  it('turns the default off with prefetch={false}', async () => {
-    const { router, prefetch } = createRouter('mount');
-    await mountLink(router, { href: '/users', prefetch: false });
-
-    expect(prefetch).not.toHaveBeenCalled();
-  });
-
-  it('skips non-GET links without throwing', async () => {
-    const { router, prefetch } = createRouter('mount');
-    const button = await mountLink(router, { href: '/users', method: 'POST' });
-
-    expect(button.tagName).toBe('BUTTON');
-    expect(prefetch).not.toHaveBeenCalled();
-  });
-
-  it('skips links to other sites', async () => {
-    const { router, prefetch } = createRouter('mount');
-    await mountLink(router, { href: 'https://example.com/users' });
-
-    expect(prefetch).not.toHaveBeenCalled();
-  });
-
-  it('does not prefetch without an app default', async () => {
+describe('Link delegated prefetch attributes', () => {
+  it('renders the default marker without starting prefetch', async () => {
     const { router, prefetch } = createRouter();
-    await mountLink(router, { href: '/users' });
-
+    const link = await mountLink(router, { href: '/users' });
+    expect(link.getAttribute('data-void-prefetch')).toBe('default');
     expect(prefetch).not.toHaveBeenCalled();
   });
+
+  it('writes explicit strategies and cache durations as anchor attributes', async () => {
+    const { router } = createRouter();
+    const link = await mountLink(router, {
+      href: '/users',
+      prefetch: ['hover', 'visible'],
+      cacheFor: ['5s', '30s'],
+    });
+    expect(link.getAttribute('data-void-prefetch')).toBe('hover visible');
+    expect(link.getAttribute('data-void-cache-for')).toBe('5s,30s');
+  });
+
+  it.each([{ prefetch: false }, { 'data-void-reload': '' }] as const)(
+    'omits delegated prefetch attributes when disabled by %j',
+    async (props) => {
+      const { router } = createRouter();
+      const link = await mountLink(router, { href: '/users', ...props });
+      expect(link.hasAttribute('data-void-prefetch')).toBe(false);
+    },
+  );
 });

@@ -25,6 +25,10 @@
       "types": "./dist/plugin.d.mts",
       "import": "./dist/plugin.mjs"
     },
+    "./internal": {
+      "types": "./dist/runtime/internal.d.mts",
+      "import": "./dist/runtime/internal.mjs"
+    },
     "./deferred": {
       "types": "./dist/runtime/use-deferred.d.mts",
       "import": "./dist/runtime/use-deferred.mjs"

@@ -1,13 +1,8 @@
 <script lang="ts">
-  import { getContext, onDestroy, onMount } from "svelte";
+  import { getContext } from "svelte";
   import {
-    handleLinkClick,
-    linkActiveAttributes,
-    linkPendingAttributes,
-    linkPrefetchStrategies,
-    observeLinkVisible,
-    prefetchLink,
-    resolveLink,
+    linkPrefetchAttributes,
+    linkStateAttributes,
     type NavigationState,
     type VoidRouter,
   } from "void/pages-client";
@@ -15,162 +10,27 @@
 
   let {
     href,
-    method = "GET",
-    data = undefined,
-    preserveScroll = false,
-    preserveState = false,
-    replace = false,
-    reloadDocument = false,
-    viewTransition = undefined,
-    prefetch: prefetchProp = undefined,
+    prefetch = undefined,
     cacheFor = undefined,
     activeMatch = undefined,
-    onNavigate = undefined,
     children,
-    onclick: onclickProp = undefined,
-    onmouseenter: onMouseEnterProp = undefined,
-    onmouseleave: onMouseLeaveProp = undefined,
-    onfocus: onFocusProp = undefined,
-    onmousedown: onMouseDownProp = undefined,
-    ontouchstart: onTouchStartProp = undefined,
-    style = undefined,
     ...rest
   }: LinkProps = $props();
 
   const router = getContext<VoidRouter>("__void_router");
   const navigation = getContext<{ value: NavigationState } | undefined>("__void_navigation");
-
-  function doPrefetch() {
-    prefetchLink(router, link.href, cacheFor);
-  }
-
-  function onClick(e: MouseEvent) {
-    onclickProp?.(e);
-    handleLinkClick(e, router, link, {
-      data,
-      preserveScroll,
-      preserveState,
-      replace,
-      reloadDocument,
-      viewTransition,
-      onNavigate,
-    });
-  }
-
-  let hoverTimer: ReturnType<typeof setTimeout> | null = null;
-  let stopObserving: (() => void) | null = null;
-  let el = $state<HTMLElement | null>(null);
-
-  function onMouseEnter(e: MouseEvent) {
-    onMouseEnterProp?.(e);
-    if (e.defaultPrevented) {
-      return;
-    }
-    if (hoverTimer) {
-      clearTimeout(hoverTimer);
-    }
-    hoverTimer = setTimeout(doPrefetch, router?._hoverDelay ?? 75);
-  }
-
-  function onMouseLeave(e: MouseEvent) {
-    onMouseLeaveProp?.(e);
-    if (hoverTimer) {
-      clearTimeout(hoverTimer);
-      hoverTimer = null;
-    }
-  }
-
-  function onFocus(e: FocusEvent) {
-    onFocusProp?.(e);
-    if (!e.defaultPrevented) {
-      doPrefetch();
-    }
-  }
-
-  function onMouseDown(e: MouseEvent) {
-    onMouseDownProp?.(e);
-    if (!e.defaultPrevented) {
-      doPrefetch();
-    }
-  }
-
-  function onTouchStart(e: TouchEvent) {
-    onTouchStartProp?.(e);
-    if (!e.defaultPrevented) {
-      doPrefetch();
-    }
-  }
-
-  onMount(() => {
-    if (strategies.includes("mount")) {
-      doPrefetch();
-    }
-    if (strategies.includes("visible") && el) {
-      stopObserving = observeLinkVisible(el, doPrefetch);
-    }
-  });
-
-  onDestroy(() => {
-    if (hoverTimer) {
-      clearTimeout(hoverTimer);
-    }
-    stopObserving?.();
-  });
-
-  const link = $derived(
-    resolveLink({ href, method, data, prefetch: prefetchProp, reloadDocument }),
-  );
-  const strategies = $derived(
-    linkPrefetchStrategies(
-      { prefetch: prefetchProp, reloadDocument },
-      link,
-      router?._prefetchDefaultStrategy,
-    ),
-  );
-  // Reading router.url tracks the route URL, so this follows navigations.
-  const activeAttributes = $derived(linkActiveAttributes(router, link, activeMatch));
-  // Reading navigation.value tracks visits as they start and end.
-  const pendingAttributes = $derived(linkPendingAttributes(router, navigation?.value, link));
-  const resolvedStyle = $derived(
-    style ? `touch-action: manipulation; ${style}` : "touch-action: manipulation",
-  );
+  const state = $derived(linkStateAttributes(router, navigation?.value, href, activeMatch));
+  const prefetchAttrs = $derived(linkPrefetchAttributes(router, {
+    prefetch, cacheFor,
+    reloadDocument: Object.hasOwn(rest, "data-void-reload"),
+  }));
 </script>
 
-{#if link.isGet}
-  <a
-    bind:this={el}
-    href={link.href}
-    {...activeAttributes}
-    {...pendingAttributes}
-    {...rest}
-    style={resolvedStyle}
-    onclick={onClick}
-    onmouseenter={strategies.includes("hover") ? onMouseEnter : onMouseEnterProp}
-    onmouseleave={strategies.includes("hover") ? onMouseLeave : onMouseLeaveProp}
-    onfocus={strategies.includes("hover") ? onFocus : onFocusProp}
-    onmousedown={strategies.includes("click") ? onMouseDown : onMouseDownProp}
-    ontouchstart={strategies.includes("hover") || strategies.includes("click")
-      ? onTouchStart
-      : onTouchStartProp}
-  >
-    {@render children()}
-  </a>
-{:else}
-  <button
-    bind:this={el}
-    type="button"
-    {...pendingAttributes}
-    {...rest}
-    style={resolvedStyle}
-    onclick={onClick}
-    onmouseenter={strategies.includes("hover") ? onMouseEnter : onMouseEnterProp}
-    onmouseleave={strategies.includes("hover") ? onMouseLeave : onMouseLeaveProp}
-    onfocus={strategies.includes("hover") ? onFocus : onFocusProp}
-    onmousedown={strategies.includes("click") ? onMouseDown : onMouseDownProp}
-    ontouchstart={strategies.includes("hover") || strategies.includes("click")
-      ? onTouchStart
-      : onTouchStartProp}
-  >
-    {@render children()}
-  </button>
-{/if}
+<a
+  {href}
+  {...prefetchAttrs}
+  {...state}
+  {...rest}
+>
+  {@render children?.()}
+</a>

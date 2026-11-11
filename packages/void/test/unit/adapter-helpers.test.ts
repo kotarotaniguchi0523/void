@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vite-plus/test';
 import {
   getValidationErrors,
   isModifiedEvent,
-  mergeDataIntoHref,
 } from '../../src/pages/adapter-helpers.ts';
 
 describe('getValidationErrors', () => {
@@ -16,18 +15,6 @@ describe('getValidationErrors', () => {
       expect(getValidationErrors(body)).toBeNull();
     },
   );
-});
-
-describe('mergeDataIntoHref', () => {
-  it('serializes dates and appends before the hash', () => {
-    expect(
-      mergeDataIntoHref('/events?sort=asc#top', { from: new Date('2026-01-02T00:00:00.000Z') }),
-    ).toBe('/events?sort=asc&from=2026-01-02T00%3A00%3A00.000Z#top');
-  });
-
-  it('returns the href unchanged without data', () => {
-    expect(mergeDataIntoHref('/users#team')).toBe('/users#team');
-  });
 });
 
 describe('isModifiedEvent', () => {

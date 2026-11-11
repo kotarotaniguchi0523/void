@@ -1,14 +1,14 @@
 <script setup lang="ts">
-import { Link, useRouter } from '@void/vue';
+import { Link, createLinkClickHandler, useRouter } from '@void/vue';
 import type { Props } from './link-behavior.server.ts';
 
 defineProps<Props>();
 const router = useRouter();
+const replaceUsers = createLinkClickHandler(router, { replace: true });
 
 type LinkBehaviorWindow = Window & {
   __linkOnClick?: boolean;
   __preventedClick?: boolean;
-  __preventedNavigate?: boolean;
 };
 
 function setClicked() {
@@ -18,11 +18,6 @@ function setClicked() {
 function preventClick(event: Event) {
   event.preventDefault();
   (window as LinkBehaviorWindow).__preventedClick = true;
-}
-
-function preventNavigate(event: { preventDefault(): void }) {
-  event.preventDefault();
-  (window as LinkBehaviorWindow).__preventedNavigate = true;
 }
 </script>
 
@@ -65,26 +60,16 @@ function preventNavigate(event: { preventDefault(): void }) {
       </Link>
     </p>
 
-    <p>
-      <Link
-        href="/users"
-        data-testid="prevented-navigate-link"
-        v-bind="{ onNavigate: preventNavigate }"
-      >
-        Prevented navigate
-      </Link>
-    </p>
+    
 
     <p>
-      <Link href="/users" data-testid="replace-link" replace>Replace with users</Link>
+      <a href="/users" data-testid="replace-link" @click="replaceUsers">Replace with users</a>
     </p>
 
-    <p>
-      <Link href="/link-behavior" method="post" data-testid="post-link">Post to this page</Link>
-    </p>
+    
 
     <p>
-      <Link href="/users" data-testid="reload-link" reload-document>Reload document</Link>
+      <a href="/users" data-testid="reload-link" data-void-reload>Reload document</a>
     </p>
 
     <p>
@@ -96,17 +81,7 @@ function preventNavigate(event: { preventDefault(): void }) {
     </p>
 
     <p>
-      <Link
-        href="/link-behavior"
-        :data="{
-          tag: ['a', 'b'],
-          page: 2,
-          active: true,
-          skip: null,
-          missing: undefined,
-        }"
-        data-testid="query-data-link"
-      >
+      <Link href="/link-behavior?tag=a&tag=b&page=2&active=true" data-testid="query-data-link">
         Query data
       </Link>
     </p>

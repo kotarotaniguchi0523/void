@@ -1,4 +1,4 @@
-import { Link, useNavigation, useRouter } from '@void/react';
+import { Link, createLinkClickHandler, useNavigation, useRouter } from '@void/react';
 import { useEffect, useRef, useState } from 'react';
 import type { Props } from './link-behavior.server.ts';
 
@@ -8,7 +8,6 @@ type LinkBehaviorWindow = Window & {
   __hashNavigationReady?: boolean;
   __linkOnClick?: boolean;
   __preventedClick?: boolean;
-  __preventedNavigate?: boolean;
 };
 
 export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeUrl }: Props) {
@@ -134,35 +133,20 @@ export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeU
         </Link>
       </p>
 
-      <p>
-        <Link
-          href="/users"
-          data-testid="prevented-navigate-link"
-          onNavigate={(event) => {
-            event.preventDefault();
-            (window as LinkBehaviorWindow).__preventedNavigate = true;
-          }}
-        >
-          Prevented navigate
-        </Link>
-      </p>
+      
 
       <p>
-        <Link href="/users" data-testid="replace-link" replace>
+        <a href="/users" data-testid="replace-link" onClick={createLinkClickHandler(router, { replace: true })}>
           Replace with users
-        </Link>
+        </a>
       </p>
 
-      <p>
-        <Link href="/link-behavior" method="post" data-testid="post-link">
-          Post to this page
-        </Link>
-      </p>
+      
 
       <p>
-        <Link href="/users" data-testid="reload-link" reloadDocument>
+        <a href="/users" data-testid="reload-link" data-void-reload>
           Reload document
-        </Link>
+        </a>
       </p>
 
       <p>
@@ -178,17 +162,7 @@ export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeU
       </p>
 
       <p>
-        <Link
-          href="/link-behavior"
-          data={{
-            tag: ['a', 'b'],
-            page: 2,
-            active: true,
-            skip: null,
-            missing: undefined,
-          }}
-          data-testid="query-data-link"
-        >
+        <Link href="/link-behavior?tag=a&tag=b&page=2&active=true" data-testid="query-data-link">
           Query data
         </Link>
       </p>
