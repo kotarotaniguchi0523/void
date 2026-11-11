@@ -1,15 +1,15 @@
 <script lang="ts">
-  import { Link, useRouter } from "@void/svelte";
+  import { Link, createLinkClickHandler, useRouter } from "@void/svelte";
   import type { Props } from "./link-behavior.server.ts";
 
   type LinkBehaviorWindow = Window & {
     __linkOnClick?: boolean;
     __preventedClick?: boolean;
-    __preventedNavigate?: boolean;
   };
 
   let { title, absoluteUrl, protocolRelativeUrl }: Props = $props();
   const router = useRouter();
+  const replaceUsers = createLinkClickHandler(router, { replace: true });
 
   function setClicked() {
     (window as LinkBehaviorWindow).__linkOnClick = true;
@@ -18,11 +18,6 @@
   function preventClick(event: Event) {
     event.preventDefault();
     (window as LinkBehaviorWindow).__preventedClick = true;
-  }
-
-  function preventNavigate(event: { preventDefault(): void }) {
-    event.preventDefault();
-    (window as LinkBehaviorWindow).__preventedNavigate = true;
   }
 </script>
 
@@ -67,22 +62,16 @@
     </Link>
   </p>
 
-  <p>
-    <Link href="/users" data-testid="prevented-navigate-link" onNavigate={preventNavigate}>
-      Prevented navigate
-    </Link>
-  </p>
+  
 
   <p>
-    <Link href="/users" data-testid="replace-link" replace>Replace with users</Link>
+    <a href="/users" data-testid="replace-link" onclick={replaceUsers}>Replace with users</a>
   </p>
 
-  <p>
-    <Link href="/link-behavior" method="post" data-testid="post-link">Post to this page</Link>
-  </p>
+  
 
   <p>
-    <Link href="/users" data-testid="reload-link" reloadDocument>Reload document</Link>
+    <a href="/users" data-testid="reload-link" data-void-reload>Reload document</a>
   </p>
 
   <p>
@@ -98,17 +87,7 @@
   </p>
 
   <p>
-    <Link
-      href="/link-behavior"
-      data={{
-        tag: ["a", "b"],
-        page: 2,
-        active: true,
-        skip: null,
-        missing: undefined,
-      }}
-      data-testid="query-data-link"
-    >
+    <Link href="/link-behavior?tag=a&tag=b&page=2&active=true" data-testid="query-data-link">
       Query data
     </Link>
   </p>

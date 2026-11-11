@@ -2,13 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 import { createPageNavigationEngine } from '../../src/pages/navigation-engine.ts';
 import { parseCacheFor } from '../../src/pages/prefetch.ts';
 
-async function setup(
-  state: Record<string, unknown> | null = null,
-  storage = new Map<string, string>(),
-) {
+async function setup(key = 'initial-entry', storage = new Map<string, string>()) {
   const frames: Array<FrameRequestCallback> = [];
   const windowStub = Object.assign(new EventTarget(), {
     location: { origin: 'http://localhost', pathname: '/', search: '', hash: '' },
+    navigation: new EventTarget(),
     scrollX: 0,
     scrollY: 0,
     scrollTo: vi.fn((x: number, y: number) => {
@@ -16,27 +14,42 @@ async function setup(
       windowStub.scrollY = y;
     }),
   });
-  const updateHistory = (
-    next: Record<string, unknown>,
-    _title: string,
-    url?: string | URL | null,
-  ) => {
-    historyStub.state = next;
-    if (url != null) {
-      const target = new URL(url, windowStub.location.origin);
-      Object.assign(windowStub.location, {
-        pathname: target.pathname,
-        search: target.search,
-        hash: target.hash,
+  let nextKey = 0;
+  const navigation = Object.assign(windowStub.navigation, {
+    currentEntry: { key, url: 'http://localhost/', getState: () => undefined },
+    navigate: vi.fn((url: string, options: NavigationNavigateOptions) => {
+      const committed = Promise.resolve().then(() => {
+        const target = new URL(url, windowStub.location.origin);
+        navigation.currentEntry = {
+          key: options.history === 'replace' ? navigation.currentEntry.key : `entry-${++nextKey}`,
+          url: target.href,
+          getState: () => undefined,
+        };
+        Object.assign(windowStub.location, {
+          pathname: target.pathname,
+          search: target.search,
+          hash: target.hash,
+        });
+        return navigation.currentEntry;
       });
-    }
-  };
-  const historyStub = {
-    state,
-    scrollRestoration: 'auto',
-    replaceState: vi.fn(updateHistory),
-    pushState: vi.fn(updateHistory),
-  };
+      return { committed, finished: committed };
+    }),
+  });
+  const historyStub = { scrollRestoration: 'auto' };
+  function changeEntry(
+    entry: Omit<typeof navigation.currentEntry, 'getState'>,
+    navigationType = 'traverse',
+  ) {
+    const from = navigation.currentEntry;
+    navigation.currentEntry = { ...entry, getState: () => undefined };
+    windowStub.location.hash = new URL(entry.url).hash;
+    navigation.dispatchEvent(
+      Object.assign(new Event('currententrychange'), {
+        from,
+        navigationType,
+      }),
+    );
+  }
   vi.stubGlobal('window', windowStub);
   vi.stubGlobal('history', historyStub);
   vi.stubGlobal('sessionStorage', {
@@ -68,23 +81,26 @@ async function setup(
     prefetchHoverDelay: 75,
     prefetchDefaultCacheFor: parseCacheFor('30s'),
   });
-  engine.setPopStateHandler((url, options) => {
-    engine.prepareVisit(url, options);
+  engine.setBrowserVisitHandler(async (resource) => {
+    await resource.shell;
+    return undefined;
   });
   return {
     engine,
     window: windowStub,
     history: historyStub,
+    navigation,
+    changeEntry,
     storage,
     frame: () => frames.splice(0).forEach((callback) => callback(0)),
   };
 }
 
 async function departedPage() {
-  const page = await setup({ app: 'retained' });
+  const page = await setup();
   page.engine.start();
   page.engine.commitInitialRender();
-  const state = structuredClone(page.history.state);
+  const state = page.navigation.currentEntry.key;
   page.window.scrollX = 40;
   page.window.scrollY = 3500;
   page.window.dispatchEvent(new Event('pagehide'));
@@ -98,22 +114,22 @@ afterEach(() => {
 
 describe('Pages scroll restoration', () => {
   it('saves the departing entry without mutating the incoming history entry on pagehide', async () => {
-    const page = await setup({ app: 'departing' });
+    const page = await setup('departing');
     page.engine.start();
     page.engine.commitInitialRender();
-    const departing = structuredClone(page.history.state);
-    const incoming = { app: 'incoming' };
-    page.history.state = incoming;
+    const departing = page.navigation.currentEntry.key;
+    const incoming = { key: 'incoming', url: 'http://localhost/', getState: () => undefined };
+    page.navigation.currentEntry = incoming;
     page.window.scrollX = 40;
     page.window.scrollY = 3500;
     page.window.dispatchEvent(new Event('pagehide'));
-    expect(page.history.state).toEqual(incoming);
+    expect(page.navigation.currentEntry).toEqual(incoming);
 
     const returned = await setup(departing, page.storage);
     returned.engine.start();
     returned.engine.commitInitialRender();
     expect(returned.window.scrollTo).toHaveBeenCalledExactlyOnceWith(40, 3500);
-    expect(returned.history.state).toEqual(departing);
+    expect(returned.navigation.currentEntry.key).toEqual(departing);
   });
 
   it('restores an entry captured before pagehide, including reloads, only after render commit', async () => {
@@ -121,7 +137,7 @@ describe('Pages scroll restoration', () => {
     const page = await setup(state, storage);
     page.engine.start();
     expect(page.history.scrollRestoration).toBe('manual');
-    expect(page.history.state).toEqual(state);
+    expect(page.navigation.currentEntry.key).toEqual(state);
     page.frame();
     expect(page.window.scrollTo).not.toHaveBeenCalled();
     page.engine.commitInitialRender();
@@ -131,20 +147,20 @@ describe('Pages scroll restoration', () => {
 
   it('does not reuse a previous visit for a fresh entry at the same URL', async () => {
     const { storage } = await departedPage();
-    const page = await setup({ app: 'new entry' }, storage);
+    const page = await setup('fresh-entry', storage);
     page.window.scrollY = 120;
     page.engine.start();
     page.engine.commitInitialRender();
     expect(page.window.scrollTo).not.toHaveBeenCalled();
     expect(page.window.scrollY).toBe(120);
-    expect(page.history.state).toMatchObject({ app: 'new entry' });
+    expect(page.navigation.currentEntry.key).toBe('fresh-entry');
   });
 
-  it('does not lose initial restoration when the browser also dispatches popstate', async () => {
+  it('does not lose initial restoration when the browser also reports the initial entry', async () => {
     const { state, storage } = await departedPage();
     const page = await setup(state, storage);
     page.engine.start();
-    page.window.dispatchEvent(Object.assign(new Event('popstate'), { state }));
+    page.changeEntry({ key: state, url: 'http://localhost/' });
     page.engine.commitInitialRender();
     expect(page.window.scrollTo).toHaveBeenCalledExactlyOnceWith(40, 3500);
   });
@@ -165,7 +181,7 @@ describe('Pages scroll restoration', () => {
     const { state, storage } = await departedPage();
     const page = await setup(state, storage);
     page.engine.start();
-    page.engine.prepareVisit('#missing-target');
+    await page.engine.prepareVisit('#missing-target').shell;
     page.window.scrollTo.mockClear();
     page.engine.commitInitialRender();
     expect(page.window.scrollTo).not.toHaveBeenCalled();
@@ -175,7 +191,7 @@ describe('Pages scroll restoration', () => {
     const page = await setup();
     page.engine.start();
     page.engine.commitInitialRender();
-    const state = structuredClone(page.history.state);
+    const state = page.navigation.currentEntry.key;
     page.window.scrollY = 3500;
     vi.stubGlobal(
       'fetch',
@@ -197,7 +213,7 @@ describe('Pages scroll restoration', () => {
     const page = await setup();
     page.engine.start();
     page.engine.commitInitialRender();
-    const state = structuredClone(page.history.state);
+    const state = page.navigation.currentEntry.key;
     vi.stubGlobal(
       'fetch',
       vi.fn(async () =>
@@ -210,7 +226,7 @@ describe('Pages scroll restoration', () => {
       await visit.shell;
       await visit.commit();
     }
-    expect(page.history.state).toEqual(state);
+    expect(page.navigation.currentEntry.key).toEqual(state);
     expect(page.storage.size).toBe(1);
 
     page.window.scrollY = 900;
@@ -219,6 +235,39 @@ describe('Pages scroll restoration', () => {
     returned.engine.start();
     returned.engine.commitInitialRender();
     expect(returned.window.scrollTo).toHaveBeenCalledExactlyOnceWith(0, 900);
+  });
+
+  it('tracks native fragment entries without scrolling again or requesting page data', async () => {
+    const page = await setup();
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+    page.engine.start();
+    page.engine.commitInitialRender();
+
+    const before = page.navigation.currentEntry;
+    const fragment = { key: 'fragment-entry', url: 'http://localhost/#details' };
+    page.window.scrollY = 120;
+    page.navigation.dispatchEvent(
+      Object.assign(new Event('navigate'), {
+        canIntercept: true,
+        destination: fragment,
+        downloadRequest: null,
+        formData: null,
+        hashChange: true,
+        navigationType: 'push',
+      }),
+    );
+    page.changeEntry(fragment, 'push');
+    expect(page.window.scrollTo).not.toHaveBeenCalled();
+    expect(page.navigation.navigate).not.toHaveBeenCalled();
+    expect(page.storage.get(`void:scroll:${before.key}`)).toBe('{"x":0,"y":120}');
+
+    page.window.scrollY = 640;
+    page.changeEntry(before);
+    expect(page.window.scrollTo).toHaveBeenLastCalledWith(0, 120);
+    page.changeEntry(fragment);
+    expect(page.window.scrollTo).toHaveBeenLastCalledWith(0, 640);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it('uses the latest in-memory position when a storage write fails', async () => {
@@ -233,12 +282,10 @@ describe('Pages scroll restoration', () => {
         throw new Error('blocked');
       },
     });
-    const state = structuredClone(page.history.state);
+    const state = page.navigation.currentEntry.key;
     page.window.scrollY = 3500;
-    page.engine.prepareVisit('#next');
-    page.history.state = state;
-    page.window.location.hash = '';
-    page.window.dispatchEvent(Object.assign(new Event('popstate'), { state }));
+    await page.engine.prepareVisit('#next').shell;
+    page.changeEntry({ key: state, url: 'http://localhost/' });
     expect(page.window.scrollY).toBe(3500);
   });
 
@@ -246,7 +293,7 @@ describe('Pages scroll restoration', () => {
     const page = await setup();
     page.engine.start();
     page.engine.commitInitialRender();
-    const key = page.history.state?.__voidScrollKey;
+    const key = page.navigation.currentEntry.key;
     vi.stubGlobal(
       'fetch',
       vi.fn(async () =>
@@ -254,7 +301,7 @@ describe('Pages scroll restoration', () => {
       ),
     );
     const error = new DOMException('History blocked', 'SecurityError');
-    page.history.pushState.mockImplementationOnce(() => {
+    page.navigation.navigate.mockImplementationOnce(() => {
       throw error;
     });
     const visit = page.engine.prepareVisit('/next');

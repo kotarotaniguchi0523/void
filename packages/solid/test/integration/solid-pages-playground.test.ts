@@ -180,28 +180,6 @@ function registerClientTests(getBase: () => string, coverage: 'smoke' | 'full') 
       await page.context().close();
     }
   });
-
-  it('Link rejects dynamic mutation props with prefetch or reloadDocument', async () => {
-    const page = await newPage();
-    try {
-      await page.goto(BASE + '/link-behavior');
-      await waitForHydration(page);
-
-      await page.click('[data-testid="toggle-prefetch-method"]');
-      await page.waitForSelector('[data-testid="reactive-prefetch-error"]');
-      expect(await page.textContent('[data-testid="reactive-prefetch-error"]')).toMatch(
-        /(?:Link:|Void Link) prefetch only supports GET links/,
-      );
-
-      await page.click('[data-testid="toggle-reload-method"]');
-      await page.waitForSelector('[data-testid="reactive-reload-error"]');
-      expect(await page.textContent('[data-testid="reactive-reload-error"]')).toMatch(
-        /(?:Link:|Void Link) reloadDocument only supports GET links/,
-      );
-    } finally {
-      await page.context().close();
-    }
-  });
 }
 
 describe('solid-pages client (dev)', () => {

@@ -7,11 +7,18 @@ import {
   serializePageData,
 } from '../packages/void/src/pages/serialize.ts';
 
+function gate() {
+  let release!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { ready, release };
+}
+
 type TestWindow = Window & {
   __SPA_MARKER?: boolean;
   __linkOnClick?: boolean;
   __preventedClick?: boolean;
-  __preventedNavigate?: boolean;
 };
 
 /**
@@ -108,7 +115,105 @@ export function registerSharedClientTests({
     BASE = getBase();
   });
 
-  it('keeps the page query and scroll for actions and forms, with resets for overrides and redirects', async ({
+  it('supports prefetch, status and visit options on a plain anchor', async ({ expect }) => {
+    const page = await newPage();
+    const { ready: requested, release: markRequested } = gate();
+    const { ready: responseReady, release: releaseResponse } = gate();
+    let requests = 0;
+    try {
+      const html = await page.request.get(BASE + '/native-anchor');
+      expect(await html.text()).toMatch(
+        /<a(?=[^>]*data-testid="anchor-current")(?=[^>]*aria-current="page")[^>]*>/,
+      );
+      await page.goto(BASE + '/native-anchor');
+      await waitForHydration(page);
+      await page.getByTestId('anchor-blocked').click();
+      expect(page.url()).toBe(BASE + '/native-anchor');
+
+      await page.evaluate(() => window.scrollTo(0, 600));
+      await page.waitForFunction(() => window.scrollY === 600);
+      const entry = await page.evaluate(() => {
+        navigation.updateCurrentEntry({ state: { retained: 'anchor-replace' } });
+        return navigation.currentEntry?.key;
+      });
+      await page
+        .getByTestId('anchor-replace')
+        .evaluate((anchor) => (anchor as HTMLElement).click());
+      await page.waitForURL(BASE + '/native-anchor?replace=1');
+      await page.waitForFunction(() => !navigation.transition);
+      expect(await page.evaluate(() => navigation.currentEntry?.key)).toBe(entry);
+      expect(await page.evaluate(() => navigation.currentEntry?.getState())).toEqual({
+        retained: 'anchor-replace',
+      });
+      expect(await page.evaluate(() => window.scrollY)).toBe(600);
+
+      await page.route('**/users/1?anchor-prefetch=1', async (route) => {
+        requests++;
+        markRequested();
+        await responseReady;
+        await route.continue();
+      });
+      const link = page.getByTestId('anchor-prefetch');
+      await link.hover();
+      await requested;
+      await link.click({ noWaitAfter: true });
+      await page.waitForSelector('[data-testid="anchor-prefetch"][data-void-pending]');
+      await page.waitForSelector('[data-testid="anchor-duplicate"][data-void-pending]');
+      expect(page.url()).toBe(BASE + '/native-anchor?replace=1');
+      releaseResponse();
+      await page.getByText('alice@example.com').waitFor();
+      expect(page.url()).toBe(BASE + '/users/1?anchor-prefetch=1');
+      expect(requests).toBe(1);
+    } finally {
+      releaseResponse();
+      await page.context().close();
+    }
+  });
+
+  it('starts opted-in anchor prefetch on mount, visibility and pointer down', async () => {
+    const page = await newPage();
+    try {
+      await page.goto(BASE + '/native-anchor');
+      await waitForHydration(page);
+      for (const strategy of ['mount', 'visible', 'click'] as const) {
+        const path = '/users/1?prefetch-strategy=' + strategy;
+        const prefetched = page.waitForRequest(
+          (request) => request.url() === BASE + path && Boolean(request.headers()['x-voidpages']),
+        );
+        await page.evaluate(
+          ({ strategy, path }) => {
+            const anchor = document.createElement('a');
+            anchor.href = path;
+            anchor.textContent = strategy;
+            anchor.setAttribute('data-void-prefetch', strategy);
+            document.body.insertBefore(anchor, document.body.firstChild);
+            if (strategy === 'click') {
+              anchor.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+            }
+          },
+          { strategy, path },
+        );
+        if (strategy === 'click') {
+          const beforePointerDown = await Promise.race([
+            prefetched.then(() => true),
+            new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 200)),
+          ]);
+          expect(beforePointerDown).toBe(false);
+          await page.evaluate(() => {
+            document
+              .querySelector('a[data-void-prefetch="click"]')
+              ?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          });
+        }
+        await prefetched;
+      }
+      expect(page.url()).toBe(BASE + '/native-anchor');
+    } finally {
+      await page.context().close();
+    }
+  });
+
+  it('keeps action and form scroll in place, with resets for overrides and redirects', async ({
     expect,
   }) => {
     const page = await newPage();
@@ -157,6 +262,302 @@ export function registerSharedClientTests({
     }
   });
 
+  it('does not publish an old action redirect when a link starts during its DOM update', async ({
+    expect,
+  }) => {
+    const page = await newPage();
+    const { ready: requested, release: markRequested } = gate();
+    const { ready: canLoad, release: releaseLoader } = gate();
+    try {
+      await page.goto(BASE + '/scroll-restoration');
+      await waitForHydration(page);
+      await page.route('**/users/1?action-race=1', async (route) => {
+        markRequested();
+        await canLoad;
+        await route.continue();
+      });
+      await page.evaluate(() => {
+        const output = document.querySelector('[data-testid="scroll-request"]')!;
+        const previous = output.textContent;
+        const anchor = document.createElement('a');
+        anchor.href = '/users/1?action-race=1';
+        document.body.appendChild(anchor);
+        navigation.addEventListener('currententrychange', () => {
+          if (location.search === '?redirected=1') {
+            document.body.setAttribute('data-stale-redirect', '');
+          }
+        });
+        const observer = new MutationObserver(() => {
+          if (document.querySelector('[data-testid="scroll-request"]')?.textContent !== previous) {
+            observer.disconnect();
+            anchor.click();
+          }
+        });
+        observer.observe(document.getElementById('app')!, {
+          childList: true,
+          characterData: true,
+          subtree: true,
+        });
+      });
+      await page.getByRole('button', { name: 'Redirect action' }).click({ noWaitAfter: true });
+      await requested;
+      expect(page.url()).toBe(BASE + '/scroll-restoration');
+      releaseLoader();
+      await page.getByText('alice@example.com').waitFor();
+      expect(page.url()).toBe(BASE + '/users/1?action-race=1');
+      expect(await page.locator('body').getAttribute('data-stale-redirect')).toBeNull();
+    } finally {
+      releaseLoader();
+      await page.context().close();
+    }
+  });
+
+  it('recovers an action entry when a navigation from currententrychange fails', async () => {
+    const page = await newPage();
+    try {
+      await page.goto(BASE + '/scroll-restoration');
+      await waitForHydration(page);
+      const failedUrl = BASE + '/users/1?action-entry-race=1';
+      const redirectUrl = BASE + '/scroll-restoration?redirected=1';
+      await page.route(failedUrl, (route) =>
+        route.fulfill({
+          headers: { 'x-voidpages': 'true' },
+          contentType: 'application/json',
+          body: '{',
+        }),
+      );
+      const timeOrigin = await page.evaluate((url) => {
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        document.body.appendChild(anchor);
+        navigation.addEventListener('currententrychange', () => {
+          if (location.search === '?redirected=1') {
+            anchor.click();
+          }
+        });
+        return performance.timeOrigin;
+      }, failedUrl);
+      const failedRequest = page.waitForRequest(
+        (request) => request.url() === failedUrl && Boolean(request.headers()['x-voidpages']),
+        { timeout: 5000 },
+      );
+      const reload = page.waitForRequest(
+        (request) => request.isNavigationRequest() && request.url() === redirectUrl,
+        { timeout: 5000 },
+      );
+      await Promise.all([
+        failedRequest,
+        reload,
+        page.getByRole('button', { name: 'Redirect action' }).click({ noWaitAfter: true }),
+      ]);
+      await page.waitForFunction((previous) => performance.timeOrigin !== previous, timeOrigin);
+      await waitForHydration(page);
+      expect(page.url()).toBe(redirectUrl);
+    } finally {
+      await page.context().close();
+    }
+  });
+
+  it('reloads the destination if the new route throws during its first render', async () => {
+    const page = await newPage();
+    try {
+      await page.goto(BASE + '/');
+      await waitForHydration(page);
+      const timeOrigin = await page.evaluate(() => {
+        document.documentElement.setAttribute('data-fail-route-render', '');
+        const anchor = document.createElement('a');
+        anchor.href = '/native-anchor';
+        anchor.textContent = 'Open failing route';
+        document.body.insertBefore(anchor, document.body.firstChild);
+        return performance.timeOrigin;
+      });
+      const destination = BASE + '/native-anchor';
+      const reload = page.waitForRequest(
+        (request) => request.isNavigationRequest() && request.url() === destination,
+        { timeout: 5000 },
+      );
+      await Promise.all([
+        reload,
+        page.getByRole('link', { name: 'Open failing route' }).click({ noWaitAfter: true }),
+      ]);
+      await page.getByRole('heading', { name: 'Native anchor' }).waitFor();
+      expect(await page.evaluate(() => performance.timeOrigin)).not.toBe(timeOrigin);
+      expect(page.url()).toBe(destination);
+    } finally {
+      await page.context().close();
+    }
+  });
+
+  it('soft navigates plain anchors and reports success after the destination renders', async () => {
+    const page = await newPage();
+    const { ready: requestStarted, release: markRequestStarted } = gate();
+    const { ready: loaderReady, release: releaseLoader } = gate();
+    try {
+      await page.goto(BASE + '/');
+      await waitForHydration(page);
+      await page.route('**/users/1?native-link=1', async (route) => {
+        if (route.request().headers()['x-voidpages']) {
+          markRequestStarted();
+          await loaderReady;
+        }
+        await route.continue();
+      });
+      await page.evaluate(() => {
+        (window as TestWindow).__SPA_MARKER = true;
+        const link = document.createElement('a');
+        link.href = '/users/1?native-link=1';
+        link.textContent = 'Plain user link';
+        document.body.insertBefore(link, document.body.firstChild);
+        navigation.addEventListener(
+          'navigatesuccess',
+          () => {
+            document.body.dataset.navigationFinished = String(
+              document.body.textContent?.includes('alice@example.com'),
+            );
+          },
+          { once: true },
+        );
+      });
+      const link = page.getByRole('link', { name: 'Plain user link' });
+      await link.focus();
+      await link.press('Enter', { noWaitAfter: true });
+      await requestStarted;
+      expect(page.url()).toBe(BASE + '/');
+      expect(await page.getByText('alice@example.com').count()).toBe(0);
+      releaseLoader();
+      await page.waitForSelector('body[data-navigation-finished="true"]');
+      expect(page.url()).toBe(BASE + '/users/1?native-link=1');
+      expect(await link.evaluate((anchor) => document.activeElement === anchor)).toBe(false);
+      expect(await page.evaluate(() => (window as TestWindow).__SPA_MARKER)).toBe(true);
+
+      await page.evaluate(() => navigation.back().finished?.then(() => {}));
+      expect(page.url()).toBe(BASE + '/');
+      expect(await page.getByRole('heading', { name: 'Welcome' }).count()).toBe(1);
+      await page.evaluate(() => navigation.forward().finished?.then(() => {}));
+      expect(page.url()).toBe(BASE + '/users/1?native-link=1');
+      expect(await page.getByText('alice@example.com').count()).toBeGreaterThan(0);
+    } finally {
+      releaseLoader();
+      await page.context().close();
+    }
+  });
+
+  it('does not commit a plain anchor superseded during precommit', async () => {
+    const page = await newPage();
+    const { ready: firstRequest, release: markFirstRequest } = gate();
+    const { ready: firstLoaderReady, release: releaseFirstLoader } = gate();
+    try {
+      await page.goto(BASE + '/');
+      await waitForHydration(page);
+      await page.route('**/users/1?first-native=1', async (route) => {
+        markFirstRequest();
+        await firstLoaderReady;
+        await route.continue().catch(() => {});
+      });
+      const initialHistory = await page.evaluate(() => {
+        for (const [href, text] of [
+          ['/users/1?first-native=1', 'Slow plain link'],
+          ['/users/2?second-native=1', 'Fast plain link'],
+        ] as const) {
+          const link = document.createElement('a');
+          link.href = href;
+          link.textContent = text;
+          document.body.insertBefore(link, document.body.firstChild);
+        }
+        return navigation.entries().length;
+      });
+      await page.getByRole('link', { name: 'Slow plain link' }).click({ noWaitAfter: true });
+      await firstRequest;
+      expect(page.url()).toBe(BASE + '/');
+      await page.getByRole('link', { name: 'Fast plain link' }).click({ noWaitAfter: true });
+      await page.getByText('bob@example.com').waitFor();
+      releaseFirstLoader();
+      expect(page.url()).toBe(BASE + '/users/2?second-native=1');
+      expect(await page.evaluate(() => navigation.entries().length)).toBe(initialHistory + 1);
+      expect(await page.getByText('alice@example.com').count()).toBe(0);
+    } finally {
+      releaseFirstLoader();
+      await page.context().close();
+    }
+  });
+
+  it('commits only the final URL and reuses the response of a precommit redirect', async () => {
+    const page = await newPage();
+    let destinationRequests = 0;
+    try {
+      await page.goto(BASE + '/');
+      await waitForHydration(page);
+      await page.route('**/users/1?native-redirect=1', (route) =>
+        route.fulfill({ status: 302, headers: { location: '/users/2?native-redirect=1' } }),
+      );
+      page.on('request', (request) => {
+        if (request.url() === BASE + '/users/2?native-redirect=1') {
+          destinationRequests++;
+        }
+      });
+      await page.evaluate(() => {
+        const link = document.createElement('a');
+        link.href = '/users/1?native-redirect=1';
+        link.textContent = 'Redirected plain link';
+        document.body.insertBefore(link, document.body.firstChild);
+        navigation.addEventListener(
+          'currententrychange',
+          () => {
+            document.body.setAttribute('data-first-committed-path', location.pathname);
+          },
+          { once: true },
+        );
+      });
+      await page.getByRole('link', { name: 'Redirected plain link' }).click({ noWaitAfter: true });
+      await page.getByText('bob@example.com').waitFor();
+      expect(page.url()).toBe(BASE + '/users/2?native-redirect=1');
+      expect(await page.locator('body').getAttribute('data-first-committed-path')).toBe('/users/2');
+      expect(destinationRequests).toBe(1);
+    } finally {
+      await page.context().close();
+    }
+  });
+
+  it('reuses a redirected prefetch when the native anchor is opened', async () => {
+    const page = await newPage();
+    const first = '/users/1?prefetch-redirect=1';
+    const final = '/users/2?prefetch-redirect=1';
+    let destinationRequests = 0;
+    try {
+      await page.route('**/users/1?prefetch-redirect=1', (route) =>
+        route.fulfill({ status: 302, headers: { location: final } }),
+      );
+      page.on('request', (request) => {
+        if (request.url() === BASE + final) {
+          destinationRequests++;
+        }
+      });
+      await page.goto(BASE + '/native-anchor');
+      await waitForHydration(page);
+      const prefetched = page.waitForResponse(
+        (response) =>
+          response.url() === BASE + final && response.request().headers()['purpose'] === 'prefetch',
+      );
+      await page.evaluate((href) => {
+        (window as TestWindow).__SPA_MARKER = true;
+        const anchor = document.createElement('a');
+        anchor.href = href;
+        anchor.textContent = 'Redirected prefetch';
+        anchor.setAttribute('data-testid', 'prefetch-redirect-link');
+        anchor.setAttribute('data-void-prefetch', 'mount');
+        document.body.insertBefore(anchor, document.body.firstChild);
+      }, first);
+      await prefetched;
+      await page.getByTestId('prefetch-redirect-link').click({ noWaitAfter: true });
+      await page.getByText('bob@example.com').waitFor();
+      expect(page.url()).toBe(BASE + final);
+      expect(await page.evaluate(() => (window as TestWindow).__SPA_MARKER)).toBe(true);
+      expect(destinationRequests).toBe(1);
+    } finally {
+      await page.context().close();
+    }
+  });
+
   it('visits typed destinations', async ({ expect }) => {
     const page = await newPage();
     try {
@@ -167,7 +568,7 @@ export function registerSharedClientTests({
       });
       await page.getByTestId('typed-visit').click();
       await page.waitForURL(BASE + '/users/2?tab=visit');
-      expect(await page.textContent('body')).toContain('Bob');
+      await page.getByText('bob@example.com').waitFor();
       expect(await page.evaluate(() => (window as TestWindow).__SPA_MARKER)).toBe(true);
     } finally {
       await page.context().close();
@@ -292,6 +693,33 @@ export function registerSharedClientTests({
     }
   });
 
+  it('does not mark GET links pending while useForm submits a mutation', async ({ expect }) => {
+    const page = await newPage();
+    const { ready: requested, release: markRequested } = gate();
+    const { ready: released, release: releaseRequest } = gate();
+    try {
+      await page.goto(BASE + '/users');
+      await waitForHydration(page);
+      await page.route('**/users', async (route) => {
+        if (route.request().method() === 'POST') {
+          markRequested();
+          await released;
+        }
+        await route.continue();
+      });
+      await page.locator('form button[type="submit"]').first().click({ noWaitAfter: true });
+      await requested;
+      expect(
+        await page.locator('nav a[href="/users"]').getAttribute('data-void-pending'),
+      ).toBeNull();
+      releaseRequest();
+      await page.getByText('Name is required', { exact: true }).first().waitFor();
+    } finally {
+      releaseRequest();
+      await page.context().close();
+    }
+  });
+
   it('Link marks links to the page that is loading', async ({ expect }) => {
     const page = await newPage();
     // Holds the matching requests, keeping the visit in flight until release().
@@ -314,15 +742,8 @@ export function registerSharedClientTests({
       await page.goto(BASE + '/link-behavior');
       await waitForHydration(page);
 
-      await hold((request) => request.method() === 'POST');
-      await page.click('[data-testid="post-link"]');
-      await page.waitForSelector('[data-testid="post-link"][data-void-pending]');
-      // A GET link to the same page isn't pending while it is submitting.
-      expect(await pending('[data-testid="absolute-current-link"]')).toBeNull();
-      release();
-      await page.waitForSelector('[data-testid="post-link"]:not([data-void-pending])');
-      await page.unrouteAll();
-
+      // Non-GET Links no longer exist. Action/Forms have their own pending
+      // contract; this assertion covers native GET Link pending state only.
       // Page data, prefetched or not, comes from a JSON request.
       await hold((request) => request.headers().accept === 'application/json');
       await page.click('nav a[href="/users"]');
@@ -337,7 +758,9 @@ export function registerSharedClientTests({
     }
   });
 
-  it('restores scroll after browser Back from an ordinary document link', async ({ expect }) => {
+  it('restores scroll after browser Back from a link that requests a document load', async ({
+    expect,
+  }) => {
     const page = await newPage();
     const errors: Array<string> = [];
     page.on('pageerror', (error) => errors.push(error.message));
@@ -368,7 +791,9 @@ export function registerSharedClientTests({
       });
       expect(before.scrollY).toBeGreaterThan(1000);
 
-      await row.getByRole('link', { name: 'Go to Users' }).click();
+      const documentLink = row.getByRole('link', { name: 'Go to Users' });
+      await documentLink.evaluate((link) => link.setAttribute('data-void-reload', ''));
+      await documentLink.click();
       await page.waitForURL(BASE + '/users');
       await waitForHydration(page);
       expect(await page.evaluate(() => (window as TestWindow).__SPA_MARKER)).toBeUndefined();
@@ -400,34 +825,63 @@ export function registerSharedClientTests({
     }
   });
 
-  if (coverage === 'smoke') {
-    it('SPA navigation: home → users', async () => {
-      const page = await newPage();
+  it('SPA navigation: home → users', async () => {
+    const page = await newPage();
 
-      try {
-        await page.goto(BASE + '/');
-        await waitForHydration(page);
+    try {
+      await page.goto(BASE + '/');
+      await waitForHydration(page);
 
-        // Set a marker to detect if a full page reload happens
-        await page.evaluate(() => {
-          (window as TestWindow).__SPA_MARKER = true;
+      // Set a marker to detect if a full page reload happens
+      await page.evaluate(() => {
+        (window as TestWindow).__SPA_MARKER = true;
+        navigation.addEventListener('navigate', (event) => {
+          if (new URL(event.destination.url).pathname === '/users') {
+            document.body.dataset.nativeLinkSource = String(
+              event.sourceElement?.closest('a')?.getAttribute('href') === '/users',
+            );
+          }
         });
+      });
 
-        await page.click('a[href="/users"]');
-        await page.waitForFunction(() =>
-          document.querySelector('h1')?.textContent?.includes('Users'),
-        );
+      await page.click('a[href="/users"]');
+      await page.waitForFunction(() =>
+        document.querySelector('h1')?.textContent?.includes('Users'),
+      );
 
-        expect(page.url()).toBe(BASE + '/users');
-        expect(await page.evaluate(() => (window as TestWindow).__SPA_MARKER)).toBe(true);
+      expect(page.url()).toBe(BASE + '/users');
+      expect(await page.evaluate(() => (window as TestWindow).__SPA_MARKER)).toBe(true);
+      expect(await page.locator('body').getAttribute('data-native-link-source')).toBe('true');
 
-        const text = await page.textContent('body');
-        expect(text).toContain('Alice');
-        expect(text).toContain('Bob');
-      } finally {
-        await page.context().close();
-      }
-    });
+      const text = await page.textContent('body');
+      expect(text).toContain('Alice');
+      expect(text).toContain('Bob');
+    } finally {
+      await page.context().close();
+    }
+  });
+  it('uses the committed page URL for a native hash-only anchor', async () => {
+    const page = await newPage();
+    try {
+      await page.goto(BASE + '/');
+      await waitForHydration(page);
+      await page.click('a[href="/users"]');
+      await page.getByRole('heading', { name: 'Users' }).waitFor();
+      const timeOrigin = await page.evaluate(() => performance.timeOrigin);
+      await page.evaluate(() => {
+        const anchor = document.createElement('a');
+        anchor.href = '#details';
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+      });
+      await page.waitForURL(BASE + '/users#details');
+      expect(await page.evaluate(() => performance.timeOrigin)).toBe(timeOrigin);
+    } finally {
+      await page.context().close();
+    }
+  });
+  if (coverage === 'smoke') {
     return;
   }
 
@@ -933,8 +1387,10 @@ export function registerSharedClientTests({
       await page.goto(BASE + '/users');
       await waitForHydration(page);
 
-      await page.fill('input:near(:text("Name:"))', name);
-      await page.fill('input:near(:text("Email:"))', email);
+      const fields = page.locator('form').getByRole('textbox');
+      expect(await fields.count()).toBe(2);
+      await fields.nth(0).fill(name);
+      await fields.nth(1).fill(email);
       await page.click('button[type="submit"]');
       await page.waitForFunction((value) => document.body?.textContent?.includes(value), name);
       const submittedText = await page.textContent('body');
@@ -987,21 +1443,6 @@ export function registerSharedClientTests({
 
       await page.click('[data-testid="prevented-click-link"]');
       await page.waitForFunction(() => (window as TestWindow).__preventedClick === true);
-
-      expect(page.url()).toBe(BASE + '/link-behavior');
-    } finally {
-      await page.context().close();
-    }
-  });
-
-  it('Link supports cancellable onNavigate', async () => {
-    const page = await newPage();
-    try {
-      await page.goto(BASE + '/link-behavior');
-      await waitForHydration(page);
-
-      await page.click('[data-testid="prevented-navigate-link"]');
-      await page.waitForFunction(() => (window as TestWindow).__preventedNavigate === true);
 
       expect(page.url()).toBe(BASE + '/link-behavior');
     } finally {
@@ -1083,7 +1524,7 @@ export function registerSharedClientTests({
     }
   });
 
-  it('Link merges GET data into href and navigation URL', async () => {
+  it('Link follows a prebuilt query URL', async () => {
     const page = await newPage();
     try {
       await page.goto(BASE + '/link-behavior');

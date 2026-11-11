@@ -9,7 +9,7 @@ import {
   isCallSiteActionError,
   isVoidActionError,
   submitAction,
-  type VoidRouter,
+  type RuntimeVoidRouter,
 } from '../../src/pages/client.ts';
 
 declare module 'void/routes' {
@@ -23,8 +23,8 @@ declare module 'void/routes' {
   }
 }
 
-function routerWithVisit(visit: VoidRouter['visit']): VoidRouter {
-  return {
+function routerWithVisit(visit: RuntimeVoidRouter['visit']): RuntimeVoidRouter {
+  const router: RuntimeVoidRouter = {
     _hoverDelay: 75,
     get url() {
       return new URL('http://localhost/');
@@ -44,6 +44,8 @@ function routerWithVisit(visit: VoidRouter['visit']): VoidRouter {
     flush: vi.fn(),
     flushAll: vi.fn(),
   };
+  createActionClient().setActionRouter(router);
+  return router;
 }
 
 function stubLocation(pathname: string, search = '') {

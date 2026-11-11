@@ -6,7 +6,7 @@ export default function UserDetailPage({ user }: Props) {
     <div>
       <h1>{user.name}</h1>
       <p>Email: {user.email}</p>
-      <Link href="/users" prefetch>
+      <Link href="/users" prefetch="hover">
         &larr; Back to Users
       </Link>
     </div>

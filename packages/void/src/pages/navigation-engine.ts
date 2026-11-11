@@ -3,8 +3,7 @@
 import { PAGES_PROTOCOL_VERSION } from '@void/edge';
 import { PRESERVED_QUERY_HEADER, searchWithoutActionKey } from './action-key.ts';
 import { createActionErrorFromResponse, isAbortError } from './action-result.ts';
-import { pageBoundarySlots, clientPageError, showTerminalPageError } from './boundary-client.ts';
-import type { BoundaryManifest } from './boundary-plans.ts';
+import { startAnchorPrefetch } from './anchor-prefetch.ts';
 import { initClientHead, applyClientHead } from './head-client.ts';
 import type { HeadDescriptor } from './head.ts';
 import { PrefetchCache, parseCacheFor } from './prefetch.ts';
@@ -12,7 +11,7 @@ import type { CacheForInput, CacheForResult, LinkPrefetchValue } from './prefetc
 import type { PageObject } from './protocol.ts';
 import { createScrollRestoration } from './scroll-restoration.ts';
 import { decodePageData, deserializePageData, serializePageData } from './serialize.ts';
-import { decodePagePath, isSameOrigin } from './url.ts';
+import { decodePagePath, isPageUrlProtocol, isSameOrigin } from './url.ts';
 
 /**
  * The server leaves a named action's key out of the page URL. When the page URL
@@ -47,6 +46,28 @@ type PageFetchOptions = RequestInit & { headers: Record<string, string> };
 
 type StaticPageDataResult = { pageData: PageData; resolvedDeferred: boolean };
 
+/** Use a full document URL: opaque Capacitor origins are not URL bases. */
+function documentBaseUrl(): URL {
+  const { href, origin, pathname, search, hash } = window.location;
+  return new URL(href || origin + pathname + search + hash);
+}
+
+const PREFETCH_REDIRECT = Symbol('void:prefetch-redirect');
+type PrefetchRedirect = {
+  [PREFETCH_REDIRECT]: true;
+  destination: string;
+  pageData: PageData;
+};
+
+function isPrefetchRedirect(value: unknown): value is PrefetchRedirect {
+  return typeof value === 'object' && value !== null && PREFETCH_REDIRECT in value;
+}
+
+/** Preserve the existing prefetch() data contract without exposing cache metadata. */
+function unwrapPrefetchedPageData(value: unknown): unknown {
+  return isPrefetchRedirect(value) ? value.pageData : value;
+}
+
 type NavigationCommitTarget = { fetchUrl: string; hash: string; method: string };
 
 export type VisitOptions = {
@@ -60,10 +81,15 @@ export type VisitOptions = {
   resolveOn?: 'data' | 'commit';
   /** @internal Used by React Actions to avoid waiting for a commit blocked by the action itself. */
   _resolveOnShell?: boolean;
-  /** @internal Used by popstate handler to pass saved scroll position */
+  /** @internal Saved position of the destination entry. */
   _scrollPosition?: { x: number; y: number } | null;
-  /** @internal Used by popstate handler to avoid writing history while traversing */
-  _popstate?: boolean;
+  /** @internal The browser has already committed this destination. */
+  _entryCommitted?: boolean;
+  _entryKey?: string;
+  /** @internal A native fragment navigation already controls scrolling. */
+  _nativeScroll?: boolean;
+  /** @internal The browser owns this visit’s URL and cancellation. */
+  _navigationSignal?: AbortSignal;
   /** @internal Used by router.refresh() to refetch the current URL even when it has a hash */
   _refresh?: boolean;
   /** @internal Used by actions: the page query they added to the URL, which redirects leave out */
@@ -71,7 +97,6 @@ export type VisitOptions = {
 };
 
 export type PrefetchOptions = {
-  method?: string;
   cacheFor?: CacheForInput;
 };
 
@@ -120,10 +145,18 @@ export type PageNavigationResource = {
   options: VisitOptions;
   immediate: boolean;
   shell: Promise<PageNavigationResult | undefined>;
+  destination(): string;
   abort(): void;
-  /** Resolves false when a newer visit has already set the URL, so nothing was committed. */
+  /** Resolves false when this visit no longer owns the navigation. */
   commit(): Promise<boolean>;
   dispose(): void;
+};
+
+type ApplyVisit = (resource: PageNavigationResource) => Promise<PageData | undefined>;
+type BrowserVisit = {
+  options: VisitOptions;
+  apply: ApplyVisit;
+  data?: { resolve(value: PageData | undefined): void; reject(reason: unknown): void };
 };
 
 export type PageNavigationEngine = {
@@ -133,10 +166,11 @@ export type PageNavigationEngine = {
   initialComponent: unknown;
   initialLayouts: Array<unknown>;
   prepareVisit(url: string, options?: VisitOptions): PageNavigationResource;
+  visit(url: string, options: VisitOptions, apply: ApplyVisit): Promise<PageData | undefined>;
+  setBrowserVisitHandler(handler: ApplyVisit | null): void;
   prefetch(url: string, options?: PrefetchOptions): Promise<unknown>;
-  flush(url: string, method?: string): void;
+  flush(url: string): void;
   flushAll(): void;
-  setPopStateHandler(handler: (url: string, options: VisitOptions) => void): void;
   start(): void;
   /** Called after the adapter commits the initial page DOM. */
   commitInitialRender(): void;
@@ -275,17 +309,58 @@ export async function createPageNavigationEngine(
   const _prefetchCache = new PrefetchCache();
   const uncachedPayloads = new WeakSet<object>();
   let _nextNavigationId = 0;
-  // The newest visit whose URL is in the address bar: the last commit, or a back/forward
-  // visit, which the browser has already moved to. An older visit must not commit over it.
-  let _urlNavigationId = 0;
+  let unrenderedEntry: string | undefined;
+  let preparedEntryUrl: string | undefined;
   let _pendingResource: PageNavigationResource | null = null;
   let _committedResource: PageNavigationResource | null = null;
   let _committedDeferredRegistry: DeferredRegistry | null = null;
   let _htmlDeferredRegistry: DeferredRegistry | null = null;
   let _currentFetchUrl = window.location.pathname + window.location.search;
-  let popStateHandler: ((url: string, options: VisitOptions) => void) | null = null;
+  let browserVisitHandler: ApplyVisit | null = null;
+  const browserVisits = new WeakSet<BrowserVisit>();
+  const renderedPageNavigation = Symbol('void:rendered-page-navigation');
+  const renderedFragmentNavigation = Symbol('void:rendered-fragment-navigation');
+  let started = false;
+  let interceptedTraversal: string | null = null;
+  const exposedResources = new Set<PageNavigationResource>();
+  const retiredResources = new Set<PageNavigationResource>();
+
+  function abortPendingResource(resource: PageNavigationResource): void {
+    if (_pendingResource === resource) {
+      _pendingResource = null;
+      supersedeResource(resource);
+    }
+  }
+
+  function supersedeResource(resource: PageNavigationResource): void {
+    if (exposedResources.delete(resource)) {
+      // An adapter can still render this payload while its successor is preparing.
+      retiredResources.add(resource);
+    } else {
+      resource.abort();
+    }
+  }
+
+  function exposeResource(
+    resource: PageNavigationResource,
+    shell = resource.shell,
+    options = resource.options,
+  ): PageNavigationResource {
+    return {
+      ...resource,
+      options,
+      shell: shell.then((result) => {
+        resource.options._navigationSignal?.throwIfAborted();
+        if (result && _pendingResource === resource) {
+          exposedResources.add(resource);
+        }
+        return result;
+      }),
+    };
+  }
+  let nativeFragment: string | null = null;
   let initialScrollPosition: { x: number; y: number } | null = null;
-  const initialUrl = window.location.pathname + window.location.search + window.location.hash;
+  const initialEntryKey = window.navigation.currentEntry?.key;
   const scrollRestoration = createScrollRestoration();
 
   async function resolveComponent(id: string): Promise<unknown> {
@@ -329,7 +404,7 @@ export async function createPageNavigationEngine(
   }
 
   function getStaticPageDataUrl(url: string): string {
-    const { pathname } = new URL(url || '/', window.location.origin);
+    const { pathname } = new URL(url || '/', documentBaseUrl());
     const filePath = pathname === '/' ? 'index' : pathname.replace(/^\/+/, '');
     return `${STATIC_PAGE_DATA_PREFIX}/${filePath}${pathname !== '/' && pathname.endsWith('/') ? 'index' : ''}.json`;
   }
@@ -611,20 +686,30 @@ export async function createPageNavigationEngine(
         return pageData;
       }
       return fetchPageResponse(url, { method: 'GET', headers }).then(async (r) => {
-        if (!r || r.redirected) {
-          return null;
+        if (!r) {
+          // Transient network errors must not turn a later visit into a hard navigation.
+          throw new Error('pages: Prefetch request failed.');
         }
-        if (!r.headers.get('X-VoidPages')) {
-          return (
-            (await loadStaticPageData(url, r, undefined, !STATIC_PAGE_DATA_FAST_PATH))?.pageData ??
-            null
-          );
+        let destination: string | undefined;
+        if (r.redirected) {
+          const current = documentBaseUrl();
+          const redirect = new URL(r.url, current);
+          if (!isPageUrlProtocol(redirect) || !isSameOrigin(redirect, current)) {
+            return null;
+          }
+          destination = redirect.pathname + redirect.search + redirect.hash;
         }
-        const data = decodePageData<PageData>(await r.json());
-        if (!r.ok || /no-store/i.test(r.headers.get('Cache-Control') ?? '')) {
-          uncachedPayloads.add(data);
-        }
-        return data;
+        const pageData = !r.headers.get('X-VoidPages')
+          ? ((await loadStaticPageData(
+              destination ?? url,
+              r,
+              undefined,
+              !STATIC_PAGE_DATA_FAST_PATH,
+            ))?.pageData ?? null)
+          : decodePageData<PageData>(await r.json());
+        return destination && pageData
+          ? { [PREFETCH_REDIRECT]: true, destination, pageData } satisfies PrefetchRedirect
+          : pageData;
       });
     });
   }
@@ -650,18 +735,57 @@ export async function createPageNavigationEngine(
   deferredWindow.__rejectDeferred = (group: string, error: unknown) =>
     _htmlDeferredRegistry?.resolve(group, undefined, error);
 
-  function commitHashNavigation(
-    effectiveFetchUrl: string,
-    hash: string,
-    options: VisitOptions,
-    writeHistory: boolean,
-  ): void {
-    if (writeHistory) {
-      scrollRestoration.writeHistory(effectiveFetchUrl + hash, !!options.replace);
+  function recoverUnrenderedEntry(id: number): void {
+    if (
+      id === _nextNavigationId &&
+      unrenderedEntry !== undefined &&
+      window.navigation.currentEntry?.key === unrenderedEntry
+    ) {
+      unrenderedEntry = undefined;
+      window.location.reload();
     }
-    _currentFetchUrl = effectiveFetchUrl;
-    scrollRestoration.commit();
-    restoreScroll(options._scrollPosition, hash);
+  }
+
+  async function applyBrowserVisit(
+    apply: ApplyVisit,
+    resource: PageNavigationResource,
+  ): Promise<PageData | undefined> {
+    try {
+      const result = await apply(resource);
+      if (!result && !resource.immediate && !resource.options._navigationSignal?.aborted) {
+        recoverUnrenderedEntry(resource.id);
+      }
+      return result;
+    } catch (error) {
+      if (!resource.options._navigationSignal?.aborted) {
+        recoverUnrenderedEntry(resource.id);
+      }
+      if (_pendingResource?.id === resource.id) {
+        abortPendingResource(_pendingResource);
+      }
+      throw error;
+    }
+  }
+
+  function navigateEntry(url: string, replace: boolean, info: unknown) {
+    return window.navigation.navigate(url, {
+      history: replace ? 'replace' : 'push',
+      ...(replace && { state: window.navigation.currentEntry?.getState() }),
+      info,
+    });
+  }
+
+  async function publishEntry(
+    url: string,
+    replace: boolean,
+    info: typeof renderedPageNavigation | typeof renderedFragmentNavigation,
+  ): Promise<string | undefined> {
+    const navigation = navigateEntry(url, replace, info);
+    void navigation.finished?.catch(() => {});
+    if (!navigation.committed) {
+      throw new Error('Void Router: browser did not start the navigation.');
+    }
+    return (await navigation.committed).key;
   }
 
   async function loadNavigationShell(
@@ -678,15 +802,11 @@ export async function createPageNavigationEngine(
     // load. Capacitor's iOS WebView uses capacitor: for local pages.
     // Unsafe schemes (javascript:, data:, ...) must never reach location.href.
     // Check the scheme first: a blob: URL reports the origin that created it.
-    const target = new URL(url, window.location.origin);
-    if (
-      target.protocol !== 'http:' &&
-      target.protocol !== 'https:' &&
-      target.protocol !== 'capacitor:'
-    ) {
+    const target = new URL(url, documentBaseUrl());
+    if (!isPageUrlProtocol(target)) {
       throw new Error(`Void Router: refusing to navigate to a ${target.protocol} URL.`);
     }
-    if (!isSameOrigin(target, window.location.origin)) {
+    if (!isSameOrigin(target, documentBaseUrl())) {
       if (method !== 'GET') {
         throw new Error('Void Router: non-GET visits must target the current origin.');
       }
@@ -729,40 +849,44 @@ export async function createPageNavigationEngine(
     }
 
     let pageData: PageData | undefined;
-    if (options._refresh) {
-      _prefetchCache.flush(fetchUrl, method);
+    let cacheEntry = method === 'GET' ? _prefetchCache.get(fetchUrl) : null;
+    let cachedPageData: unknown;
+    if (cacheEntry) {
+      try {
+        cachedPageData = await Promise.race([cacheEntry.response, abortSignalPromise(signal)]);
+      } catch {
+        signal.throwIfAborted();
+        // A speculative request may fail while the user is already visiting.
+        // Retry the regular GET path rather than failing the navigation.
+        if (_prefetchCache.get(fetchUrl) === cacheEntry) {
+          _prefetchCache.flush(fetchUrl);
+        }
+        cacheEntry = null;
+      }
     }
-    const cacheEntry = method === 'GET' ? _prefetchCache.get(fetchUrl, method) : null;
 
     if (cacheEntry) {
-      const cachedPageData = await cacheEntry.response;
-      _prefetchCache.consume(fetchUrl, method);
+      signal.throwIfAborted();
+      _prefetchCache.consume(fetchUrl);
       if (cachedPageData === null) {
         window.location.href = url;
         return undefined;
       }
+      if (isPrefetchRedirect(cachedPageData)) {
+        const target = new URL(cachedPageData.destination, documentBaseUrl());
+        commitTarget.fetchUrl = target.pathname + target.search;
+        commitTarget.hash = target.hash;
+      }
       // Deferred initialization and adapters mutate props; retain the cached wire payload.
-      pageData = clonePageData(cachedPageData as PageData);
+      pageData = clonePageData(
+        isPrefetchRedirect(cachedPageData) ? cachedPageData.pageData : cachedPageData as PageData,
+      );
       deferredRegistry.setup(pageData, true);
-      if (!_prefetchCache.isFresh(cacheEntry)) {
-        void fetchPrefetchPageData(fetchUrl)
-          .then((data) => {
-            if (
-              data &&
-              typeof data === 'object' &&
-              !uncachedPayloads.has(data) &&
-              _prefetchCache.get(fetchUrl, method) === cacheEntry
-            ) {
-              _prefetchCache.flush(fetchUrl, method);
-              _prefetchCache.set(
-                fetchUrl,
-                method,
-                Promise.resolve(data),
-                PREFETCH_DEFAULT_CACHE_FOR,
-              );
-            }
-          })
-          .catch(() => {});
+      if (!cacheEntry.singleUse && !_prefetchCache.isFresh(cacheEntry)) {
+        const bgFetch = fetchPrefetchPageData(fetchUrl);
+        // Drop the stale entry so the revalidated data lands (set() won't overwrite a usable one).
+        _prefetchCache.flush(fetchUrl);
+        _prefetchCache.set(fetchUrl, bgFetch, PREFETCH_DEFAULT_CACHE_FOR);
       }
     } else {
       if (method === 'GET' && STATIC_PAGE_DATA_ENABLED && STATIC_PAGE_DATA_FAST_PATH) {
@@ -771,7 +895,6 @@ export async function createPageNavigationEngine(
           pageData = staticPageData.pageData;
           _prefetchCache.set(
             fetchUrl,
-            method,
             Promise.resolve(clonePageData(pageData)),
             PREFETCH_DEFAULT_CACHE_FOR,
           );
@@ -786,14 +909,15 @@ export async function createPageNavigationEngine(
             : await fetch(fetchUrl, fetchOptions)
           : null;
 
+      signal.throwIfAborted();
       if (pageData === undefined && !response) {
         window.location.href = url;
         return undefined;
       }
 
       if (response?.redirected) {
-        const redirectUrl = new URL(response.url, window.location.origin);
-        if (!isSameOrigin(redirectUrl, window.location.origin)) {
+        const redirectUrl = new URL(response.url, documentBaseUrl());
+        if (!isSameOrigin(redirectUrl, documentBaseUrl())) {
           window.location.href = method === 'GET' ? url : response.url;
           return undefined;
         }
@@ -819,6 +943,7 @@ export async function createPageNavigationEngine(
             signal,
             !STATIC_PAGE_DATA_FAST_PATH,
           );
+          signal.throwIfAborted();
           if (staticPageData) {
             pageData = staticPageData.pageData;
             deferredRegistry.setup(pageData, staticPageData.resolvedDeferred);
@@ -871,17 +996,29 @@ export async function createPageNavigationEngine(
         while (firstLine) {
           const { done, value } = await reader.read();
           if (done) {
+            buffer += decoder.decode();
+            if (buffer.trim()) {
+              buffer += '\n';
+              processLines();
+            }
             break;
           }
           buffer += decoder.decode(value, { stream: true });
           processLines();
         }
 
-        (async () => {
+        void (async () => {
           try {
             while (!signal.aborted) {
               const { done, value } = await reader.read();
               if (done) {
+                buffer += decoder.decode();
+                if (buffer.trim()) {
+                  buffer += '\n';
+                  processLines();
+                }
+                // A successful stream close is still an error for unresolved groups.
+                deferredRegistry.rejectPending('Stream closed before resolution');
                 break;
               }
               buffer += decoder.decode(value, { stream: true });
@@ -909,7 +1046,6 @@ export async function createPageNavigationEngine(
       ) {
         _prefetchCache.set(
           fetchUrl,
-          method,
           Promise.resolve(clonePageData(pageData)),
           PREFETCH_DEFAULT_CACHE_FOR,
         );
@@ -973,8 +1109,11 @@ export async function createPageNavigationEngine(
     shell: Promise<PageNavigationResult | undefined>,
     deferredRegistry: DeferredRegistry,
     resourceId: number,
+    signal: AbortSignal,
     getResource: () => PageNavigationResource,
   ): () => Promise<boolean> {
+    const ownsCommit = () =>
+      _pendingResource?.id === resourceId && !signal.aborted && !options._navigationSignal?.aborted;
     let committed = false;
     return async () => {
       if (committed) {
@@ -985,9 +1124,8 @@ export async function createPageNavigationEngine(
       if (!result) {
         return false;
       }
-      // A newer visit committed while this one was being applied. Committing now would put
-      // back this page's URL, head, scroll and Deferred ownership over the newer page.
-      if (resourceId < _urlNavigationId) {
+      // Losing ownership does not imply that the renderer has released the payload.
+      if (!ownsCommit()) {
         return false;
       }
       // Mutations that update the current page keep scroll. A redirect's GET
@@ -999,7 +1137,8 @@ export async function createPageNavigationEngine(
       // Write history before anything else changes. Disposing the previous page and handing
       // over its Deferred values cannot be undone, so a failed write must find them untouched.
       // preserveState only controls component state; back/forward traversal already moved history.
-      if (!options._popstate) {
+      let entryKey = options._entryKey;
+      if (!options._entryCommitted && !options._navigationSignal) {
         const historyUrl = commitTarget.fetchUrl + commitTarget.hash;
         const resource = getResource();
         const currentDocumentUrl = window.location.pathname + window.location.search;
@@ -1007,7 +1146,15 @@ export async function createPageNavigationEngine(
           !!options.replace ||
           (resource.method !== 'GET' && historyUrl === currentDocumentUrl + commitTarget.hash);
         try {
-          scrollRestoration.writeHistory(historyUrl, replaceHistory);
+          const visibleUrl = currentDocumentUrl + window.location.hash;
+          // An action updating the current page has no new destination to publish.
+          entryKey =
+            resource.method !== 'GET' && replaceHistory && historyUrl === visibleUrl
+              ? window.navigation.currentEntry?.key
+              : await publishEntry(historyUrl, replaceHistory, renderedPageNavigation);
+          if (!ownsCommit()) {
+            return false;
+          }
         } catch (error) {
           if (_pendingResource?.id === resourceId) {
             _pendingResource = null;
@@ -1016,7 +1163,7 @@ export async function createPageNavigationEngine(
           throw error;
         }
       }
-      _urlNavigationId = resourceId;
+      unrenderedEntry = undefined;
       if (_pendingResource?.id === resourceId) {
         _pendingResource = null;
       }
@@ -1027,6 +1174,14 @@ export async function createPageNavigationEngine(
         result.pageData,
       );
       _committedResource = getResource();
+      exposedResources.delete(_committedResource);
+      retiredResources.delete(_committedResource);
+      for (const retired of retiredResources) {
+        if (retired.id < resourceId) {
+          retired.dispose();
+          retiredResources.delete(retired);
+        }
+      }
       const previousResourceOwnsPreservedRegistry = Boolean(
         previousResource &&
         preservedDeferredRegistry &&
@@ -1062,10 +1217,14 @@ export async function createPageNavigationEngine(
       }
       applyClientHead(result.pageData.head as HeadDescriptor | undefined);
       _currentFetchUrl = commitTarget.fetchUrl;
-      scrollRestoration.commit();
+      scrollRestoration.commit(entryKey);
 
       requestAnimationFrame(() => {
-        if (!preserveScroll) {
+        if (
+          !preserveScroll &&
+          resourceId === _nextNavigationId &&
+          !options._navigationSignal?.aborted
+        ) {
           restoreScroll(options._scrollPosition, commitTarget.hash);
         }
       });
@@ -1103,7 +1262,6 @@ export async function createPageNavigationEngine(
   ) {
     _prefetchCache.set(
       _currentFetchUrl,
-      'GET',
       Promise.resolve(clonePageData(initialPageData)),
       PREFETCH_DEFAULT_CACHE_FOR,
     );
@@ -1114,6 +1272,14 @@ export async function createPageNavigationEngine(
   _committedDeferredRegistry = initialDeferredRegistry;
   _htmlDeferredRegistry = initialDeferredRegistry;
 
+  function isClientPage(url: URL): boolean {
+    if (!isPageUrlProtocol(url) || !isSameOrigin(url, documentBaseUrl())) {
+      return false;
+    }
+    const id = matchRoute(url.href);
+    return !!id && !!components[id] && !routeMeta[id]?.island;
+  }
+
   const engine: PageNavigationEngine = {
     _hoverDelay: PREFETCH_HOVER_DELAY,
     _prefetchDefaultStrategy: PREFETCH_DEFAULT_STRATEGY,
@@ -1122,7 +1288,7 @@ export async function createPageNavigationEngine(
     initialLayouts,
 
     prepareVisit(url, options = {}) {
-      if (!options._popstate) {
+      if (!options._entryCommitted) {
         // Capture the departing page before an adapter replaces or shrinks its DOM.
         scrollRestoration.save();
       }
@@ -1133,9 +1299,11 @@ export async function createPageNavigationEngine(
       const effectiveFetchUrl = fetchUrl || currentPath;
       const method = (options.method || 'GET').toUpperCase();
       const id = ++_nextNavigationId;
-      const hashNavigationBaseUrl = options._popstate ? _currentFetchUrl : currentPath;
+      const hashNavigationBaseUrl = options._entryCommitted ? _currentFetchUrl : currentPath;
 
-      _pendingResource?.abort();
+      if (_pendingResource) {
+        supersedeResource(_pendingResource);
+      }
       _pendingResource = null;
 
       const isSamePageHashNavigation =
@@ -1143,15 +1311,25 @@ export async function createPageNavigationEngine(
         effectiveFetchUrl === hashNavigationBaseUrl &&
         method === 'GET' &&
         !options.data &&
-        Boolean(hash || options._popstate);
+        Boolean(hash || options._entryCommitted);
 
       if (isSamePageHashNavigation) {
-        // A failed history write ends this visit like any other failed visit: through its shell.
-        let shell: Promise<undefined> = Promise.resolve(undefined);
-        try {
-          commitHashNavigation(effectiveFetchUrl, hash, options, !options._popstate);
-        } catch (error) {
-          shell = Promise.reject(error);
+        async function finishFragment(): Promise<undefined> {
+          const key = options._entryCommitted
+            ? (options._entryKey ?? window.navigation.currentEntry?.key)
+            : await publishEntry(
+                effectiveFetchUrl + hash,
+                !!options.replace,
+                renderedFragmentNavigation,
+              );
+          if (id === _nextNavigationId && !options._navigationSignal?.aborted) {
+            _currentFetchUrl = effectiveFetchUrl;
+            scrollRestoration.commit(key);
+            if (!options._nativeScroll) {
+              restoreScroll(options._scrollPosition, hash);
+            }
+          }
+          return undefined;
         }
         return {
           id,
@@ -1161,21 +1339,19 @@ export async function createPageNavigationEngine(
           method,
           options,
           immediate: true,
-          shell,
+          shell: finishFragment(),
+          destination: () => effectiveFetchUrl + hash,
           abort() {},
-          // Same-page hash visits commit right away. They do not stop an older visit
-          // whose page is already on screen from committing its URL.
           async commit() {
-            return true;
+            return id === _nextNavigationId && !options._navigationSignal?.aborted;
           },
           dispose() {},
         };
       }
 
-      if (options._popstate) {
-        // The browser has already moved to this entry. A same-page hash entry is left out
-        // above: it renders nothing, so an older page on screen still commits its URL.
-        _urlNavigationId = id;
+      if (options._entryCommitted) {
+        // The browser has already moved to this entry.
+        unrenderedEntry = options._entryKey ?? window.navigation.currentEntry?.key;
       }
 
       const controller = new AbortController();
@@ -1193,7 +1369,10 @@ export async function createPageNavigationEngine(
       );
 
       let commitResource: () => Promise<boolean> = async () => false;
+      const browserSignal = options._navigationSignal;
+      const abortPending = () => abortPendingResource(resource);
       const stop = () => {
+        browserSignal?.removeEventListener('abort', abortPending);
         controller.abort(abortError());
         deferredRegistry.dispose();
       };
@@ -1209,9 +1388,12 @@ export async function createPageNavigationEngine(
         options,
         immediate: false,
         shell,
+        destination: () => commitTarget.fetchUrl + commitTarget.hash,
         abort: stop,
         commit() {
-          return commitResource();
+          return commitResource().finally(() =>
+            browserSignal?.removeEventListener('abort', abortPending),
+          );
         },
         dispose: stop,
       };
@@ -1222,28 +1404,97 @@ export async function createPageNavigationEngine(
         shell,
         deferredRegistry,
         id,
+        controller.signal,
         () => resource,
       );
       _pendingResource = resource;
+      if (browserSignal?.aborted) {
+        abortPending();
+      } else {
+        browserSignal?.addEventListener('abort', abortPending, { once: true });
+      }
       return resource;
     },
 
-    prefetch(url, options = {}) {
-      const method = (options.method || 'GET').toUpperCase();
-      if (method !== 'GET') {
-        throw new Error('Void Router: prefetch() only supports GET requests.');
+    async visit(url, options, apply) {
+      const target = new URL(url, documentBaseUrl());
+      if (
+        !browserVisitHandler ||
+        options._entryCommitted ||
+        options.data ||
+        (options.method ?? 'GET').toUpperCase() !== 'GET' ||
+        !isClientPage(target)
+      ) {
+        const resource = engine.prepareVisit(url, options);
+        return applyBrowserVisit(apply, exposeResource(resource));
       }
+      let result: PageData | undefined;
+      let data: BrowserVisit['data'];
+      const dataReady =
+        options.resolveOn === 'data' || options._resolveOnShell
+          ? new Promise<PageData | undefined>((resolve, reject) => {
+              data = { resolve, reject };
+            })
+          : undefined;
+      const request: BrowserVisit = {
+        options,
+        async apply(resource) {
+          result = await apply(resource);
+          return result;
+        },
+        ...(data ? { data } : {}),
+      };
+      browserVisits.add(request);
+      const navigationResult = navigateEntry(target.href, !!options.replace, request);
+      void navigationResult.committed?.catch(() => {});
+      const completion =
+        navigationResult.finished ??
+        Promise.reject(new Error('Void Router: browser did not start the navigation.'));
+      const finished = completion.then(
+        () => {
+          data?.resolve(result);
+          return result;
+        },
+        (error: unknown) => {
+          if (isAbortError(error) && !options._resolveOnShell) {
+            data?.resolve(undefined);
+            return undefined;
+          }
+          data?.reject(error);
+          throw error;
+        },
+      );
+      if (dataReady) {
+        void finished.catch(() => {});
+        return dataReady;
+      }
+      return finished;
+    },
 
-      const id = matchRoute(url);
+    setBrowserVisitHandler(handler) {
+      browserVisitHandler = handler;
+    },
+
+    prefetch(url, options = {}) {
+      // Programmatic prefetch must enforce the same origin and scheme constraints
+      // as Links before starting imports, fetches, or document hints.
+      const current = documentBaseUrl();
+      const target = new URL(url, current);
+      if (!isPageUrlProtocol(target) || !isSameOrigin(target, current)) {
+        return Promise.resolve(undefined);
+      }
+      // Prefetch only local page paths, without a fragment or absolute URL.
+      const prefetchUrl = target.pathname + target.search;
+      const id = matchRoute(prefetchUrl);
       if (!id) {
         return Promise.resolve(undefined);
       }
 
       if (routeMeta[id]?.island) {
-        if (!document.querySelector('link[rel="prefetch"][href="' + url + '"]')) {
+        if (!document.querySelector('link[rel="prefetch"][href="' + prefetchUrl + '"]')) {
           const link = document.createElement('link');
           link.rel = 'prefetch';
-          link.href = url;
+          link.href = prefetchUrl;
           link.as = 'document';
           document.head.appendChild(link);
         }
@@ -1251,61 +1502,59 @@ export async function createPageNavigationEngine(
       }
 
       if (components[id]) {
-        components[id]();
+        void Promise.resolve().then(components[id]).catch(() => {
+          // Page data prefetch can succeed even if a speculative import fails.
+        });
       }
       const layoutIds = layoutTree[id] || [];
       for (const lid of layoutIds) {
         if (components[lid]) {
-          components[lid]();
+          void Promise.resolve().then(components[lid]).catch(() => {
+            // The visit will report an import failure if this route is opened.
+          });
         }
       }
 
-      const hashIdx = url.indexOf('#');
-      const prefetchUrl = hashIdx !== -1 ? url.slice(0, hashIdx) : url;
-      const existing = _prefetchCache.get(prefetchUrl, method);
+      const existing = _prefetchCache.get(prefetchUrl);
       if (existing) {
-        return existing.response;
+        return existing.response.then(unwrapPrefetchedPageData);
       }
-      const ttl = options.cacheFor ? parseCacheFor(options.cacheFor) : PREFETCH_DEFAULT_CACHE_FOR;
-      const fetchPromise = fetchPrefetchPageData(prefetchUrl).then((data) => {
-        if (
-          data &&
-          typeof data === 'object' &&
-          uncachedPayloads.has(data) &&
-          _prefetchCache.get(prefetchUrl, method)?.response === fetchPromise
-        ) {
-          _prefetchCache.flush(prefetchUrl, method);
-        }
-        return data;
-      });
-      _prefetchCache.set(prefetchUrl, method, fetchPromise, ttl);
-      return fetchPromise;
+      const ttl = options.cacheFor !== undefined
+        ? parseCacheFor(options.cacheFor)
+        : PREFETCH_DEFAULT_CACHE_FOR;
+      const fetchPromise = fetchPrefetchPageData(prefetchUrl);
+      _prefetchCache.set(prefetchUrl, fetchPromise, ttl);
+      return fetchPromise.then(unwrapPrefetchedPageData);
     },
 
-    flush(url, method = 'GET') {
+    flush(url) {
       const hashIdx = url.indexOf('#');
-      _prefetchCache.flush(hashIdx !== -1 ? url.slice(0, hashIdx) : url, method);
+      _prefetchCache.flush(hashIdx !== -1 ? url.slice(0, hashIdx) : url);
     },
 
     flushAll() {
       _prefetchCache.flushAll();
     },
 
-    setPopStateHandler(handler) {
-      popStateHandler = handler;
-    },
-
     commitInitialRender() {
       const saved = initialScrollPosition;
       initialScrollPosition = null;
-      scrollRestoration.commit();
+      if (_nextNavigationId === 0) {
+        scrollRestoration.commit(initialEntryKey);
+      }
       if (saved && _nextNavigationId === 0) {
         window.scrollTo(saved.x, saved.y);
       }
     },
 
     start() {
-      initialScrollPosition = scrollRestoration.start();
+      if (started) {
+        return;
+      }
+      started = true;
+      startAnchorPrefetch(engine);
+      scrollRestoration.start();
+      initialScrollPosition = scrollRestoration.read(initialEntryKey);
 
       initClientHead(initialPageData.head as HeadDescriptor | undefined);
 
@@ -1323,25 +1572,222 @@ export async function createPageNavigationEngine(
         }
         delete deferredWindow.__deferredQueue;
       }
-
-      window.addEventListener('popstate', (e) => {
-        const url = window.location.pathname + window.location.search + window.location.hash;
-        const saved = scrollRestoration.pop(e.state);
-        if (!scrollRestoration.ready && url === initialUrl) {
-          initialScrollPosition = saved;
-          return;
-        }
-        const options = {
-          preserveState: true,
-          _scrollPosition: saved,
-          _popstate: true,
-        };
-        if (popStateHandler) {
-          popStateHandler(url, options);
-        }
-      });
     },
   };
+
+  // Register before the adapter mounts: an initial effect can publish an entry.
+  window.navigation.addEventListener('navigate', (event) => {
+    interceptedTraversal = null;
+    nativeFragment = null;
+    preparedEntryUrl = undefined;
+    if (event.info === renderedPageNavigation || event.info === renderedFragmentNavigation) {
+      // A visit started by currententrychange can still invalidate the resource
+      // before Void commits it, even though its DOM update has already run.
+      if (event.info === renderedPageNavigation) {
+        preparedEntryUrl = event.destination.url;
+      }
+      event.intercept({ scroll: 'manual', focusReset: 'manual' });
+      return;
+    }
+    const request = event.info as BrowserVisit | undefined;
+    const own = !!request && browserVisits.has(request);
+    const apply = own ? request.apply : browserVisitHandler;
+    const target = new URL(event.destination.url);
+    const traversal = event.navigationType === 'traverse';
+    if (
+      !apply ||
+      !event.canIntercept ||
+      event.downloadRequest !== null ||
+      event.formData !== null ||
+      !isClientPage(target)
+    ) {
+      return;
+    }
+
+    const url = target.pathname + target.search + target.hash;
+    const options = own ? request.options : {};
+    const ownHashVisit =
+      own &&
+      !options._refresh &&
+      target.pathname + target.search === _currentFetchUrl &&
+      (event.hashChange || Boolean(target.hash));
+    if (event.hashChange && !ownHashVisit && !traversal) {
+      if (_pendingResource) {
+        abortPendingResource(_pendingResource);
+      }
+      scrollRestoration.save();
+      nativeFragment = target.href;
+      return;
+    }
+    // A classic history write also emits navigate. Only claim a link, a
+    // traversal, or a visit initiated by this router.
+    const anchor = event.sourceElement?.closest('a[href],area[href]');
+    if (!own && !traversal && (!anchor || anchor.hasAttribute('data-void-reload'))) {
+      return;
+    }
+    if (traversal && !event.destination.sameDocument) {
+      return;
+    }
+    if ((ownHashVisit || traversal || event.cancelable) && _pendingResource) {
+      abortPendingResource(_pendingResource);
+    }
+    if (ownHashVisit) {
+      scrollRestoration.save();
+      event.intercept({
+        scroll: 'manual',
+        focusReset: 'manual',
+        handler: async () => {
+          await apply(
+            engine.prepareVisit(url, {
+              ...options,
+              _entryCommitted: true,
+              _entryKey: window.navigation.currentEntry?.key,
+              _navigationSignal: event.signal,
+            }),
+          );
+        },
+      });
+      return;
+    }
+    if (traversal) {
+      interceptedTraversal = event.destination.key || null;
+      event.intercept({
+        scroll: 'manual',
+        focusReset: 'manual',
+        handler: async () => {
+          scrollRestoration.save();
+          const key = event.destination.key;
+          const resource = engine.prepareVisit(url, {
+            preserveState: true,
+            _scrollPosition: scrollRestoration.read(key),
+            _entryCommitted: true,
+            _entryKey: key,
+            _navigationSignal: event.signal,
+          });
+          const result = await applyBrowserVisit(apply, exposeResource(resource));
+          event.signal.throwIfAborted();
+          if (!resource.immediate && !result) {
+            throw abortError();
+          }
+        },
+      });
+      return;
+    }
+
+    if (!event.cancelable) {
+      return;
+    }
+    event.intercept({
+      scroll: 'manual',
+      focusReset: event.navigationType === 'push' ? 'after-transition' : 'manual',
+      async precommitHandler(controller) {
+        const resource = engine.prepareVisit(url, {
+          ...options,
+          _navigationSignal: event.signal,
+        });
+        let release!: (committed: boolean) => void;
+        const urlReady = new Promise<boolean>((resolve) => {
+          release = resolve;
+        });
+        const cancel = () => release(false);
+        event.signal.addEventListener('abort', cancel, { once: true });
+        // Notify the adapter about pending state immediately. It can only read
+        // the new page once the browser has committed the destination.
+        const shellAfterCommit = urlReady.then((committed) => {
+          if (!committed) {
+            throw abortError();
+          }
+          return resource.shell;
+        });
+        const applied = apply(
+          exposeResource(resource, shellAfterCommit, {
+            ...resource.options,
+            resolveOn: 'commit',
+            _resolveOnShell: false,
+          }),
+        );
+        void applied.catch(() => {});
+        try {
+          const shell = await resource.shell;
+          event.signal.throwIfAborted();
+          if (!shell || _pendingResource !== resource) {
+            throw abortError();
+          }
+          const finalUrl = resource.destination();
+          if (finalUrl !== url) {
+            controller.redirect(finalUrl);
+          }
+          if (own) {
+            request.data?.resolve(shell.pageData);
+          }
+          preparedEntryUrl = new URL(finalUrl, documentBaseUrl()).href;
+          controller.addHandler(async () => {
+            event.signal.removeEventListener('abort', cancel);
+            if (event.signal.aborted) {
+              cancel();
+              event.signal.throwIfAborted();
+            }
+            resource.options._entryKey = window.navigation.currentEntry?.key;
+            unrenderedEntry = resource.options._entryKey;
+            release(true);
+            const result = await applyBrowserVisit(() => applied, resource);
+            event.signal.throwIfAborted();
+            if (!result) {
+              throw abortError();
+            }
+          });
+        } catch (error) {
+          event.signal.removeEventListener('abort', cancel);
+          cancel();
+          abortPendingResource(resource);
+          if (!event.signal.aborted) {
+            recoverUnrenderedEntry(resource.id);
+          }
+          throw error;
+        }
+      },
+    });
+  });
+  window.navigation.addEventListener('currententrychange', (event) => {
+    const entry = window.navigation.currentEntry;
+    if (!entry?.url || entry === event.from) {
+      return;
+    }
+    const target = new URL(entry.url);
+    // This event runs before the post-commit handler. A new navigation can
+    // supersede that handler before it gets a chance to apply the page.
+    if (entry.url === preparedEntryUrl || entry.key === interceptedTraversal) {
+      if (entry.url === preparedEntryUrl || target.pathname + target.search !== _currentFetchUrl) {
+        unrenderedEntry = entry.key;
+      }
+      preparedEntryUrl = undefined;
+      return;
+    }
+    const nativeHash = entry.url === nativeFragment;
+    nativeFragment = null;
+    if (
+      (!nativeHash && (event.navigationType !== 'traverse' || !isClientPage(target))) ||
+      (entry.key === initialEntryKey && _nextNavigationId === 0)
+    ) {
+      return;
+    }
+    if (!nativeHash) {
+      scrollRestoration.save();
+    }
+    if (!browserVisitHandler) {
+      return;
+    }
+    const resource = engine.prepareVisit(target.pathname + target.search + target.hash, {
+      preserveState: true,
+      _scrollPosition: scrollRestoration.read(entry.key),
+      _entryCommitted: true,
+      _entryKey: entry.key,
+      _nativeScroll: nativeHash && target.pathname + target.search === _currentFetchUrl,
+    });
+    void applyBrowserVisit(browserVisitHandler, exposeResource(resource)).catch((error) =>
+      reportError(error),
+    );
+  });
 
   return engine;
 }

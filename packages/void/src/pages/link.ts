@@ -1,13 +1,13 @@
 /// <reference lib="dom" />
 import type { Href } from 'void/routes';
-import { isModifiedEvent, mergeDataIntoHref } from './adapter-helpers.ts';
-import type { NavigationMethod, NavigationState, VoidRouter } from './client.ts';
+import { isModifiedEvent } from './adapter-helpers.ts';
+import { isAbortError } from './action-result.ts';
+import type { NavigationState, VoidRouter } from './client.ts';
 import type { PrefetchOptions } from './navigation-engine.ts';
 import type { CacheForInput, LinkPrefetchValue, LinkPrefetchStrategy } from './prefetch.ts';
-import { decodePagePath } from './url.ts';
+import { decodePagePath, isPageUrlProtocol, isSameOrigin } from './url.ts';
 
 export type { LinkPrefetchValue, LinkPrefetchStrategy };
-export type LinkNavigateEvent = { preventDefault(): void };
 export type LinkActiveMatch = 'exact' | 'prefix';
 
 /** Present only when the link matches the current URL. */
@@ -24,25 +24,9 @@ export type LinkPendingAttributes = {
 /** Props every adapter's Link accepts. Adapters add element attributes and children. */
 export type BaseLinkProps = {
   href: Href;
-  method?: NavigationMethod | Lowercase<NavigationMethod>;
-  data?: Record<string, unknown>;
-  preserveScroll?: boolean;
-  preserveState?: boolean;
-  replace?: boolean;
-  reloadDocument?: boolean;
-  viewTransition?: boolean;
-  /** If omitted, the Link uses the app's `prefetch.defaultStrategy`. */
-  prefetch?: LinkPrefetchValue;
+  prefetch?: Exclude<LinkPrefetchValue, true>;
   cacheFor?: CacheForInput;
   activeMatch?: LinkActiveMatch;
-  onNavigate?: (event: LinkNavigateEvent) => void;
-};
-
-export type ResolvedLink = {
-  method: NavigationMethod;
-  isGet: boolean;
-  /** The destination, with GET data merged into its query. */
-  href: Href;
 };
 
 type LinkClickEvent = Pick<
@@ -57,89 +41,70 @@ type LinkClickEvent = Pick<
   | 'preventDefault'
 >;
 
-type LinkClickProps = Pick<
-  BaseLinkProps,
-  | 'data'
-  | 'preserveScroll'
-  | 'preserveState'
-  | 'replace'
-  | 'reloadDocument'
-  | 'viewTransition'
-  | 'onNavigate'
->;
+type AnchorClickOptions = {
+  preserveScroll?: boolean;
+  preserveState?: boolean;
+  replace?: boolean;
+  viewTransition?: boolean;
+};
 
-/** Normalizes the method and destination, rejecting options that only GET links support. */
-export function resolveLink(
-  props: Pick<BaseLinkProps, 'href' | 'method' | 'data' | 'prefetch' | 'reloadDocument'>,
-): ResolvedLink {
-  const method = (props.method ?? 'GET').toUpperCase() as NavigationMethod;
-  const isGet = method === 'GET';
+/**
+ * The events that prefetch a GET Link. When omitted, use the app's default.
+ */
+export function linkPrefetchStrategies(
+  props: Pick<BaseLinkProps, 'prefetch'> & { reloadDocument?: boolean },
+  defaultStrategy: LinkPrefetchValue = false,
+): ReadonlyArray<LinkPrefetchStrategy> {
+  if (props.reloadDocument) return [];
+  const prefetch = props.prefetch ?? defaultStrategy;
+  if (prefetch === false) return [];
+  if (prefetch === true) return ['hover'];
+  return typeof prefetch === 'string' ? [prefetch] : prefetch;
+}
 
-  if (props.prefetch !== undefined && props.prefetch !== false && !isGet) {
-    throw new Error(
-      'Link: prefetch only supports GET links. Remove `prefetch` or use method="GET".',
-    );
+/** Use the same delegated prefetching for Link and authored anchors. */
+export function linkPrefetchAttributes(
+  router: VoidRouter | null | undefined,
+  props: Pick<BaseLinkProps, 'prefetch' | 'cacheFor'> & { reloadDocument?: boolean },
+): { 'data-void-prefetch'?: string; 'data-void-cache-for'?: string } {
+  if (!router) {
+    return {};
   }
-  if (props.reloadDocument && !isGet) {
-    throw new Error('Link: reloadDocument only supports GET links.');
+  // The app default is a client setting. Render the same marker during SSR.
+  const strategies = linkPrefetchStrategies(props);
+  const strategy =
+    !props.reloadDocument && props.prefetch === undefined
+      ? 'default'
+      : strategies.join(' ');
+  if (!strategy) {
+    return {};
   }
-
+  const { cacheFor } = props;
   return {
-    method,
-    isGet,
-    href: isGet ? mergeDataIntoHref(props.href, props.data) : props.href,
+    'data-void-prefetch': strategy,
+    ...(cacheFor !== undefined && { 'data-void-cache-for': String(cacheFor) }),
   };
 }
 
 /**
- * The events that prefetch a Link. A Link without a `prefetch` prop uses the app's
- * `defaultStrategy`, but only when it is a GET link, the only kind that can prefetch.
- */
-export function linkPrefetchStrategies(
-  props: Pick<BaseLinkProps, 'prefetch' | 'reloadDocument'>,
-  link: Pick<ResolvedLink, 'isGet'>,
-  defaultStrategy: LinkPrefetchValue = false,
-): ReadonlyArray<LinkPrefetchStrategy> {
-  if (props.reloadDocument) {
-    return [];
-  }
-
-  const prefetch = props.prefetch ?? (link.isGet ? defaultStrategy : false);
-  if (prefetch === false) {
-    return [];
-  }
-
-  if (prefetch === true) {
-    return ['hover'];
-  }
-
-  if (typeof prefetch === 'string') {
-    return [prefetch];
-  }
-
-  return prefetch;
-}
-
-/**
- * Marks a GET link to the current page. Pathnames compare the way the server
+ * Marks a link to the current page. Pathnames compare the way the server
  * matches pages: case-sensitive, trailing slash significant, decoded like Hono's
  * getPath. A link with a query also needs each of its params, with the same value,
- * in the current URL, which may have more params in any order. GET data counts as
- * query, and the hash is ignored. `prefix` also matches nested pages by whole
+ * in the current URL, which may have more params in any order. The hash is ignored. `prefix` also matches nested pages by whole
  * segment, except for `/`, comparing only the path, but only an exact match is
  * `aria-current`. Spread the result before the user's attributes so theirs win.
  */
 export function linkActiveAttributes(
   router: VoidRouter | null | undefined,
-  link: ResolvedLink,
+  href: Href,
   match: LinkActiveMatch = 'exact',
 ): LinkActiveAttributes {
-  if (!router || !link.isGet) {
+  if (!router) {
     return {};
   }
 
   const current = router.url;
-  const target = resolveSameOrigin(link.href, current);
+  const target = resolveSameOrigin(href, current);
   if (!target) {
     return {};
   }
@@ -164,8 +129,8 @@ export function linkActiveAttributes(
 }
 
 /**
- * Marks a link while a visit to its destination is loading: the visit uses the link's
- * method and goes to its path, query and hash. Unlike active links, the whole query and
+ * Marks a link while a GET visit to its destination loads, matching its path,
+ * query and hash. Unlike active links, the whole query and
  * the hash count, so `?tab=open` isn't pending during a visit to `?tab=open&page=2`.
  * Every link to the destination is marked, not only the one that was clicked.
  * Spread the result before the user's attributes so theirs win.
@@ -173,19 +138,19 @@ export function linkActiveAttributes(
 export function linkPendingAttributes(
   router: VoidRouter | null | undefined,
   navigation: NavigationState | null | undefined,
-  link: ResolvedLink,
+  href: Href,
 ): LinkPendingAttributes {
   if (
     !router ||
     !navigation?.location ||
     navigation.state === 'idle' ||
-    navigation.method !== link.method
+    navigation.method !== 'GET'
   ) {
     return {};
   }
 
   const destination = navigation.location;
-  const target = resolveSameOrigin(link.href, router.url);
+  const target = resolveSameOrigin(href, router.url);
   if (
     target &&
     target.host === destination.host &&
@@ -200,18 +165,64 @@ export function linkPendingAttributes(
   return {};
 }
 
+export function linkStateAttributes(
+  router: VoidRouter | null | undefined,
+  navigation: NavigationState | null | undefined,
+  href: Href,
+  activeMatch?: LinkActiveMatch,
+): LinkActiveAttributes & LinkPendingAttributes {
+  return {
+    ...linkActiveAttributes(router, href, activeMatch),
+    ...linkPendingAttributes(router, navigation, href),
+  };
+}
+
+/** Reactive attributes for a GET anchor. Read attributes from the framework's render. */
+export function createLinkState(
+  router: VoidRouter,
+  navigation: NavigationState,
+  href: Href | (() => Href),
+  options?: { activeMatch?: LinkActiveMatch },
+): { readonly attributes: LinkActiveAttributes & LinkPendingAttributes } {
+  return {
+    get attributes() {
+      const destination = typeof href === 'function' ? href() : href;
+      return linkStateAttributes(router, navigation, destination, options?.activeMatch);
+    },
+  };
+}
+
+/** Attach to authored GET anchors that need explicit visit options. */
+export function createLinkClickHandler(
+  router: VoidRouter,
+  options: AnchorClickOptions,
+): (event: LinkClickEvent) => void {
+  return (event) => {
+    const anchor = event.currentTarget;
+    if (!(anchor instanceof HTMLAnchorElement)) return;
+    handleLinkClick(event, router, anchor.href as Href, options);
+  };
+}
+
 /** Each of `params` has the same value in `current`. Extra params in `current` are allowed. */
 function hasQueryParams(current: URLSearchParams, params: URLSearchParams): boolean {
+  const available = new Map<string, Map<string, number>>();
+  for (const [key, value] of current) {
+    const values = available.get(key) ?? new Map<string, number>();
+    values.set(value, (values.get(value) ?? 0) + 1);
+    available.set(key, values);
+  }
   for (const [key, value] of params) {
-    if (!current.getAll(key).includes(value)) {
-      return false;
-    }
+    const values = available.get(key);
+    const count = values?.get(value) ?? 0;
+    if (count === 0) return false;
+    values!.set(value, count - 1);
   }
   return true;
 }
 
 /** Resolves `href` against `base`, or returns `null` for a malformed or other-origin href. */
-function resolveSameOrigin(href: string, base: URL): URL | null {
+export function resolveSameOrigin(href: string, base: URL): URL | null {
   let target: URL;
   try {
     target = new URL(href, base);
@@ -219,8 +230,7 @@ function resolveSameOrigin(href: string, base: URL): URL | null {
     // A malformed href still renders; it just never matches.
     return null;
   }
-  // Protocol and host rather than `origin`, which is opaque for custom schemes such as capacitor:.
-  if (target.protocol !== base.protocol || target.host !== base.host) {
+  if (!isPageUrlProtocol(target) || !isSameOrigin(target, base)) {
     return null;
   }
   return target;
@@ -241,7 +251,7 @@ function isConstrainedConnection(): boolean {
 
 /** Link's automatic prefetch. `router.prefetch()` called directly is not limited by the connection. */
 export function prefetchLink(
-  router: VoidRouter | null | undefined,
+  router: { prefetch(href: Href, options?: PrefetchOptions): Promise<unknown> } | null | undefined,
   href: Href,
   cacheFor: CacheForInput | undefined,
 ): void {
@@ -249,13 +259,12 @@ export function prefetchLink(
     return;
   }
 
-  // The router matches only the path, which on another site names a different page.
-  if (new URL(href, window.location.href).origin !== window.location.origin) {
-    return;
-  }
+  // Use the same host/protocol check as link state, including custom schemes.
+  const target = resolveSameOrigin(href, new URL(window.location.href));
+  if (!target) return;
 
   const current = window.location.pathname + window.location.search;
-  if (href === current) {
+  if (target.pathname + target.search === current) {
     return;
   }
 
@@ -264,52 +273,29 @@ export function prefetchLink(
     options.cacheFor = cacheFor;
   }
 
-  router.prefetch(href, options);
+  void router.prefetch(href, options).catch(() => {
+    // Prefetch is speculative; failures must not become unhandled rejections.
+  });
 }
 
-/**
- * Runs a client-side visit for a plain same-origin click. Modified clicks, downloads,
- * cross-origin destinations and `reloadDocument` links are left to the browser.
- * Call it after the user's own click handler so its `preventDefault()` is respected.
- */
+/** Only explicit GET options require imperative interception. */
 export function handleLinkClick(
   event: LinkClickEvent,
   router: VoidRouter | null | undefined,
-  link: ResolvedLink,
-  props: LinkClickProps,
+  href: Href,
+  options: AnchorClickOptions,
 ): void {
-  if (props.reloadDocument || !router || event.defaultPrevented || isModifiedEvent(event)) {
-    return;
-  }
-
-  if ((event.currentTarget as HTMLElement).hasAttribute('download')) {
-    return;
-  }
-
-  const url = new URL(link.href, window.location.href);
-  if (url.origin !== window.location.origin) {
-    return;
-  }
-
-  let navigatePrevented = false;
-  props.onNavigate?.({
-    preventDefault() {
-      navigatePrevented = true;
-    },
-  });
-
+  if (!router || event.defaultPrevented || isModifiedEvent(event)) return;
+  const element = event.currentTarget as HTMLElement;
+  if (element.hasAttribute('download') || element.hasAttribute('data-void-reload')) return;
+  if (
+    !options.preserveScroll && !options.preserveState &&
+    !options.replace && options.viewTransition === undefined
+  ) return;
+  if (!resolveSameOrigin(href, new URL(window.location.href))) return;
   event.preventDefault();
-  if (navigatePrevented) {
-    return;
-  }
-
-  router.visit(link.href, {
-    method: link.method,
-    data: link.isGet ? undefined : props.data,
-    preserveScroll: props.preserveScroll,
-    preserveState: props.preserveState,
-    replace: props.replace,
-    viewTransition: props.viewTransition,
+  void router.visit(href, options).catch((error: unknown) => {
+    if (!isAbortError(error)) reportError(error);
   });
 }
 

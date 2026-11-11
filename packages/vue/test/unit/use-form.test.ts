@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
-import type { VoidRouter } from 'void/pages-client';
+import { describe, expect, it } from 'vite-plus/test';
+import { createActionClient, type RuntimeVoidRouter, type VoidRouter } from 'void/pages-client';
 import { createSSRApp, defineComponent, h, nextTick } from 'vue';
 import { renderToString } from 'vue/server-renderer';
 import { useForm as typedUseForm } from '../../src/runtime/use-form.ts';
@@ -26,11 +26,13 @@ const useForm = typedUseForm as unknown as (
 async function renderForm(url: string, params: Record<string, string>) {
   const visits: Array<string> = [];
   const router = {
+    _hoverDelay: 75,
     visit: async (target: string) => {
       visits.push(target);
       return {};
     },
-  } as unknown as VoidRouter;
+  } as unknown as RuntimeVoidRouter;
+  createActionClient().setActionRouter(router);
   let form!: ReturnType<typeof useForm>;
   const app = createSSRApp(
     defineComponent({
@@ -51,6 +53,11 @@ async function mountForm(
   options?: { resetOnSuccess?: boolean },
   router = { visit: async () => ({}) } as unknown as VoidRouter,
 ): Promise<TestForm> {
+  const router = {
+    _hoverDelay: 75,
+    visit: async () => ({}),
+  } as unknown as RuntimeVoidRouter;
+  createActionClient().setActionRouter(router);
   let form!: TestForm;
   const app = createSSRApp(
     defineComponent({
@@ -137,7 +144,7 @@ describe('useForm setError', () => {
         },
       }),
     );
-    app.provide('__void_router', { visit: async () => ({}) });
+    app.provide('__void_router', { _hoverDelay: 75, visit: async () => ({}) });
     await renderToString(app);
   });
 

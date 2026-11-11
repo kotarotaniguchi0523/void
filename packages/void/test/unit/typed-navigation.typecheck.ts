@@ -89,6 +89,9 @@ export function checkTypedServerDestinations(c: CloudContext): void {
 }
 
 export function checkTypedNavigation(router: VoidRouter): void {
+  expectTypeOf(router.visit('/typed-navigation')).toEqualTypeOf<Promise<void>>();
+  expectTypeOf(router.refresh()).toEqualTypeOf<Promise<void>>();
+  expectTypeOf(router.prefetch('/typed-navigation')).toEqualTypeOf<Promise<void>>();
   const target: RouteDestination = {
     pathname: '/typed-navigation/:id',
     params: { id: 123 },
@@ -98,6 +101,12 @@ export function checkTypedNavigation(router: VoidRouter): void {
   const url: RouteUrlInput = target;
   void router.visit(url);
   void router.visit(url, { resolveOn: 'data' });
+  // @ts-expect-error Mutation visits belong to action()/useForm()
+  void router.visit(url, { method: 'POST' });
+  // @ts-expect-error Navigation does not carry mutation data
+  void router.visit(url, { data: { name: 'Ada' } });
+  // @ts-expect-error Prefetch only applies to GET
+  void router.prefetch(url, { method: 'POST' });
   void router.refresh({ resolveOn: 'commit' });
   // @ts-expect-error completion is data or commit
   void router.refresh({ resolveOn: 'render' });

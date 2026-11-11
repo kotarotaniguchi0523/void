@@ -5,35 +5,35 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   return (
     <div>
       <nav>
-        <Link href="/" prefetch>
+        <Link href="/" prefetch="hover">
           Home
         </Link>{' '}
         |{' '}
-        <Link href="/users" activeMatch="prefix" prefetch>
+        <Link href="/users" activeMatch="prefix" prefetch="hover">
           Users
         </Link>{' '}
         |{' '}
-        <Link href="/blog" prefetch>
+        <Link href="/blog" prefetch="hover">
           Blog
         </Link>{' '}
         |{' '}
-        <Link href="/deferred" prefetch>
+        <Link href="/deferred" prefetch="hover">
           Deferred
         </Link>{' '}
         |{' '}
-        <Link href="/router-params" prefetch>
+        <Link href="/router-params" prefetch="hover">
           Router Params
         </Link>{' '}
         |{' '}
-        <Link href="/live" prefetch>
+        <Link href="/live" prefetch="hover">
           Live
         </Link>{' '}
         |{' '}
-        <Link href="/action-error" prefetch>
+        <Link href="/action-error" prefetch="hover">
           Form Lab
         </Link>{' '}
         |{' '}
-        <Link href="/client-only" prefetch>
+        <Link href="/client-only" prefetch="hover">
           Client-only
         </Link>{' '}
         | <span>{shared.appName}</span>

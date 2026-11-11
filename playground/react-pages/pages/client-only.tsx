@@ -4,6 +4,9 @@ export default function ClientOnlyPage(props: Props) {
   if (typeof window === 'undefined') {
     throw new Error('client-only page component rendered on the server');
   }
+  if (document.documentElement.hasAttribute('data-fail-route-render')) {
+    throw new Error('Test route render failed');
+  }
 
   return (
     <main>
