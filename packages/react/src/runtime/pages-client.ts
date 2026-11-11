@@ -421,7 +421,7 @@ class RouteRenderBoundary extends React.Component<
     resourceId: number;
     pending: boolean;
     onError(error: unknown): void;
-    children: React.ReactNode;
+    children?: React.ReactNode;
   },
   { resourceId: number; failure: { error: unknown } | null }
 > {
@@ -552,6 +552,15 @@ function App({
     navigationStore.getSnapshot,
     navigationStore.getSnapshot,
   );
+
+  // A failed batched visit can restore the same resource identities. Its state
+  // commit still acknowledges that the abandoned render has left the tree.
+  useLayoutEffect(() => {
+    engine.releaseRetiredResources(new Set([
+      state.resource.id,
+      ...(state.rollbackResource ? [state.rollbackResource.id] : []),
+    ]));
+  }, [engine, state]);
 
   const finishNavigation = useCallback(
     (resource: ReactPageResource, result: PageNavigationResult) => {
@@ -831,31 +840,34 @@ function App({
               ? React.createElement(NavigationFallback, { initialPageData })
               : null,
         },
-        React.createElement(RouteRenderBoundary, {
-          resourceId: state.resource.id,
-          pending: state.pendingId === state.resource.id,
-          onError(error) {
-            const resource = state.resource;
-            if (activePendingNavigationId !== resource.id) {
-              return;
-            }
-            activePendingNavigationId = null;
-            viewTransitionWaiters.get(resource.id)?.();
-            viewTransitionWaiters.delete(resource.id);
-            const settler = pendingVisitSettlers.get(resource.id);
-            pendingVisitSettlers.delete(resource.id);
-            if (settler) {
-              settler.reject(error);
-            } else {
-              reportError(error);
-            }
-            dispatch({ type: 'fail', resource, location: currentUrl() });
+        React.createElement(
+          RouteRenderBoundary,
+          {
+            resourceId: state.resource.id,
+            pending: state.pendingId === state.resource.id,
+            onError(error) {
+              const resource = state.resource;
+              if (activePendingNavigationId !== resource.id) {
+                return;
+              }
+              activePendingNavigationId = null;
+              viewTransitionWaiters.get(resource.id)?.();
+              viewTransitionWaiters.delete(resource.id);
+              const settler = pendingVisitSettlers.get(resource.id);
+              pendingVisitSettlers.delete(resource.id);
+              if (settler) {
+                settler.reject(error);
+              } else {
+                reportError(error);
+              }
+              dispatch({ type: 'fail', resource, location: currentUrl() });
+            },
           },
-          children: React.createElement(RouteResource, {
+          React.createElement(RouteResource, {
             resource: state.resource,
             onCommit: finishNavigation,
           }),
-        }),
+        ),
       ),
     ),
   );

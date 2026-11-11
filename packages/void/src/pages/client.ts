@@ -148,12 +148,16 @@ function currentUrl(): string {
 }
 
 function getUrlOrigin(): string {
-  if (typeof window === 'undefined') return 'http://localhost';
+  if (typeof window === 'undefined') {
+    return 'http://localhost';
+  }
   const { origin, href } = window.location;
   // Capacitor WebViews may expose an opaque origin even for a local app.
   if (origin === 'null' && href) {
     const url = new URL(href);
-    if (url.protocol === 'capacitor:') return `capacitor://${url.host}`;
+    if (url.protocol === 'capacitor:') {
+      return `capacitor://${url.host}`;
+    }
   }
   return origin;
 }
@@ -209,6 +213,10 @@ export function idleNavigationState(): NavigationState {
   };
 }
 
+function publicRouterOptions(options: object, allowed: ReadonlyArray<string>) {
+  return Object.fromEntries(Object.entries(options).filter(([key]) => allowed.includes(key)));
+}
+
 export function createRouterFacade(
   router: VoidRouter | RuntimeVoidRouter,
   getCurrentUrl: () => string,
@@ -232,15 +240,19 @@ export function createRouterFacade(
     },
 
     visit(url, options = {}) {
-      return router.visit(url, options).then(() => {});
+      return router.visit(url, publicRouterOptions(options, [
+        'preserveScroll', 'preserveState', 'replace', 'viewTransition', 'resolveOn',
+      ])).then(() => {});
     },
 
     refresh(options = {}) {
-      return router.refresh(options).then(() => {});
+      return router.refresh(publicRouterOptions(options, [
+        'preserveScroll', 'preserveState', 'viewTransition', 'resolveOn',
+      ])).then(() => {});
     },
 
     prefetch(url, options = {}) {
-      return router.prefetch(url, options).then(() => {});
+      return router.prefetch(url, publicRouterOptions(options, ['cacheFor'])).then(() => {});
     },
 
     flush(url) {
@@ -252,7 +264,9 @@ export function createRouterFacade(
     },
   };
   const transport = actionTransportOf(router);
-  if (transport) actionTransports.set(facade, transport);
+  if (transport) {
+    actionTransports.set(facade, transport);
+  }
   return facade;
 }
 
@@ -532,6 +546,7 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
       const ownsNavigation = activeNavigationId === resource.id;
       if (ownsNavigation || activeNavigationId === null) {
         let restored = false;
+        let restorationSucceeded = true;
         if (failedRender && renderedPage !== committedPage) {
           const { preserveState } = failedRender;
           failedRender = null;
@@ -543,9 +558,19 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
               preserveState,
             });
           } catch (error) {
+            restorationSucceeded = false;
             // The visit already rejects with the history error; keep that one.
             reportError(error);
           }
+        }
+        // The adapter has acknowledged the restored DOM. A newer visit may
+        // have started during that update, and still needs its retired payloads.
+        if (
+          restorationSucceeded &&
+          renderedPage === committedPage &&
+          (activeNavigationId === resource.id || activeNavigationId === null)
+        ) {
+          engine.releaseRetiredResources(new Set());
         }
         // A newer visit may have started while the committed page was applied.
         if (ownsNavigation && activeNavigationId === resource.id) {

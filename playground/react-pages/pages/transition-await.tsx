@@ -11,6 +11,7 @@ function FormButton({ testId }: { testId: string }) {
 export default function TransitionAwaitPage({ revision }: Props) {
   const router = useRouter();
   const [operation, setOperation] = useState('action');
+  const [navigationFailed, setNavigationFailed] = useState(false);
   const [pending, startTransition] = useTransition();
   const [plainPending, setPlainPending] = useState(false);
   const [completed, setCompleted] = useState(false);
@@ -70,6 +71,15 @@ export default function TransitionAwaitPage({ revision }: Props) {
   return (
     <section>
       <h1>Transition Await</h1>
+      <button
+        data-testid="reject-next-navigation"
+        onClick={() => {
+          void router.visit('/users/1?retire-error=1').catch(() => setNavigationFailed(true));
+        }}
+      >
+        Try another page
+      </button>
+      <output data-testid="navigation-failed">{navigationFailed ? 'failed' : 'waiting'}</output>
       <select
         data-testid="operation"
         value={operation}

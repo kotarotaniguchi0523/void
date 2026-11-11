@@ -396,6 +396,84 @@ export function registerSharedClientTests({
     }
   });
 
+  it.each(['page data', 'component import'] as const)('loads the destination document when native-link precommit fails during %s', async (failure) => {
+    const page = await newPage();
+    try {
+      await page.goto(BASE + '/');
+      await waitForHydration(page);
+      const destination = BASE + '/users/1?precommit-recovery=1';
+      let blockedComponent = false;
+      if (failure === 'component import') {
+        await page.route('**/*', (route) => {
+          const path = new URL(route.request().url()).pathname;
+          const component = path.includes('/pages/users/') || /\/assets\/_id_[^/]*\.js$/.test(path);
+          if (!blockedComponent && route.request().resourceType() === 'script' && component) {
+            blockedComponent = true;
+            return route.abort();
+          }
+          return route.continue();
+        });
+      } else {
+        await page.route(destination, (route) =>
+          route.request().headers()['x-voidpages']
+            ? route.fulfill({ headers: { 'x-voidpages': 'true' }, body: '{' })
+            : route.continue(),
+        );
+      }
+      const timeOrigin = await page.evaluate((href) => {
+        const anchor = document.createElement('a');
+        anchor.href = href;
+        anchor.textContent = 'Recover native navigation';
+        document.body.insertBefore(anchor, document.body.firstChild);
+        return performance.timeOrigin;
+      }, destination);
+      const documentLoad = page.waitForRequest(
+        (request) => request.isNavigationRequest() && request.url() === destination,
+      );
+      await Promise.all([
+        documentLoad,
+        page.getByRole('link', { name: 'Recover native navigation' }).click({ noWaitAfter: true }),
+      ]);
+      await page.getByText('alice@example.com').waitFor();
+      expect(page.url()).toBe(destination);
+      expect(await page.evaluate(() => performance.timeOrigin)).not.toBe(timeOrigin);
+      await waitForHydration(page);
+      if (failure === 'component import') {
+        expect(blockedComponent).toBe(true);
+      }
+    } finally {
+      await page.context().close();
+    }
+  });
+
+  it('retains scroll and focus when an explicit GET rejects before URL commit', async () => {
+    const page = await newPage();
+    try {
+      await page.goto(BASE + '/native-anchor');
+      await waitForHydration(page);
+      await page.route('**/native-anchor?replace=1', (route) =>
+        route.fulfill({ headers: { 'x-voidpages': 'true' }, body: '{' }),
+      );
+      const initial = await page.evaluate(() => {
+        window.scrollTo(0, 600);
+        const anchor = document.querySelector<HTMLAnchorElement>('[data-testid="anchor-replace"]')!;
+        anchor.focus({ preventScroll: true });
+        navigation.addEventListener('navigateerror', () => {
+          document.body.setAttribute('data-navigation-failed', '');
+        }, { once: true });
+        return { timeOrigin: performance.timeOrigin, scroll: window.scrollY };
+      });
+      await page.getByTestId('anchor-replace').press('Enter', { noWaitAfter: true });
+      await page.waitForSelector('body[data-navigation-failed]');
+      expect(page.url()).toBe(BASE + '/native-anchor');
+      expect(await page.evaluate(() => window.scrollY)).toBe(initial.scroll);
+      expect(await page.evaluate(() => document.activeElement?.getAttribute('data-testid'))).toBe('anchor-replace');
+      expect(await page.evaluate(() => performance.timeOrigin)).toBe(initial.timeOrigin);
+    } finally {
+      await page.context().close();
+    }
+  });
+
   it('soft navigates plain anchors and reports success after the destination renders', async () => {
     const page = await newPage();
     const { ready: requestStarted, release: markRequestStarted } = gate();

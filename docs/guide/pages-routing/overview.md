@@ -167,6 +167,8 @@ handler to use Void Pages navigation. Void does not add a legacy History API fal
 For a new page, the address updates after Void has loaded its page data and components.
 The destination can still be rendering after the address changes.
 
+If a native link cannot prepare its page data or component, Void loads the destination as a document. Handle preparation errors from programmatic `router.visit()` calls with `try/catch`.
+
 Use the `Link` component for checked `href` values, prefetching, active and pending styles, or other link options. Build dynamic URLs with [`routeUrl()`](../type-safety.md#typed-urls-and-navigation) to check the route pattern and its parameters:
 
 ::: code-group
@@ -353,20 +355,57 @@ Opt in to Void page-data prefetching with `data-void-prefetch`. Supported strate
 
 Use `useLinkState(href, { activeMatch: "prefix" })` from your Pages adapter to read the current and pending attributes for an anchor. Read `state.attributes` in the render or template and pass it to the anchor. Use a function such as `() => props.href` for a reactive destination. All anchors using the attributes for the same pending destination show the pending state.
 
-For a link that needs visit options or a cancellation callback, use `createLinkClickHandler(router, options)` from the same adapter. Attach the returned function to the anchor’s click handler.
+Call these APIs inside your component or component setup, where the Pages router context is available. For explicit visit options, attach `createLinkClickHandler(router, options)` to the anchor.
 
-```ts
+::: code-group
+
+```tsx [React]
 import { createLinkClickHandler, useLinkState, useRouter } from '@void/react';
-// The same exports are available from @void/vue, @void/svelte, and @void/solid.
 
-const users = useLinkState('/users');
-const replaceUsers = createLinkClickHandler(useRouter(), {
-  replace: true,
-  preserveScroll: true,
-});
+export function UsersLink() {
+  const users = useLinkState('/users');
+  const click = createLinkClickHandler(useRouter(), { replace: true, preserveScroll: true });
+  return <a href="/users" {...users.attributes} onClick={click}>Users</a>;
+}
 ```
 
-Use your framework’s usual event and attribute syntax to apply `replaceUsers` and `users.attributes`. For data mutations, use a form or an action button.
+```vue [Vue]
+<script setup lang="ts">
+import { createLinkClickHandler, useLinkState, useRouter } from '@void/vue';
+
+const users = useLinkState('/users');
+const click = createLinkClickHandler(useRouter(), { replace: true, preserveScroll: true });
+</script>
+
+<template>
+  <a href="/users" v-bind="users.attributes" @click="click">Users</a>
+</template>
+```
+
+```svelte [Svelte]
+<script lang="ts">
+  import { createLinkClickHandler, useLinkState, useRouter } from '@void/svelte';
+
+  const users = useLinkState('/users');
+  const click = createLinkClickHandler(useRouter(), { replace: true, preserveScroll: true });
+</script>
+
+<a href="/users" {...users.attributes} onclick={click}>Users</a>
+```
+
+```tsx [Solid]
+import { createLinkClickHandler, useLinkState, useRouter } from '@void/solid';
+
+export function UsersLink() {
+  const users = useLinkState('/users');
+  const click = createLinkClickHandler(useRouter(), { replace: true, preserveScroll: true });
+  return <a href="/users" {...users.attributes} onClick={click}>Users</a>;
+}
+```
+
+:::
+
+For data mutations, use a form or an action button.
 
 ### Active links
 

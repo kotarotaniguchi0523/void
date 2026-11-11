@@ -690,6 +690,28 @@ describe('createVoidRouter', () => {
     expect(plain._prefetchDefaultStrategy).toBe(false);
   });
 
+  it('filters mutation and internal options at every public facade boundary', async () => {
+    stubClientGlobals();
+    const visit = vi.fn(async () => ({}));
+    const raw = {
+      url: new URL('http://localhost/'), params: {}, path: '/', query: new URLSearchParams(),
+      _hoverDelay: 75, visit, refresh: vi.fn(async () => ({})), prefetch: vi.fn(async () => ({})),
+      flush: vi.fn(), flushAll: vi.fn(),
+    } satisfies RuntimeVoidRouter;
+    createActionClient().setActionRouter(raw);
+    const facade = createRouterFacade(createRouterFacade(raw, () => '/'), () => '/');
+    const unsafe = { method: 'POST', data: { secret: true }, _entryCommitted: true, preserveScroll: true };
+    await facade.visit('/users', unsafe);
+    const refreshOptions = { ...unsafe, replace: false };
+    await facade.refresh(refreshOptions);
+    await facade.prefetch('/users', { ...unsafe, cacheFor: '5s' });
+    expect(visit).toHaveBeenCalledWith('/users', { preserveScroll: true });
+    expect(raw.refresh).toHaveBeenCalledWith({ preserveScroll: true });
+    expect(raw.prefetch).toHaveBeenCalledWith('/users', { cacheFor: '5s' });
+    await submitAction(facade, '/users?save', { method: 'POST', data: { name: 'Ada' } });
+    expect(visit).toHaveBeenLastCalledWith('/users?save', { method: 'POST', data: { name: 'Ada' } });
+  });
+
   it('keeps runtime page data private when using the public router facade', async () => {
     const raw = {
       url: new URL('http://localhost/users'),
@@ -2151,7 +2173,7 @@ describe('createVoidRouter', () => {
     expect(rejectDeferred).not.toHaveBeenCalled();
   });
 
-  it('keeps a shell handed to the renderer alive until its successor commits', async () => {
+  it.each(['commit', 'failure'] as const)('releases a retired shell after its successor %s and renderer acknowledgement', async (outcome) => {
     stubClientGlobals();
     stubBrowserNavigation();
     const firstApplied = controlledPromise<void>();
@@ -2198,19 +2220,29 @@ describe('createVoidRouter', () => {
       },
     });
     start();
-    const first = router.visit('/first');
+    const first = router.visit('/first', { method: 'POST' });
+    const firstSettled = expect(first).rejects.toMatchObject({ name: 'AbortError' });
     await firstApplied.promise;
     const second = router.visit('/second');
     expect(firstSignal?.aborted).toBe(false);
     send({ __deferred: 'stats', data: 42 });
     await vi.waitFor(() => expect(resolveDeferred).toHaveBeenCalledWith(expect.anything(), 42));
-    secondResponse.resolve(pageJson({ component: 'home', props: {} }));
-    await second;
-    expect(firstSignal?.aborted).toBe(true);
+    if (outcome === 'failure') {
+      const rejected = expect(second).rejects.toBeInstanceOf(SyntaxError);
+      secondResponse.resolve(new Response('{', { headers: { 'X-VoidPages': 'true' } }));
+      await rejected;
+      // The failed successor has not removed the first render from the DOM.
+      expect(firstSignal?.aborted).toBe(false);
+    } else {
+      secondResponse.resolve(pageJson({ component: 'home', props: {} }));
+      await second;
+      expect(firstSignal?.aborted).toBe(true);
+    }
     firstRender.resolve();
-    await expect(first).resolves.toBeUndefined();
+    await firstSettled;
+    expect(firstSignal?.aborted).toBe(true);
     firstStream.close();
-    expect(window.location.pathname).toBe('/second');
+    expect(window.location.pathname).toBe(outcome === 'commit' ? '/second' : '/');
   });
 
   it('accepts an NDJSON first page payload without a trailing newline', async () => {
