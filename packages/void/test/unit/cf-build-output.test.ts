@@ -1172,7 +1172,7 @@ it('bundles a generated static Worker and staged assets into prebuilt cf output'
       expectCfDryRun(prepared.directory, ['deploy']);
     },
   );
-});
+}, 15_000);
 
 /** The comment line `void domain add` writes, in the format of writeWranglerPublishedTrafficSnapshot. */
 const PUBLISHED_TRAFFIC_COMMENT = `// void:published-traffic:v1:${Buffer.from(

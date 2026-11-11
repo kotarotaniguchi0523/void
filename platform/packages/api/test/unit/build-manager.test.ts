@@ -336,7 +336,8 @@ import {
   parseProcStatusUid,
   pipeStream,
   record,
-  runBuild,
+  runBuild as runBuildAgent,
+  type RunBuildDeps,
   SCRUBBED_ENV_VARS,
   sanitizeChildEnv,
   startControlServer,
@@ -6367,6 +6368,16 @@ describe('build-agent shutdown handlers (PID-1 SIGTERM delivery)', () => {
     }
   });
 });
+
+function runBuild(deps: RunBuildDeps): Promise<number> {
+  // Unit fixtures fake the build children. Keep the agent's root-only host
+  // operations injectable so tests never chown files or kill host processes.
+  return runBuildAgent({
+    chownWorkDir: async () => {},
+    killBuilderProcesses: async () => {},
+    ...deps,
+  });
+}
 
 describe('build-agent parent-process secret scrub', () => {
   it('deletes AGENT_TOKEN and DO_LOG_URL from process.env at module load', async () => {
