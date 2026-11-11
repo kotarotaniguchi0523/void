@@ -402,6 +402,21 @@ export function registerSharedClientTests({
       await page.goto(BASE + '/');
       await waitForHydration(page);
       const destination = BASE + '/users/1?precommit-recovery=1';
+      const initialHistoryLength = await page.evaluate(() => {
+        sessionStorage.setItem('precommit-events', '[]');
+        const record = (event: { type: string; url: string; from: string }) => {
+          const events = JSON.parse(sessionStorage.getItem('precommit-events')!);
+          events.push(event);
+          sessionStorage.setItem('precommit-events', JSON.stringify(events));
+        };
+        navigation.addEventListener('navigate', (event) => {
+          record({ type: 'navigate', url: event.destination.url, from: location.href });
+        });
+        navigation.addEventListener('currententrychange', () => {
+          record({ type: 'commit', url: location.href, from: location.href });
+        });
+        return history.length;
+      });
       let blockedComponent = false;
       if (failure === 'component import') {
         await page.route('**/*', (route) => {
@@ -441,6 +456,23 @@ export function registerSharedClientTests({
       if (failure === 'component import') {
         expect(blockedComponent).toBe(true);
       }
+      const recovered = await page.evaluate(() => ({
+        events: JSON.parse(sessionStorage.getItem('precommit-events')!) as Array<{ type: string; url: string; from: string }>,
+        historyLength: history.length,
+        destinations: navigation.entries().filter((entry) => entry.url === location.href).length,
+      }));
+      const starts = recovered.events.filter((event) => event.type === 'navigate');
+      expect(starts.map((event) => event.url)).toEqual([destination, destination]);
+      expect(starts.every((event) => event.from === BASE + '/')).toBe(true);
+      expect(recovered.events.filter((event) => event.type === 'commit')).toEqual([]);
+      expect(recovered.historyLength).toBe(initialHistoryLength + 1);
+      expect(recovered.destinations).toBe(1);
+      await page.goBack();
+      await page.getByRole('heading', { name: 'Welcome' }).waitFor();
+      expect(page.url()).toBe(BASE + '/');
+      await page.goForward();
+      await page.getByText('alice@example.com').waitFor();
+      expect(page.url()).toBe(destination);
     } finally {
       await page.context().close();
     }
@@ -1000,19 +1032,22 @@ export function registerSharedClientTests({
       try {
         await page.goto(BASE + '/');
         await waitForHydration(page);
+        expect(await page.evaluate((id) => document.getElementById(id), id)).toBeNull();
         await page.evaluate((id) => {
-          const target = document.createElement('div');
-          target.id = id;
-          target.textContent = 'Fragment target';
-          target.style.cssText = 'margin-top: 1800px; height: 1200px';
-          document.body.appendChild(target);
           const anchor = document.createElement('a');
-          anchor.href = '/users#' + (id.startsWith('bad') ? 'bad%FF%20value%' : encodeURIComponent(id));
+        anchor.href =
+          '/native-anchor#' + (id.startsWith('bad') ? 'bad%FF%20value%' : encodeURIComponent(id));
           document.body.appendChild(anchor);
           anchor.click();
           anchor.remove();
         }, id);
-        await page.getByRole('heading', { name: 'Users' }).waitFor();
+        await page.getByRole('heading', { name: 'Native anchor' }).waitFor();
+        expect(
+          await page.evaluate(
+            (id) => !!document.getElementById('app')?.contains(document.getElementById(id)),
+            id,
+          ),
+        ).toBe(true);
         await expect
           .poll(() => page.evaluate((id) => document.getElementById(id)!.getBoundingClientRect().top, id))
           .toBeCloseTo(0, 0);
@@ -1022,6 +1057,29 @@ export function registerSharedClientTests({
       }
     });
   }
+
+  it('matches native scrolling for missing, named and top same-page fragments', async ({ expect }) => {
+    const page = await newPage();
+    try {
+      await page.goto(BASE + '/native-anchor');
+      await waitForHydration(page);
+      await page.evaluate(() => window.scrollTo(0, 640));
+      await page.getByTestId('fragment-missing').evaluate((anchor) => (anchor as HTMLElement).click());
+      await page.waitForURL(BASE + '/native-anchor#missing');
+      await page.waitForFunction(() => !navigation.transition);
+      expect(await page.evaluate(() => window.scrollY)).toBe(640);
+      await page.getByTestId('fragment-named').evaluate((anchor) => (anchor as HTMLElement).click());
+      await page.waitForURL(BASE + '/native-anchor#named-section');
+      await expect
+        .poll(() => page.evaluate(() => document.querySelector('a[name="named-section"]')!.getBoundingClientRect().top))
+        .toBeCloseTo(0, 0);
+      await page.getByTestId('fragment-top').evaluate((anchor) => (anchor as HTMLElement).click());
+      await page.waitForURL(BASE + '/native-anchor#top');
+      await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0);
+    } finally {
+      await page.context().close();
+    }
+  });
 
   if (coverage === 'smoke') {
     return;

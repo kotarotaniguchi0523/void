@@ -67,6 +67,7 @@ async function setup(key = 'initial-entry', storage = new Map<string, string>())
         : id === 'app'
           ? { getAttribute: () => null }
           : null,
+    getElementsByName: () => [],
     head: { querySelectorAll: () => [], querySelector: () => null },
   });
   const engine = await createPageNavigationEngine({
@@ -116,6 +117,64 @@ afterEach(() => {
 });
 
 describe('Pages scroll restoration', () => {
+  it.each([
+    ['#missing', 640],
+    ['#bad%FF%', 640],
+    ['#top', 0],
+    ['#TOP', 0],
+    ['#%74op', 0],
+    ['#', 0],
+  ] as const)('keeps native fragment semantics for %s in an imperative visit', async (hash, expected) => {
+    const page = await setup();
+    page.engine.start();
+    page.engine.commitInitialRender();
+    page.window.scrollY = 640;
+    await page.engine.prepareVisit(hash).shell;
+    expect(page.window.scrollY).toBe(expected);
+  });
+
+  it('resets scroll for a missing fragment after a cross-page commit', async () => {
+    const page = await setup();
+    page.engine.start();
+    page.engine.commitInitialRender();
+    page.window.scrollY = 640;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        Response.json({ component: 'home', props: {} }, { headers: { 'X-VoidPages': 'true' } }),
+      ),
+    );
+    const visit = page.engine.prepareVisit('/next#missing');
+    await visit.shell;
+    await visit.commit();
+    page.frame();
+    expect(page.window.scrollTo).toHaveBeenLastCalledWith(0, 0);
+  });
+
+  it('resolves named anchors before decoded IDs and ignores other named elements', async () => {
+    const page = await setup();
+    const named = vi.fn();
+    const decoded = vi.fn();
+    const getElementById = document.getElementById.bind(document);
+    vi.spyOn(document, 'getElementById').mockImplementation((id) =>
+      id === 'a b' ? ({ scrollIntoView: decoded } as unknown as HTMLElement) : getElementById(id),
+    );
+    vi.spyOn(document, 'getElementsByName').mockImplementation(
+      (name) =>
+        (name === 'a%20b'
+          ? [
+              { localName: 'input', scrollIntoView: vi.fn() },
+              { localName: 'a', scrollIntoView: named },
+            ]
+          : []) as unknown as NodeListOf<HTMLElement>,
+    );
+    page.engine.start();
+    page.engine.commitInitialRender();
+    await page.engine.prepareVisit('#a%20b').shell;
+    expect(named).toHaveBeenCalledOnce();
+    expect(decoded).not.toHaveBeenCalled();
+  });
+
   it('removes disposed entries from memory and storage without touching retained history', async () => {
     const page = await setup();
     const initial = page.navigation.currentEntry;

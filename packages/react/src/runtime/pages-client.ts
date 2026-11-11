@@ -111,7 +111,7 @@ type AppAction =
 const deferredState = new WeakMap<DeferredResource, DeferredResourceState>();
 const viewTransitionWaiters = new Map<number, () => void>();
 const pendingVisitSettlers = new Map<number, VisitSettler>();
-const committedResources = new Set<number>();
+let committedResources = new WeakSet<ReactPageResource>();
 const EMPTY_PARAMS: Record<string, string> = {};
 
 let terminalResource: ReactPageResource | null = null;
@@ -564,10 +564,10 @@ function App({
 
   const finishNavigation = useCallback(
     (resource: ReactPageResource, result: PageNavigationResult) => {
-      if (committedResources.has(resource.id)) {
+      if (committedResources.has(resource)) {
         return;
       }
-      committedResources.add(resource.id);
+      committedResources.add(resource);
       resource
         .commit()
         .then((committed) => {
@@ -877,7 +877,7 @@ export async function startReactPages(config: ReactPagesConfig): Promise<ReactPa
   terminalResource = null;
   viewTransitionWaiters.clear();
   pendingVisitSettlers.clear();
-  committedResources.clear();
+  committedResources = new WeakSet();
   activePendingNavigationId = null;
   prerenderedUrl = null;
 
