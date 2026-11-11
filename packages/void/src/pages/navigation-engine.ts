@@ -716,23 +716,33 @@ export async function createPageNavigationEngine(
     });
   }
 
-  function restoreScroll(scrollPosition: VisitOptions['_scrollPosition'], hash: string): void {
+  function restoreScroll(
+    scrollPosition: VisitOptions['_scrollPosition'],
+    hash: string,
+    resetIfMissing = true,
+  ): void {
     if (scrollPosition) {
       window.scrollTo(scrollPosition.x, scrollPosition.y);
       return;
     }
-    if (hash) {
+    if (hash && hash !== '#') {
       const fragment = hash.slice(1);
-      // HTML first checks the literal ID, then percent-decodes with replacement
+      // HTML first checks the literal fragment, then percent-decodes with replacement
       // for invalid UTF-8. decodeURIComponent would throw for malformed input.
       const decoded = fragment.replace(/(?:%[\da-f]{2})+/gi, (escaped) =>
         new TextDecoder('utf-8', { ignoreBOM: true }).decode(
           Uint8Array.from(escaped.match(/%[\da-f]{2}/gi)!, (byte) => parseInt(byte.slice(1), 16)),
         ),
       );
-      const el = document.getElementById(fragment) ?? document.getElementById(decoded);
+      const findTarget = (value: string) =>
+        document.getElementById(value) ??
+        Array.from(document.getElementsByName(value)).find((element) => element.localName === 'a');
+      const el = findTarget(fragment) ?? findTarget(decoded);
       if (el) {
         el.scrollIntoView();
+        return;
+      }
+      if (!resetIfMissing && decoded.toLowerCase() !== 'top') {
         return;
       }
     }
@@ -1336,7 +1346,7 @@ export async function createPageNavigationEngine(
             _currentFetchUrl = effectiveFetchUrl;
             scrollRestoration.commit(key);
             if (!options._nativeScroll) {
-              restoreScroll(options._scrollPosition, hash);
+              restoreScroll(options._scrollPosition, hash, false);
             }
           }
           return undefined;

@@ -66,6 +66,7 @@ function stubClientGlobals(origin = 'http://localhost') {
       }
       return null;
     }),
+    getElementsByName: () => [],
     head: {
       appendChild: vi.fn(),
       querySelector: vi.fn(() => null),
@@ -1731,7 +1732,7 @@ describe('createVoidRouter', () => {
 
     expect(events).toEqual(['loading', 'idle']);
     expect(browserWrites.push).toHaveBeenCalledWith('/docs?tab=api#section');
-    expect(window.scrollTo).toHaveBeenCalledWith(0, 0);
+    expect(window.scrollTo).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
     expect(applyUpdate).not.toHaveBeenCalled();
     expect(matchRoute).not.toHaveBeenCalled();
@@ -1915,7 +1916,7 @@ describe('createVoidRouter', () => {
     expect(applyUpdate).not.toHaveBeenCalled();
     expect(browserWrites.push).toHaveBeenCalledWith('/docs?tab=api#section');
     expect(browserWrites.replace).not.toHaveBeenCalled();
-    expect(window.scrollTo).toHaveBeenCalledWith(0, 0);
+    expect(window.scrollTo).not.toHaveBeenCalled();
   });
 
   it('aborts pending navigations before same-page hash traversal visits', async () => {

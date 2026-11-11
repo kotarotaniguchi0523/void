@@ -6,6 +6,7 @@ if (typeof document !== 'undefined' && document.documentElement.hasAttribute('da
 const state = useLinkState('/users/1?anchor-prefetch=1');
 const current = useLinkState('/native-anchor');
 const replace = createLinkClickHandler(useRouter(), { replace: true, preserveScroll: true });
+const fragment = createLinkClickHandler(useRouter(), { preserveState: true });
 </script>
 
 <template>
@@ -27,5 +28,15 @@ const replace = createLinkClickHandler(useRouter(), { replace: true, preserveScr
     <a href="/native-anchor?replace=1" data-testid="anchor-replace" @click="replace"
       >Replace in place</a
     >
+
+    <a href="#missing" data-testid="fragment-missing" @click="fragment">Missing fragment</a>
+    <a href="#top" data-testid="fragment-top" @click="fragment">Top</a>
+    <a href="#named-section" data-testid="fragment-named" @click="fragment">Named section</a>
+    <section style="margin-top: 1800px">
+      <h2 id="日本語">Japanese fragment</h2>
+      <a name="named-section">Named fragment</a>
+      <div id="bad� value%" style="height: 1200px">Malformed fragment</div>
+      <div style="height: 1200px"></div>
+    </section>
   </main>
 </template>
