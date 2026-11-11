@@ -21,6 +21,29 @@ export function createScrollRestoration(): {
 } {
   const positions = new Map<string, ScrollPosition>();
   let renderedKey: string | null = null;
+  const observedEntries = new WeakSet<NavigationHistoryEntry>();
+
+  function observeEntry(entry: NavigationHistoryEntry): void {
+    if (observedEntries.has(entry)) {
+      return;
+    }
+    observedEntries.add(entry);
+    entry.addEventListener(
+      'dispose',
+      () => {
+        positions.delete(entry.key);
+        if (renderedKey === entry.key) {
+          renderedKey = null;
+        }
+        try {
+          sessionStorage.removeItem(STORAGE_PREFIX + entry.key);
+        } catch {
+          // Storage can be unavailable, but the in-memory position is still released.
+        }
+      },
+      { once: true },
+    );
+  }
 
   function read(key: string | undefined): ScrollPosition | null {
     if (!key) {
@@ -54,6 +77,15 @@ export function createScrollRestoration(): {
     start(): void {
       // Also covers reloads and traversals outside our intercept() handlers.
       history.scrollRestoration = 'manual';
+      for (const entry of window.navigation.entries()) {
+        observeEntry(entry);
+      }
+      window.navigation.addEventListener('currententrychange', () => {
+        const entry = window.navigation.currentEntry;
+        if (entry) {
+          observeEntry(entry);
+        }
+      });
       window.addEventListener('pagehide', save);
     },
     read,

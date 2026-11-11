@@ -80,6 +80,7 @@ function stubClientGlobals(origin = 'http://localhost') {
   vi.stubGlobal('window', {
     addEventListener: vi.fn(),
     navigation: Object.assign(new EventTarget(), {
+      entries: () => [],
       navigate(url: string, { history }: NavigationNavigateOptions) {
         const committed = Promise.resolve().then(() => {
           browserWrites[history === 'replace' ? 'replace' : 'push'](url);
@@ -127,7 +128,8 @@ function controlledPromise<T>() {
 
 function stubBrowserNavigation() {
   const browser = Object.assign(new EventTarget(), {
-    currentEntry: { key: 'initial-entry', getState: () => undefined },
+    currentEntry: Object.assign(new EventTarget(), { key: 'initial-entry', getState: () => undefined }),
+    entries: () => [browser.currentEntry],
   });
   let active: AbortController | undefined;
   Object.defineProperty(browser, 'navigate', {
@@ -164,7 +166,10 @@ function stubBrowserNavigation() {
         controller.signal.throwIfAborted();
         const { pathname, search, hash } = destination;
         Object.assign(window.location, { pathname, search, hash });
-        browser.currentEntry = { key: 'test-entry', getState: () => undefined };
+        browser.currentEntry = Object.assign(new EventTarget(), {
+          key: 'test-entry',
+          getState: () => undefined,
+        });
         return browser.currentEntry;
       });
       const finished = committed.then(async () => {

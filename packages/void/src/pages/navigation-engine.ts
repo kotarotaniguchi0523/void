@@ -722,7 +722,15 @@ export async function createPageNavigationEngine(
       return;
     }
     if (hash) {
-      const el = document.getElementById(hash.slice(1));
+      const fragment = hash.slice(1);
+      // HTML first checks the literal ID, then percent-decodes with replacement
+      // for invalid UTF-8. decodeURIComponent would throw for malformed input.
+      const decoded = fragment.replace(/(?:%[\da-f]{2})+/gi, (escaped) =>
+        new TextDecoder('utf-8', { ignoreBOM: true }).decode(
+          Uint8Array.from(escaped.match(/%[\da-f]{2}/gi)!, (byte) => parseInt(byte.slice(1), 16)),
+        ),
+      );
+      const el = document.getElementById(fragment) ?? document.getElementById(decoded);
       if (el) {
         el.scrollIntoView();
         return;
