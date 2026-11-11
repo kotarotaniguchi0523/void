@@ -1622,7 +1622,11 @@ export async function createPageNavigationEngine(
     // A classic history write also emits navigate. Only claim a link, a
     // traversal, or a visit initiated by this router.
     const anchor = event.sourceElement?.closest('a[href],area[href]');
-    if (!own && !traversal && (!anchor || anchor.hasAttribute('data-void-reload'))) {
+    if (
+      !own &&
+      !traversal &&
+      (!anchor || anchor.hasAttribute('download') || anchor.hasAttribute('data-void-reload'))
+    ) {
       return;
     }
     if (traversal && !event.destination.sameDocument) {
@@ -1709,8 +1713,16 @@ export async function createPageNavigationEngine(
         void applied.catch(() => {});
         try {
           const shell = await resource.shell;
+          if (!shell) {
+            // The loader has handed this visit to a document navigation.
+            // Release the renderer without reporting a synthetic AbortError.
+            event.signal.removeEventListener('abort', cancel);
+            cancel();
+            abortPendingResource(resource);
+            return;
+          }
           event.signal.throwIfAborted();
-          if (!shell || _pendingResource !== resource) {
+          if (_pendingResource !== resource) {
             throw abortError();
           }
           const finalUrl = resource.destination();
