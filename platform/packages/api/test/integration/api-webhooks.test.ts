@@ -4830,6 +4830,12 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
 // can never deploy a commit a push could not.
 // ---------------------------------------------------------------------------
 describe('POST /webhooks/github — rerun from the check run', () => {
+  beforeEach(async () => {
+    // post() drains waitUntil, including the check-run report sent after a refusal.
+    const checkRunModule = await import('../../src/github/check-run.ts');
+    vi.spyOn(checkRunModule, 'completeCheckRun').mockResolvedValue(true);
+  });
+
   /** A BUILD_SCHEDULER stand-in that records pokes. */
   function pokeEnvWith(base: TestEnv): { pokeEnv: TestEnv; pokes: Array<string> } {
     const pokes: Array<string> = [];
