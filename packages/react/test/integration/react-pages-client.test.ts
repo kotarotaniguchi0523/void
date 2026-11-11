@@ -367,6 +367,9 @@ function defineTransitionAwaitTests(getBase: () => string) {
             ),
             (async () => {
               await button.click();
+              // The response gate holds this state stable. Await its DOM commit
+              // without imposing expect.poll's one-second scheduling deadline.
+              await button.filter({ hasText: /^pending$/ }).waitFor();
               await expect.poll(() => button.textContent()).toBe('pending');
               await expect.poll(() => page.getByTestId('optimistic').textContent()).toBe('saving');
               expect(page.url()).toBe(url);

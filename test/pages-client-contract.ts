@@ -279,9 +279,16 @@ export function registerSharedClientTests({
       await page.evaluate(() => {
         const output = document.querySelector('[data-testid="scroll-request"]')!;
         const previous = output.textContent;
-        const anchor = document.createElement('a');
-        anchor.href = '/users/1?action-race=1';
-        document.body.appendChild(anchor);
+        let navigationStarted = false;
+        navigation.addEventListener('navigate', (event) => {
+          if (event.destination.url.endsWith('/users/1?action-race=1')) {
+            navigationStarted = true;
+          }
+        });
+        // Native anchor activation may queue navigate after this callback returns.
+        // This option-bearing anchor starts router.visit synchronously, so the
+        // test actually supersedes the resource before its commit resumes.
+        const anchor = document.querySelector<HTMLAnchorElement>('[data-testid="race-link"]')!;
         navigation.addEventListener('currententrychange', () => {
           if (location.search === '?redirected=1') {
             document.body.setAttribute('data-stale-redirect', '');
@@ -291,6 +298,7 @@ export function registerSharedClientTests({
           if (document.querySelector('[data-testid="scroll-request"]')?.textContent !== previous) {
             observer.disconnect();
             anchor.click();
+            document.body.dataset.raceNavigationStarted = String(navigationStarted);
           }
         });
         observer.observe(document.getElementById('app')!, {
@@ -301,6 +309,7 @@ export function registerSharedClientTests({
       });
       await page.getByRole('button', { name: 'Redirect action' }).click({ noWaitAfter: true });
       await requested;
+      expect(await page.locator('body').getAttribute('data-race-navigation-started')).toBe('true');
       expect(page.url()).toBe(BASE + '/scroll-restoration');
       releaseLoader();
       await page.getByText('alice@example.com').waitFor();
@@ -327,9 +336,8 @@ export function registerSharedClientTests({
         }),
       );
       const timeOrigin = await page.evaluate((url) => {
-        const anchor = document.createElement('a');
+        const anchor = document.querySelector<HTMLAnchorElement>('[data-testid="race-link"]')!;
         anchor.href = url;
-        document.body.appendChild(anchor);
         navigation.addEventListener('currententrychange', () => {
           if (location.search === '?redirected=1') {
             anchor.click();
