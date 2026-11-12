@@ -311,7 +311,6 @@ export async function createPageNavigationEngine(
   // The visit that renders that entry. Unset while the entry has no such visit:
   // the one that published it lost its commit, or its handler has yet to run.
   let unrenderedEntryVisit: number | undefined;
-  let preparedEntryUrl: string | undefined;
   let _pendingResource: PageNavigationResource | null = null;
   let _committedResource: PageNavigationResource | null = null;
   let _committedDeferredRegistry: DeferredRegistry | null = null;
@@ -321,9 +320,7 @@ export async function createPageNavigationEngine(
   let locationHandler: (() => void) | null = null;
   const browserVisits = new WeakSet<BrowserVisit>();
   const renderedPageNavigation = Symbol('void:rendered-page-navigation');
-  const renderedEntryReturn = Symbol('void:rendered-entry-return');
   let started = false;
-  let interceptedTraversal: string | null = null;
   const exposedResources = new Set<PageNavigationResource>();
   const retiredResources = new Set<PageNavigationResource>();
 
@@ -823,7 +820,11 @@ export async function createPageNavigationEngine(
     if (!navigation.committed) {
       throw new Error('Void Router: browser did not start the navigation.');
     }
-    return (await navigation.committed).key;
+    const { key } = await navigation.committed;
+    // The entry is current, and its visit can still lose the commit to a navigation
+    // that a currententrychange listener started. The visit clears this when it commits.
+    markUnrenderedEntry(key);
+    return key;
   }
 
   /**
@@ -841,7 +842,7 @@ export async function createPageNavigationEngine(
     const key = scrollRestoration.rendered();
     let returned: Promise<unknown>;
     if (key && key !== current.key && window.navigation.entries().some((e) => e.key === key)) {
-      const traversal = window.navigation.traverseTo(key, { info: renderedEntryReturn });
+      const traversal = window.navigation.traverseTo(key, { info: renderedPageNavigation });
       void traversal.finished?.catch(() => {});
       returned = Promise.resolve(traversal.committed);
     } else {
@@ -1663,44 +1664,13 @@ export async function createPageNavigationEngine(
     },
   };
 
-  // interceptedTraversal and preparedEntryUrl tell currententrychange
-  // about the entry a claimed navigation commits. They belong to that navigation:
-  // a navigate event the router leaves alone, such as a classic history write,
-  // must not change them.
-  let entryHandoff: NavigateEvent | null = null;
-  function resetEntryHandoff(): void {
-    interceptedTraversal = null;
-    preparedEntryUrl = undefined;
-  }
-  function claimEntryHandoff(event: NavigateEvent): void {
-    resetEntryHandoff();
-    entryHandoff = event;
-    event.signal.addEventListener(
-      'abort',
-      () => {
-        if (entryHandoff === event) {
-          entryHandoff = null;
-          resetEntryHandoff();
-        }
-      },
-      { once: true },
-    );
-  }
-
+  // Every visit starts here: one navigate event is one navigation. The browser owns its
+  // URL, history entry and cancellation, and this listener loads and renders the page.
   // Register before the adapter mounts: an initial effect can publish an entry.
   window.navigation.addEventListener('navigate', (event) => {
     if (event.info === renderedPageNavigation) {
-      claimEntryHandoff(event);
-      // A visit started by currententrychange can still invalidate the resource
-      // before Void commits it, even though its DOM update has already run.
-      preparedEntryUrl = event.destination.url;
-      event.intercept({ scroll: 'manual', focusReset: 'manual' });
-      return;
-    }
-    if (event.info === renderedEntryReturn) {
-      // The page of this entry is on screen: there is nothing to load or scroll.
-      claimEntryHandoff(event);
-      interceptedTraversal = event.destination.key || null;
+      // The engine's own entry for a page that is on screen, or its return to that
+      // page's entry: there is nothing to load or scroll.
       event.intercept({ scroll: 'manual', focusReset: 'manual' });
       return;
     }
@@ -1767,8 +1737,6 @@ export async function createPageNavigationEngine(
       abortPendingResource(_pendingResource);
     }
     if (traversal) {
-      claimEntryHandoff(event);
-      interceptedTraversal = event.destination.key || null;
       event.intercept({
         scroll: 'manual',
         focusReset: 'manual',
@@ -1795,7 +1763,6 @@ export async function createPageNavigationEngine(
     if (!event.cancelable) {
       return;
     }
-    claimEntryHandoff(event);
     event.intercept({
       scroll: 'manual',
       focusReset: event.navigationType === 'push' ? 'after-transition' : 'manual',
@@ -1847,7 +1814,6 @@ export async function createPageNavigationEngine(
           if (own) {
             request.data?.resolve(shell.pageData);
           }
-          preparedEntryUrl = new URL(finalUrl, documentBaseUrl()).href;
           controller.addHandler(async () => {
             event.signal.removeEventListener('abort', cancel);
             if (event.signal.aborted) {
@@ -1880,63 +1846,39 @@ export async function createPageNavigationEngine(
       },
     });
   });
+  // The browser has committed an entry. Its visit, if it has one, started from the
+  // navigate event: this listener only records what the entry means for the page on screen.
   window.navigation.addEventListener('currententrychange', (event) => {
     const entry = window.navigation.currentEntry;
     if (!entry?.url || entry === event.from) {
       return;
     }
-    const target = new URL(entry.url);
-    // This event runs before the post-commit handler. A new navigation can
-    // supersede that handler before it gets a chance to apply the page.
-    const prepared = entry.url === preparedEntryUrl;
-    const intercepted = entry.key === interceptedTraversal;
-    if (prepared || intercepted) {
-      if (prepared || target.pathname + target.search !== _currentFetchUrl) {
+    const pending = _pendingResource;
+    if (pending) {
+      // A visit that loads its page before the browser commits owns this entry: any
+      // other navigation would have aborted it. Its handler has yet to run, and a
+      // navigation started from this event can supersede it first.
+      const signal = pending.options._navigationSignal;
+      if (signal && !signal.aborted && !pending.options._entryCommitted) {
         markUnrenderedEntry(entry.key);
       }
-      // This entry consumes what its navigation left for it.
-      if (prepared) {
-        preparedEntryUrl = undefined;
-      }
-      if (intercepted) {
-        interceptedTraversal = null;
-      }
       return;
     }
-    if (isRenderedPageUrl(target)) {
-      // The rendered page under another fragment. The browser has not scrolled yet.
-      if (entry.key === event.from?.key && entry.url === event.from.url) {
-        return;
-      }
-      scrollRestoration.save();
-      scrollRestoration.commit(entry.key);
-      if (event.navigationType === 'traverse') {
-        // Entries keep their own positions: the browser restores none of them.
-        restoreScroll(scrollRestoration.read(entry.key), target.hash, false);
-      }
-      locationHandler?.();
-      return;
-    }
+    const target = new URL(entry.url);
     if (
-      event.navigationType !== 'traverse' ||
-      !(isClientPage(target) || isServerRoutedUrl(target)) ||
-      (entry.key === initialEntryKey && _nextNavigationId === 0)
+      !isRenderedPageUrl(target) ||
+      (entry.key === event.from?.key && entry.url === event.from.url)
     ) {
       return;
     }
+    // The rendered page under another fragment. The browser has not scrolled yet.
     scrollRestoration.save();
-    if (!browserVisitHandler) {
-      return;
+    scrollRestoration.commit(entry.key);
+    if (event.navigationType === 'traverse') {
+      // Entries keep their own positions: the browser restores none of them.
+      restoreScroll(scrollRestoration.read(entry.key), target.hash, false);
     }
-    const resource = engine.prepareVisit(target.pathname + target.search + target.hash, {
-      preserveState: true,
-      _scrollPosition: scrollRestoration.read(entry.key),
-      _entryCommitted: true,
-      _entryKey: entry.key,
-    });
-    void applyBrowserVisit(browserVisitHandler, exposeResource(resource)).catch((error) =>
-      reportError(error),
-    );
+    locationHandler?.();
   });
 
   return engine;

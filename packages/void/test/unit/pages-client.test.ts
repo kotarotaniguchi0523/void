@@ -3390,19 +3390,61 @@ describe('browser navigate events', () => {
     expect(applyUpdate).toHaveBeenCalledOnce();
   });
 
-  it('forgets an intercepted traversal that the browser aborts', async () => {
-    const { fetchPage, applyUpdate } = setup();
-    const created = await createTestRouter({ adapter: { applyUpdate } });
-    created.start();
+  describe('a visit that app code starts from currententrychange and that fails', () => {
+    /** The visit to /bad starts as soon as the browser commits `path`, and never renders. */
+    async function setup(path: string) {
+      stubClientGlobals();
+      const browser = stubNavigationHistory();
+      const reload = vi.fn();
+      Object.assign(window.location, { reload });
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string, init?: RequestInit) => {
+          if (url === '/bad') {
+            return new Response('{', { headers: { 'X-VoidPages': 'true' } });
+          }
+          const page = pageJson({ component: 'home', url: path, props: {} });
+          return init?.method === 'POST'
+            ? Object.defineProperties(page, {
+                redirected: { value: true },
+                url: { value: 'http://localhost' + path },
+              })
+            : page;
+        }),
+      );
+      const created = await createTestRouter();
+      created.start();
+      created.commitInitialRender();
+      let failed: Promise<unknown> | undefined;
+      browser.addEventListener('currententrychange', () => {
+        if (window.location.pathname === path) {
+          failed ??= created.router.visit('/bad');
+        }
+      });
+      const settled = async () => {
+        await vi.waitFor(() => expect(failed).toBeDefined());
+        await expect(failed).rejects.toBeInstanceOf(SyntaxError);
+      };
+      return { created, reload, settled };
+    }
 
-    const back = dispatchNavigate('/back', { navigationType: 'traverse', key: 'back-entry' });
-    expect(back.interception?.handler).toBeTypeOf('function');
-    back.controller.abort();
+    it('reloads the entry of a visit it superseded before that page rendered', async () => {
+      const { created, reload, settled } = await setup('/next');
 
-    // A later traversal to that entry that the router could not intercept.
-    commitEntry('/back', 'back-entry', 'traverse');
-    await vi.waitFor(() => expect(applyUpdate).toHaveBeenCalledOnce());
-    expect(fetchPage).toHaveBeenCalledOnce();
+      await created.router.visit('/next');
+      await settled();
+      expect(window.location.pathname).toBe('/next');
+      expect(reload).toHaveBeenCalledOnce();
+    });
+
+    it('reloads the entry an action published when the action lost its commit', async () => {
+      const { created, reload, settled } = await setup('/done');
+
+      await created.router.visit('/', { method: 'POST' }).catch(() => {});
+      await settled();
+      expect(window.location.pathname).toBe('/done');
+      expect(reload).toHaveBeenCalledOnce();
+    });
   });
 
   it('reloads the committed browser URL when the adapter cannot apply it', async () => {
@@ -3520,11 +3562,17 @@ describe('browser navigate events', () => {
       expect(fetchPage).toHaveBeenCalledOnce();
       expect(applyUpdate).toHaveBeenCalledOnce();
 
-      // A traversal that the router could not intercept is rendered after it commits.
+      // The entry commits before its handler runs: only the handler loads the page.
+      const forward = dispatchNavigate('/api/health', {
+        navigationType: 'traverse',
+        key: 'other-entry',
+      });
       commitEntry('/api/health', 'other-entry', 'traverse');
-      await vi.waitFor(() => expect(fetchPage).toHaveBeenCalledTimes(2));
+      expect(fetchPage).toHaveBeenCalledOnce();
+      await forward.interception!.handler!();
+      expect(fetchPage).toHaveBeenCalledTimes(2);
       expect(fetchPage.mock.calls[1]![0]).toBe('/api/health');
-      await vi.waitFor(() => expect(applyUpdate).toHaveBeenCalledTimes(2));
+      expect(applyUpdate).toHaveBeenCalledTimes(2);
     });
   });
 });
