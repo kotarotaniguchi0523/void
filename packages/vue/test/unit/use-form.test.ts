@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vite-plus/test';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 import { createActionClient, type RuntimeVoidRouter, type VoidRouter } from 'void/pages-client';
 import { createSSRApp, defineComponent, h, nextTick } from 'vue';
 import { renderToString } from 'vue/server-renderer';
@@ -53,11 +53,7 @@ async function mountForm(
   options?: { resetOnSuccess?: boolean },
   router = { visit: async () => ({}) } as unknown as VoidRouter,
 ): Promise<TestForm> {
-  const router = {
-    _hoverDelay: 75,
-    visit: async () => ({}),
-  } as unknown as RuntimeVoidRouter;
-  createActionClient().setActionRouter(router);
+  createActionClient().setActionRouter(router as unknown as RuntimeVoidRouter);
   let form!: TestForm;
   const app = createSSRApp(
     defineComponent({

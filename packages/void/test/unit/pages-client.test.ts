@@ -129,7 +129,10 @@ function controlledPromise<T>() {
 
 function stubBrowserNavigation() {
   const browser = Object.assign(new EventTarget(), {
-    currentEntry: Object.assign(new EventTarget(), { key: 'initial-entry', getState: () => undefined }),
+    currentEntry: Object.assign(new EventTarget(), {
+      key: 'initial-entry',
+      getState: () => undefined,
+    }),
     entries: () => [browser.currentEntry],
   });
   let active: AbortController | undefined;
@@ -521,12 +524,9 @@ describe('createVoidRouter', () => {
       }),
     );
     expect(window.scrollTo).not.toHaveBeenCalled();
-    expect(history.pushState).not.toHaveBeenCalled();
-    expect(history.replaceState).toHaveBeenCalledWith(
-      expect.anything(),
-      '',
-      '/editor?page=2&search=foo',
-    );
+    // The address bar already shows the page query, so the entry is left as it is.
+    expect(browserWrites.push).not.toHaveBeenCalled();
+    expect(browserWrites.replace).not.toHaveBeenCalled();
   });
 
   it.each(['?page=2&search=foo', '?delete=confirm&page=2'])(
@@ -575,8 +575,8 @@ describe('createVoidRouter', () => {
         props: { query },
         url: '/editor' + search,
       });
-      expect(history.pushState).not.toHaveBeenCalled();
-      expect(history.replaceState).toHaveBeenCalledWith(expect.anything(), '', '/editor' + search);
+      expect(browserWrites.push).not.toHaveBeenCalled();
+      expect(browserWrites.replace).not.toHaveBeenCalled();
       expect(window.scrollTo).not.toHaveBeenCalled();
     },
   );
@@ -700,13 +700,28 @@ describe('createVoidRouter', () => {
     stubClientGlobals();
     const visit = vi.fn(async () => ({}));
     const raw = {
-      url: new URL('http://localhost/'), params: {}, path: '/', query: new URLSearchParams(),
-      _hoverDelay: 75, visit, refresh: vi.fn(async () => ({})), prefetch: vi.fn(async () => ({})),
-      flush: vi.fn(), flushAll: vi.fn(),
+      url: new URL('http://localhost/'),
+      params: {},
+      path: '/',
+      query: new URLSearchParams(),
+      _hoverDelay: 75,
+      visit,
+      refresh: vi.fn(async () => ({})),
+      prefetch: vi.fn(async () => ({})),
+      flush: vi.fn(),
+      flushAll: vi.fn(),
     } satisfies RuntimeVoidRouter;
     createActionClient().setActionRouter(raw);
-    const facade = createRouterFacade(createRouterFacade(raw, () => '/'), () => '/');
-    const unsafe = { method: 'POST', data: { secret: true }, _entryCommitted: true, preserveScroll: true };
+    const facade = createRouterFacade(
+      createRouterFacade(raw, () => '/'),
+      () => '/',
+    );
+    const unsafe = {
+      method: 'POST',
+      data: { secret: true },
+      _entryCommitted: true,
+      preserveScroll: true,
+    };
     await facade.visit('/users', unsafe);
     const refreshOptions = { ...unsafe, replace: false };
     await facade.refresh(refreshOptions);
@@ -715,7 +730,10 @@ describe('createVoidRouter', () => {
     expect(raw.refresh).toHaveBeenCalledWith({ preserveScroll: true });
     expect(raw.prefetch).toHaveBeenCalledWith('/users', { cacheFor: '5s' });
     await submitAction(facade, '/users?save', { method: 'POST', data: { name: 'Ada' } });
-    expect(visit).toHaveBeenLastCalledWith('/users?save', { method: 'POST', data: { name: 'Ada' } });
+    expect(visit).toHaveBeenLastCalledWith('/users?save', {
+      method: 'POST',
+      data: { name: 'Ada' },
+    });
   });
 
   it('keeps runtime page data private when using the public router facade', async () => {
@@ -732,6 +750,7 @@ describe('createVoidRouter', () => {
       _hoverDelay: 75,
       _prefetchDefaultStrategy: 'hover',
     } satisfies RuntimeVoidRouter;
+    vi.stubGlobal('window', { location: { pathname: '/users', search: '' } });
     createActionClient().setActionRouter(raw);
     const router = createRouterFacade(raw, () => '/users');
     expect(await router.visit('/users')).toBeUndefined();
@@ -1048,7 +1067,8 @@ describe('createVoidRouter', () => {
   it('retries after a speculative fetch fails instead of caching a hard reload', async () => {
     stubClientGlobals();
     const pageData = { component: 'users', props: { users: [] } };
-    const fetchMock = vi.fn()
+    const fetchMock = vi
+      .fn()
       .mockRejectedValueOnce(new TypeError('Network unavailable'))
       .mockResolvedValueOnce(pageJson(pageData));
     vi.stubGlobal('fetch', fetchMock);
@@ -1068,7 +1088,8 @@ describe('createVoidRouter', () => {
     stubClientGlobals();
     const delayed = controlledPromise<Response>();
     const pageData = { component: 'users', props: { users: [] } };
-    const fetchMock = vi.fn()
+    const fetchMock = vi
+      .fn()
       .mockImplementationOnce(() => delayed.promise)
       .mockResolvedValueOnce(pageJson(pageData));
     vi.stubGlobal('fetch', fetchMock);
@@ -1136,7 +1157,10 @@ describe('createVoidRouter', () => {
   it('handles rejected speculative component imports without rejecting page-data prefetch', async () => {
     stubClientGlobals();
     const pageData = { component: 'users', props: {} };
-    vi.stubGlobal('fetch', vi.fn(async () => pageJson(pageData)));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => pageJson(pageData)),
+    );
     const loader = vi.fn(() => Promise.reject(new Error('Speculative import failed')));
     const { router } = await createTestRouter({
       components: { home: loadComponent, users: loader },
@@ -2179,86 +2203,93 @@ describe('createVoidRouter', () => {
     expect(rejectDeferred).not.toHaveBeenCalled();
   });
 
-  it.each(['commit', 'failure'] as const)('releases a retired shell after its successor %s and renderer acknowledgement', async (outcome) => {
-    stubClientGlobals();
-    stubBrowserNavigation();
-    const firstApplied = controlledPromise<void>();
-    const firstRender = controlledPromise<void>();
-    const secondResponse = controlledPromise<Response>();
-    let firstSignal: AbortSignal | null | undefined;
-    let firstStream!: ReadableStreamDefaultController<Uint8Array>;
-    const encoder = new TextEncoder();
-    const send = (message: object) =>
-      firstStream.enqueue(encoder.encode(JSON.stringify(message) + '\n'));
-    vi.stubGlobal('fetch', (url: string, init: RequestInit) => {
-      if (url !== '/first') {
-        return secondResponse.promise;
-      }
-      firstSignal = init.signal;
-      return Promise.resolve(
-        new Response(
-          new ReadableStream<Uint8Array>({
-            start(controller) {
-              firstStream = controller;
-              send({
-                component: 'home',
-                props: { stats: { loading: true } },
-                deferredKeys: { stats: 'stats' },
-              });
-            },
-          }),
-          { headers: { 'content-type': 'application/x-ndjson', 'X-VoidPages': 'true' } },
-        ),
-      );
-    });
-    const resolveDeferred = vi.fn((_ref, value) => ({ loading: false, value }));
-    const { router, start } = await createTestRouter({
-      adapter: {
-        applyUpdate(page) {
-          if (page.props.stats) {
-            firstApplied.resolve();
-            return firstRender.promise;
-          }
+  it.each(['commit', 'failure'] as const)(
+    'releases a retired shell after its successor %s and renderer acknowledgement',
+    async (outcome) => {
+      stubClientGlobals();
+      stubBrowserNavigation();
+      const firstApplied = controlledPromise<void>();
+      const firstRender = controlledPromise<void>();
+      const secondResponse = controlledPromise<Response>();
+      let firstSignal: AbortSignal | null | undefined;
+      let firstStream!: ReadableStreamDefaultController<Uint8Array>;
+      const encoder = new TextEncoder();
+      const send = (message: object) =>
+        firstStream.enqueue(encoder.encode(JSON.stringify(message) + '\n'));
+      vi.stubGlobal('fetch', (url: string, init: RequestInit) => {
+        if (url !== '/first') {
+          return secondResponse.promise;
+        }
+        firstSignal = init.signal;
+        return Promise.resolve(
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                firstStream = controller;
+                send({
+                  component: 'home',
+                  props: { stats: { loading: true } },
+                  deferredKeys: { stats: 'stats' },
+                });
+              },
+            }),
+            { headers: { 'content-type': 'application/x-ndjson', 'X-VoidPages': 'true' } },
+          ),
+        );
+      });
+      const resolveDeferred = vi.fn((_ref, value) => ({ loading: false, value }));
+      const { router, start } = await createTestRouter({
+        adapter: {
+          applyUpdate(page) {
+            if (page.props.stats) {
+              firstApplied.resolve();
+              return firstRender.promise;
+            }
+          },
+          createDeferred: () => ({ loading: true }),
+          isLoading: (ref) => Boolean((ref as { loading?: boolean })?.loading),
+          resolveDeferred,
         },
-        createDeferred: () => ({ loading: true }),
-        isLoading: (ref) => Boolean((ref as { loading?: boolean })?.loading),
-        resolveDeferred,
-      },
-    });
-    start();
-    const first = router.visit('/first', { method: 'POST' });
-    const firstSettled = expect(first).rejects.toMatchObject({ name: 'AbortError' });
-    await firstApplied.promise;
-    const second = router.visit('/second');
-    expect(firstSignal?.aborted).toBe(false);
-    send({ __deferred: 'stats', data: 42 });
-    await vi.waitFor(() => expect(resolveDeferred).toHaveBeenCalledWith(expect.anything(), 42));
-    if (outcome === 'failure') {
-      const rejected = expect(second).rejects.toBeInstanceOf(SyntaxError);
-      secondResponse.resolve(new Response('{', { headers: { 'X-VoidPages': 'true' } }));
-      await rejected;
-      // The failed successor has not removed the first render from the DOM.
+      });
+      start();
+      const first = router.visit('/first', { method: 'POST' });
+      const firstSettled = expect(first).rejects.toMatchObject({ name: 'AbortError' });
+      await firstApplied.promise;
+      const second = router.visit('/second');
       expect(firstSignal?.aborted).toBe(false);
-    } else {
-      secondResponse.resolve(pageJson({ component: 'home', props: {} }));
-      await second;
+      send({ __deferred: 'stats', data: 42 });
+      await vi.waitFor(() => expect(resolveDeferred).toHaveBeenCalledWith(expect.anything(), 42));
+      if (outcome === 'failure') {
+        const rejected = expect(second).rejects.toBeInstanceOf(SyntaxError);
+        secondResponse.resolve(new Response('{', { headers: { 'X-VoidPages': 'true' } }));
+        await rejected;
+        // The failed successor has not removed the first render from the DOM.
+        expect(firstSignal?.aborted).toBe(false);
+      } else {
+        secondResponse.resolve(pageJson({ component: 'home', props: {} }));
+        await second;
+        expect(firstSignal?.aborted).toBe(true);
+      }
+      firstRender.resolve();
+      await firstSettled;
       expect(firstSignal?.aborted).toBe(true);
-    }
-    firstRender.resolve();
-    await firstSettled;
-    expect(firstSignal?.aborted).toBe(true);
-    firstStream.close();
-    expect(window.location.pathname).toBe(outcome === 'commit' ? '/second' : '/');
-  });
+      firstStream.close();
+      expect(window.location.pathname).toBe(outcome === 'commit' ? '/second' : '/');
+    },
+  );
 
   it('accepts an NDJSON first page payload without a trailing newline', async () => {
     stubClientGlobals();
     const page = { component: 'users', props: { title: 'First line only' } };
-    vi.stubGlobal('fetch', vi.fn(async () =>
-      new Response(JSON.stringify(page), {
-        headers: { 'content-type': 'application/x-ndjson', 'X-VoidPages': 'true' },
-      }),
-    ));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify(page), {
+            headers: { 'content-type': 'application/x-ndjson', 'X-VoidPages': 'true' },
+          }),
+      ),
+    );
     const { router } = await createTestRouter({
       components: { home: loadComponent, users: loadComponent },
       matchRoute: () => 'users',
@@ -2278,14 +2309,21 @@ describe('createVoidRouter', () => {
       }),
       JSON.stringify({ __deferred: 'stats', data: { count: 42 } }),
     ].join('\n');
-    vi.stubGlobal('fetch', vi.fn(async () =>
-      new Response(new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode(payload));
-          controller.close();
-        },
-      }), { headers: { 'content-type': 'application/x-ndjson', 'X-VoidPages': 'true' } }),
-    ));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode(payload));
+                controller.close();
+              },
+            }),
+            { headers: { 'content-type': 'application/x-ndjson', 'X-VoidPages': 'true' } },
+          ),
+      ),
+    );
     const { router } = await createTestRouter({
       adapter: {
         createDeferred: () => ({ loading: true }),
@@ -2301,7 +2339,8 @@ describe('createVoidRouter', () => {
     await vi.waitFor(() => {
       expect(resolveDeferred).toHaveBeenCalledWith(expect.anything(), { count: 42 });
       expect(rejectDeferred).toHaveBeenCalledWith(
-        expect.anything(), 'Stream closed before resolution',
+        expect.anything(),
+        'Stream closed before resolution',
       );
     });
   });

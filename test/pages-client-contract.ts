@@ -213,7 +213,7 @@ export function registerSharedClientTests({
     }
   });
 
-  it('keeps action and form scroll in place, with resets for overrides and redirects', async ({
+  it('keeps the page query and scroll for actions and forms, with resets for overrides and redirects', async ({
     expect,
   }) => {
     const page = await newPage();
@@ -396,87 +396,97 @@ export function registerSharedClientTests({
     }
   });
 
-  it.each(['page data', 'component import'] as const)('loads the destination document when native-link precommit fails during %s', async (failure) => {
-    const page = await newPage();
-    try {
-      await page.goto(BASE + '/');
-      await waitForHydration(page);
-      const destination = BASE + '/users/1?precommit-recovery=1';
-      const initialHistoryLength = await page.evaluate(() => {
-        sessionStorage.setItem('precommit-events', '[]');
-        const record = (event: { type: string; url: string; from: string }) => {
-          const events = JSON.parse(sessionStorage.getItem('precommit-events')!);
-          events.push(event);
-          sessionStorage.setItem('precommit-events', JSON.stringify(events));
-        };
-        navigation.addEventListener('navigate', (event) => {
-          record({ type: 'navigate', url: event.destination.url, from: location.href });
+  it.each(['page data', 'component import'] as const)(
+    'loads the destination document when native-link precommit fails during %s',
+    async (failure) => {
+      const page = await newPage();
+      try {
+        await page.goto(BASE + '/');
+        await waitForHydration(page);
+        const destination = BASE + '/users/1?precommit-recovery=1';
+        const initialHistoryLength = await page.evaluate(() => {
+          sessionStorage.setItem('precommit-events', '[]');
+          const record = (event: { type: string; url: string; from: string }) => {
+            const events = JSON.parse(sessionStorage.getItem('precommit-events')!);
+            events.push(event);
+            sessionStorage.setItem('precommit-events', JSON.stringify(events));
+          };
+          navigation.addEventListener('navigate', (event) => {
+            record({ type: 'navigate', url: event.destination.url, from: location.href });
+          });
+          navigation.addEventListener('currententrychange', () => {
+            record({ type: 'commit', url: location.href, from: location.href });
+          });
+          return history.length;
         });
-        navigation.addEventListener('currententrychange', () => {
-          record({ type: 'commit', url: location.href, from: location.href });
-        });
-        return history.length;
-      });
-      let blockedComponent = false;
-      if (failure === 'component import') {
-        await page.route('**/*', (route) => {
-          const path = new URL(route.request().url()).pathname;
-          const component = path.includes('/pages/users/') || /\/assets\/_id_[^/]*\.js$/.test(path);
-          if (!blockedComponent && route.request().resourceType() === 'script' && component) {
-            blockedComponent = true;
-            return route.abort();
-          }
-          return route.continue();
-        });
-      } else {
-        await page.route(destination, (route) =>
-          route.request().headers()['x-voidpages']
-            ? route.fulfill({ headers: { 'x-voidpages': 'true' }, body: '{' })
-            : route.continue(),
+        let blockedComponent = false;
+        if (failure === 'component import') {
+          await page.route('**/*', (route) => {
+            const path = new URL(route.request().url()).pathname;
+            const component =
+              path.includes('/pages/users/') || /\/assets\/_id_[^/]*\.js$/.test(path);
+            if (!blockedComponent && route.request().resourceType() === 'script' && component) {
+              blockedComponent = true;
+              return route.abort();
+            }
+            return route.continue();
+          });
+        } else {
+          await page.route(destination, (route) =>
+            route.request().headers()['x-voidpages']
+              ? route.fulfill({ headers: { 'x-voidpages': 'true' }, body: '{' })
+              : route.continue(),
+          );
+        }
+        const timeOrigin = await page.evaluate((href) => {
+          const anchor = document.createElement('a');
+          anchor.href = href;
+          anchor.textContent = 'Recover native navigation';
+          document.body.insertBefore(anchor, document.body.firstChild);
+          return performance.timeOrigin;
+        }, destination);
+        const documentLoad = page.waitForRequest(
+          (request) => request.isNavigationRequest() && request.url() === destination,
         );
+        await Promise.all([
+          documentLoad,
+          page
+            .getByRole('link', { name: 'Recover native navigation' })
+            .click({ noWaitAfter: true }),
+        ]);
+        await page.getByText('alice@example.com').waitFor();
+        expect(page.url()).toBe(destination);
+        expect(await page.evaluate(() => performance.timeOrigin)).not.toBe(timeOrigin);
+        await waitForHydration(page);
+        if (failure === 'component import') {
+          expect(blockedComponent).toBe(true);
+        }
+        const recovered = await page.evaluate(() => ({
+          events: JSON.parse(sessionStorage.getItem('precommit-events')!) as Array<{
+            type: string;
+            url: string;
+            from: string;
+          }>,
+          historyLength: history.length,
+          destinations: navigation.entries().filter((entry) => entry.url === location.href).length,
+        }));
+        const starts = recovered.events.filter((event) => event.type === 'navigate');
+        expect(starts.map((event) => event.url)).toEqual([destination, destination]);
+        expect(starts.every((event) => event.from === BASE + '/')).toBe(true);
+        expect(recovered.events.filter((event) => event.type === 'commit')).toEqual([]);
+        expect(recovered.historyLength).toBe(initialHistoryLength + 1);
+        expect(recovered.destinations).toBe(1);
+        await page.goBack();
+        await page.getByRole('heading', { name: 'Welcome' }).waitFor();
+        expect(page.url()).toBe(BASE + '/');
+        await page.goForward();
+        await page.getByText('alice@example.com').waitFor();
+        expect(page.url()).toBe(destination);
+      } finally {
+        await page.context().close();
       }
-      const timeOrigin = await page.evaluate((href) => {
-        const anchor = document.createElement('a');
-        anchor.href = href;
-        anchor.textContent = 'Recover native navigation';
-        document.body.insertBefore(anchor, document.body.firstChild);
-        return performance.timeOrigin;
-      }, destination);
-      const documentLoad = page.waitForRequest(
-        (request) => request.isNavigationRequest() && request.url() === destination,
-      );
-      await Promise.all([
-        documentLoad,
-        page.getByRole('link', { name: 'Recover native navigation' }).click({ noWaitAfter: true }),
-      ]);
-      await page.getByText('alice@example.com').waitFor();
-      expect(page.url()).toBe(destination);
-      expect(await page.evaluate(() => performance.timeOrigin)).not.toBe(timeOrigin);
-      await waitForHydration(page);
-      if (failure === 'component import') {
-        expect(blockedComponent).toBe(true);
-      }
-      const recovered = await page.evaluate(() => ({
-        events: JSON.parse(sessionStorage.getItem('precommit-events')!) as Array<{ type: string; url: string; from: string }>,
-        historyLength: history.length,
-        destinations: navigation.entries().filter((entry) => entry.url === location.href).length,
-      }));
-      const starts = recovered.events.filter((event) => event.type === 'navigate');
-      expect(starts.map((event) => event.url)).toEqual([destination, destination]);
-      expect(starts.every((event) => event.from === BASE + '/')).toBe(true);
-      expect(recovered.events.filter((event) => event.type === 'commit')).toEqual([]);
-      expect(recovered.historyLength).toBe(initialHistoryLength + 1);
-      expect(recovered.destinations).toBe(1);
-      await page.goBack();
-      await page.getByRole('heading', { name: 'Welcome' }).waitFor();
-      expect(page.url()).toBe(BASE + '/');
-      await page.goForward();
-      await page.getByText('alice@example.com').waitFor();
-      expect(page.url()).toBe(destination);
-    } finally {
-      await page.context().close();
-    }
-  });
+    },
+  );
 
   it('retains scroll and focus when an explicit GET rejects before URL commit', async () => {
     const page = await newPage();
@@ -490,16 +500,22 @@ export function registerSharedClientTests({
         window.scrollTo(0, 600);
         const anchor = document.querySelector<HTMLAnchorElement>('[data-testid="anchor-replace"]')!;
         anchor.focus({ preventScroll: true });
-        navigation.addEventListener('navigateerror', () => {
-          document.body.setAttribute('data-navigation-failed', '');
-        }, { once: true });
+        navigation.addEventListener(
+          'navigateerror',
+          () => {
+            document.body.setAttribute('data-navigation-failed', '');
+          },
+          { once: true },
+        );
         return { timeOrigin: performance.timeOrigin, scroll: window.scrollY };
       });
       await page.getByTestId('anchor-replace').press('Enter', { noWaitAfter: true });
       await page.waitForSelector('body[data-navigation-failed]');
       expect(page.url()).toBe(BASE + '/native-anchor');
       expect(await page.evaluate(() => window.scrollY)).toBe(initial.scroll);
-      expect(await page.evaluate(() => document.activeElement?.getAttribute('data-testid'))).toBe('anchor-replace');
+      expect(await page.evaluate(() => document.activeElement?.getAttribute('data-testid'))).toBe(
+        'anchor-replace',
+      );
       expect(await page.evaluate(() => performance.timeOrigin)).toBe(initial.timeOrigin);
     } finally {
       await page.context().close();
@@ -1035,8 +1051,8 @@ export function registerSharedClientTests({
         expect(await page.evaluate((id) => document.getElementById(id), id)).toBeNull();
         await page.evaluate((id) => {
           const anchor = document.createElement('a');
-        anchor.href =
-          '/native-anchor#' + (id.startsWith('bad') ? 'bad%FF%20value%' : encodeURIComponent(id));
+          anchor.href =
+            '/native-anchor#' + (id.startsWith('bad') ? 'bad%FF%20value%' : encodeURIComponent(id));
           document.body.appendChild(anchor);
           anchor.click();
           anchor.remove();
@@ -1049,7 +1065,9 @@ export function registerSharedClientTests({
           ),
         ).toBe(true);
         await expect
-          .poll(() => page.evaluate((id) => document.getElementById(id)!.getBoundingClientRect().top, id))
+          .poll(() =>
+            page.evaluate((id) => document.getElementById(id)!.getBoundingClientRect().top, id),
+          )
           .toBeCloseTo(0, 0);
         expect(await page.evaluate(() => window.scrollY)).toBeGreaterThan(1000);
       } finally {
@@ -1058,20 +1076,30 @@ export function registerSharedClientTests({
     });
   }
 
-  it('matches native scrolling for missing, named and top same-page fragments', async ({ expect }) => {
+  it('matches native scrolling for missing, named and top same-page fragments', async ({
+    expect,
+  }) => {
     const page = await newPage();
     try {
       await page.goto(BASE + '/native-anchor');
       await waitForHydration(page);
       await page.evaluate(() => window.scrollTo(0, 640));
-      await page.getByTestId('fragment-missing').evaluate((anchor) => (anchor as HTMLElement).click());
+      await page
+        .getByTestId('fragment-missing')
+        .evaluate((anchor) => (anchor as HTMLElement).click());
       await page.waitForURL(BASE + '/native-anchor#missing');
       await page.waitForFunction(() => !navigation.transition);
       expect(await page.evaluate(() => window.scrollY)).toBe(640);
-      await page.getByTestId('fragment-named').evaluate((anchor) => (anchor as HTMLElement).click());
+      await page
+        .getByTestId('fragment-named')
+        .evaluate((anchor) => (anchor as HTMLElement).click());
       await page.waitForURL(BASE + '/native-anchor#named-section');
       await expect
-        .poll(() => page.evaluate(() => document.querySelector('a[name="named-section"]')!.getBoundingClientRect().top))
+        .poll(() =>
+          page.evaluate(
+            () => document.querySelector('a[name="named-section"]')!.getBoundingClientRect().top,
+          ),
+        )
         .toBeCloseTo(0, 0);
       await page.getByTestId('fragment-top').evaluate((anchor) => (anchor as HTMLElement).click());
       await page.waitForURL(BASE + '/native-anchor#top');

@@ -12,6 +12,7 @@ export default function ScrollRestorationPage(props: Props) {
       <h1>Scroll restoration</h1>
       <p>Scroll down, follow a link, then use the browser Back button.</p>
       <output data-testid="scroll-request">{props.requestId}</output>
+      <output data-testid="scroll-page">{props.page}</output>
       <a href="/users/1?action-race=1" data-testid="race-link" onClick={visitUser}>
         Visit user with preserved scroll
       </a>

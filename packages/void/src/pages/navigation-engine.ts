@@ -4,6 +4,8 @@ import { PAGES_PROTOCOL_VERSION } from '@void/edge';
 import { PRESERVED_QUERY_HEADER, searchWithoutActionKey } from './action-key.ts';
 import { createActionErrorFromResponse, isAbortError } from './action-result.ts';
 import { startAnchorPrefetch } from './anchor-prefetch.ts';
+import { pageBoundarySlots, clientPageError, showTerminalPageError } from './boundary-client.ts';
+import type { BoundaryManifest } from './boundary-plans.ts';
 import { initClientHead, applyClientHead } from './head-client.ts';
 import type { HeadDescriptor } from './head.ts';
 import { PrefetchCache, parseCacheFor } from './prefetch.ts';
@@ -350,6 +352,10 @@ export async function createPageNavigationEngine(
   ): PageNavigationResource {
     return {
       ...resource,
+      // Redirects update the destination after this copy is made.
+      get resolvedUrl() {
+        return resource.resolvedUrl;
+      },
       options,
       shell: shell.then((result) => {
         resource.options._navigationSignal?.throwIfAborted();
@@ -702,16 +708,23 @@ export async function createPageNavigationEngine(
           destination = redirect.pathname + redirect.search + redirect.hash;
         }
         const pageData = !r.headers.get('X-VoidPages')
-          ? ((await loadStaticPageData(
-              destination ?? url,
-              r,
-              undefined,
-              !STATIC_PAGE_DATA_FAST_PATH,
-            ))?.pageData ?? null)
+          ? ((
+              await loadStaticPageData(
+                destination ?? url,
+                r,
+                undefined,
+                !STATIC_PAGE_DATA_FAST_PATH,
+              )
+            )?.pageData ?? null)
           : decodePageData<PageData>(await r.json());
-        return destination && pageData
-          ? { [PREFETCH_REDIRECT]: true, destination, pageData } satisfies PrefetchRedirect
-          : pageData;
+        const data =
+          destination && pageData
+            ? ({ [PREFETCH_REDIRECT]: true, destination, pageData } satisfies PrefetchRedirect)
+            : pageData;
+        if (data && (!r.ok || /no-store/i.test(r.headers.get('Cache-Control') ?? ''))) {
+          uncachedPayloads.add(data);
+        }
+        return data;
       });
     });
   }
@@ -869,6 +882,9 @@ export async function createPageNavigationEngine(
     }
 
     let pageData: PageData | undefined;
+    if (options._refresh) {
+      _prefetchCache.flush(fetchUrl);
+    }
     let cacheEntry = method === 'GET' ? _prefetchCache.get(fetchUrl) : null;
     let cachedPageData: unknown;
     if (cacheEntry) {
@@ -899,14 +915,24 @@ export async function createPageNavigationEngine(
       }
       // Deferred initialization and adapters mutate props; retain the cached wire payload.
       pageData = clonePageData(
-        isPrefetchRedirect(cachedPageData) ? cachedPageData.pageData : cachedPageData as PageData,
+        isPrefetchRedirect(cachedPageData) ? cachedPageData.pageData : (cachedPageData as PageData),
       );
       deferredRegistry.setup(pageData, true);
       if (!cacheEntry.singleUse && !_prefetchCache.isFresh(cacheEntry)) {
-        const bgFetch = fetchPrefetchPageData(fetchUrl);
-        // Drop the stale entry so the revalidated data lands (set() won't overwrite a usable one).
-        _prefetchCache.flush(fetchUrl);
-        _prefetchCache.set(fetchUrl, bgFetch, PREFETCH_DEFAULT_CACHE_FOR);
+        const staleEntry = cacheEntry;
+        void fetchPrefetchPageData(fetchUrl)
+          .then((data) => {
+            if (
+              data &&
+              typeof data === 'object' &&
+              !uncachedPayloads.has(data) &&
+              _prefetchCache.get(fetchUrl) === staleEntry
+            ) {
+              _prefetchCache.flush(fetchUrl);
+              _prefetchCache.set(fetchUrl, Promise.resolve(data), PREFETCH_DEFAULT_CACHE_FOR);
+            }
+          })
+          .catch(() => {});
       }
     } else {
       if (method === 'GET' && STATIC_PAGE_DATA_ENABLED && STATIC_PAGE_DATA_FAST_PATH) {
@@ -1531,16 +1557,20 @@ export async function createPageNavigationEngine(
       }
 
       if (components[id]) {
-        void Promise.resolve().then(components[id]).catch(() => {
-          // Page data prefetch can succeed even if a speculative import fails.
-        });
+        void Promise.resolve()
+          .then(components[id])
+          .catch(() => {
+            // Page data prefetch can succeed even if a speculative import fails.
+          });
       }
       const layoutIds = layoutTree[id] || [];
       for (const lid of layoutIds) {
         if (components[lid]) {
-          void Promise.resolve().then(components[lid]).catch(() => {
-            // The visit will report an import failure if this route is opened.
-          });
+          void Promise.resolve()
+            .then(components[lid])
+            .catch(() => {
+              // The visit will report an import failure if this route is opened.
+            });
         }
       }
 
@@ -1548,10 +1578,21 @@ export async function createPageNavigationEngine(
       if (existing) {
         return existing.response.then(unwrapPrefetchedPageData);
       }
-      const ttl = options.cacheFor !== undefined
-        ? parseCacheFor(options.cacheFor)
-        : PREFETCH_DEFAULT_CACHE_FOR;
-      const fetchPromise = fetchPrefetchPageData(prefetchUrl);
+      const ttl =
+        options.cacheFor !== undefined
+          ? parseCacheFor(options.cacheFor)
+          : PREFETCH_DEFAULT_CACHE_FOR;
+      const fetchPromise = fetchPrefetchPageData(prefetchUrl).then((data) => {
+        if (
+          data &&
+          typeof data === 'object' &&
+          uncachedPayloads.has(data) &&
+          _prefetchCache.get(prefetchUrl)?.response === fetchPromise
+        ) {
+          _prefetchCache.flush(prefetchUrl);
+        }
+        return data;
+      });
       _prefetchCache.set(prefetchUrl, fetchPromise, ttl);
       return fetchPromise.then(unwrapPrefetchedPageData);
     },

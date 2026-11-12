@@ -1,6 +1,6 @@
 import { createComponent, createRoot } from 'solid-js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
-import type { VoidRouter } from 'void/pages-client';
+import { createActionClient, type RuntimeVoidRouter, type VoidRouter } from 'void/pages-client';
 import { RouterContext } from '../../src/runtime/context.ts';
 import { useForm as typedUseForm } from '../../src/runtime/use-form.ts';
 import { useIslandForm } from '../../src/runtime/use-island-form.ts';
@@ -75,6 +75,7 @@ function mountOverlappingForm(options?: { resetOnSuccess?: boolean }) {
       return visit.promise;
     },
   } as unknown as VoidRouter;
+  createActionClient().setActionRouter(router as unknown as RuntimeVoidRouter);
   let form!: TestForm;
   createRoot((dispose) => {
     disposers.push(dispose);
