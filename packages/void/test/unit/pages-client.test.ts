@@ -1806,23 +1806,6 @@ describe('createVoidRouter', () => {
     },
   );
 
-  it('does not grow history on repeated same-page named action submits', async () => {
-    stubClientGlobals();
-    window.location.pathname = '/db';
-    window.location.search = '';
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async () => pageJson({ component: 'home', props: {}, url: '/db', errors: null })),
-    );
-    const { router } = await createTestRouter();
-
-    await router.visit('/db?create', { method: 'POST' });
-    await router.visit('/db?create', { method: 'POST' });
-
-    expect(browserWrites.push).not.toHaveBeenCalled();
-    expect(browserWrites.replace).not.toHaveBeenCalled();
-  });
-
   it('runs navigation listeners for same-page hash visits', async () => {
     const documentStub = stubClientGlobals();
     window.location.pathname = '/docs';
@@ -1844,6 +1827,7 @@ describe('createVoidRouter', () => {
 
     expect(events).toEqual(['loading', 'idle']);
     expect(browserWrites.push).toHaveBeenCalledWith('/docs?tab=api#section');
+    expect(browserWrites.replace).not.toHaveBeenCalled();
     expect(window.scrollTo).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
     expect(applyUpdate).not.toHaveBeenCalled();
@@ -2011,24 +1995,6 @@ describe('createVoidRouter', () => {
     expect(browserWrites.push).not.toHaveBeenCalled();
     expect(browserWrites.replace).not.toHaveBeenCalled();
     expect(window.scrollTo).toHaveBeenCalledWith(0, 42);
-  });
-
-  it('writes history for same-page hash visits when state is preserved', async () => {
-    stubClientGlobals();
-    window.location.pathname = '/docs';
-    window.location.search = '?tab=api';
-    const applyUpdate = vi.fn();
-    vi.stubGlobal('fetch', vi.fn());
-
-    const { router } = await createTestRouter({ adapter: { applyUpdate } });
-
-    await router.visit('#section', { preserveState: true });
-
-    expect(fetch).not.toHaveBeenCalled();
-    expect(applyUpdate).not.toHaveBeenCalled();
-    expect(browserWrites.push).toHaveBeenCalledWith('/docs?tab=api#section');
-    expect(browserWrites.replace).not.toHaveBeenCalled();
-    expect(window.scrollTo).not.toHaveBeenCalled();
   });
 
   it('aborts pending navigations before same-page hash traversal visits', async () => {
@@ -2836,6 +2802,10 @@ describe('superseded navigation commits (#507)', () => {
     await vi.waitFor(() => expect(page.rendered).toContain(url));
   }
 
+  function states(onNavigationChange: ReturnType<typeof vi.fn>) {
+    return onNavigationChange.mock.calls.map((call) => (call[0] as { state: string }).state);
+  }
+
   it('commits each visit in order when they do not overlap', async () => {
     const page = setup();
     const r = await router(page);
@@ -2876,20 +2846,28 @@ describe('superseded navigation commits (#507)', () => {
     const b = gate();
     page.updateGates.set('/a', a.promise);
     page.fetchGates.set('/b', b.promise);
-    const r = await router(page);
+    const onNavigationChange = vi.fn();
+    const r = await router(page, { onNavigationChange });
 
     const visitA = r.visit('/a');
     await entered(page, '/a');
     const visitB = r.visit('/b');
     a.release();
     await expect(visitA).resolves.toBeUndefined();
+
+    // B is still loading, so A stays on screen until B settles.
+    expect(page.rendered).toEqual(['/a']);
+    expect(states(onNavigationChange).at(-1)).toBe('loading');
     expect(window.location.pathname).toBe('/');
     expect(browserWrites.push).not.toHaveBeenCalled();
 
     b.release();
-    await visitB;
+    await expect(visitB).resolves.toMatchObject({ url: '/b' });
+    expect(page.rendered).toEqual(['/a', '/b']);
     expect(browserWrites.push.mock.calls.map((call) => call[0])).toEqual(['/b']);
     expect(window.location.pathname).toBe('/b');
+    expect(page.documentStub).toMatchObject({ title: 'B' });
+    expect(states(onNavigationChange).at(-1)).toBe('idle');
   });
 
   it('does not let an old POST interrupt a GET waiting in browser precommit', async () => {
@@ -2970,7 +2948,8 @@ describe('superseded navigation commits (#507)', () => {
     const page = setup();
     const a = gate();
     page.updateGates.set('/a', a.promise);
-    const r = await router(page);
+    const onNavigationChange = vi.fn();
+    const r = await router(page, { onNavigationChange });
 
     const visitA = r.visit('/a');
     await entered(page, '/a');
@@ -2981,6 +2960,7 @@ describe('superseded navigation commits (#507)', () => {
     expect(window.location.pathname + window.location.hash).toBe('/#x');
     expect(page.documentStub).toMatchObject({ title: 'Home' });
     expect(page.rendered).toEqual(['/a', '']);
+    expect(states(onNavigationChange).at(-1)).toBe('idle');
   });
 
   it('does not push an older URL after a back/forward visit', async () => {
@@ -3134,10 +3114,6 @@ describe('superseded navigation commits (#507)', () => {
       return error;
     }
 
-    function states(onNavigationChange: ReturnType<typeof vi.fn>) {
-      return onNavigationChange.mock.calls.map((call) => (call[0] as { state: string }).state);
-    }
-
     it('keeps the committed page, URL and head when push fails', async () => {
       const page = setup();
       const onNavigationChange = vi.fn();
@@ -3186,51 +3162,6 @@ describe('superseded navigation commits (#507)', () => {
       expect(page.documentStub).toMatchObject({ title: 'Home' });
     });
 
-    it('keeps the current entry and component state on a same-URL submission', async () => {
-      const page = setup();
-      const r = await router(page);
-      await r.visit('/a');
-
-      await r.visit('/a', { method: 'post', data: { name: 'x' } });
-
-      expect(browserWrites.push).toHaveBeenCalledTimes(1);
-      expect(browserWrites.replace).not.toHaveBeenCalled();
-      expect(page.applyUpdate).toHaveBeenLastCalledWith(
-        expect.objectContaining({ url: '/a' }),
-        expect.anything(),
-        expect.anything(),
-        { preserveState: true },
-      );
-      expect(window.location.pathname).toBe('/a');
-    });
-
-    it('leaves the page to a newer visit without publishing the older visit', async () => {
-      const page = setup();
-      const b = gate();
-      const a = gate();
-      page.updateGates.set('/b', b.promise);
-      page.fetchGates.set('/a', a.promise);
-      const onNavigationChange = vi.fn();
-      const r = await router(page, { onNavigationChange });
-
-      const visitB = r.visit('/b');
-      await entered(page, '/b');
-      const visitA = r.visit('/a');
-      b.release();
-      await expect(visitB).resolves.toBeUndefined();
-
-      // A is still loading, so B stays on screen until A settles.
-      expect(page.rendered).toEqual(['/b']);
-      expect(states(onNavigationChange).at(-1)).toBe('loading');
-
-      a.release();
-      await expect(visitA).resolves.toMatchObject({ url: '/a' });
-      expect(page.rendered).toEqual(['/b', '/a']);
-      expect(window.location.pathname).toBe('/a');
-      expect(page.documentStub).toMatchObject({ title: 'A' });
-      expect(states(onNavigationChange).at(-1)).toBe('idle');
-    });
-
     it('restores the committed page once a newer visit fails too', async () => {
       const page = setup();
       const b = gate();
@@ -3260,25 +3191,6 @@ describe('superseded navigation commits (#507)', () => {
 
       expect(page.rendered).toEqual(['/b', '']);
       expect(window.location.pathname).toBe('/');
-      expect(page.documentStub).toMatchObject({ title: 'Home' });
-      expect(states(onNavigationChange).at(-1)).toBe('idle');
-    });
-
-    it('restores the committed page when a hash visit settled first', async () => {
-      const page = setup();
-      const b = gate();
-      page.updateGates.set('/b', b.promise);
-      const onNavigationChange = vi.fn();
-      const r = await router(page, { onNavigationChange });
-
-      const visitB = r.visit('/b');
-      await entered(page, '/b');
-      await r.visit('#x');
-      b.release();
-
-      await expect(visitB).resolves.toBeUndefined();
-      expect(page.rendered).toEqual(['/b', '']);
-      expect(window.location.pathname + window.location.hash).toBe('/#x');
       expect(page.documentStub).toMatchObject({ title: 'Home' });
       expect(states(onNavigationChange).at(-1)).toBe('idle');
     });

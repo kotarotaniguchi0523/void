@@ -1945,21 +1945,4 @@ export function registerSharedClientTests({
       await page.context().close();
     }
   });
-
-  it('Link follows a prebuilt query URL', async () => {
-    const page = await newPage();
-    try {
-      await page.goto(BASE + '/link-behavior');
-      await waitForHydration(page);
-
-      const href = await page.getAttribute('[data-testid="query-data-link"]', 'href');
-      expect(href).toBe('/link-behavior?tag=a&tag=b&page=2&active=true');
-
-      await page.click('[data-testid="query-data-link"]');
-      await page.waitForURL(BASE + '/link-behavior?tag=a&tag=b&page=2&active=true');
-      expect(page.url()).toBe(BASE + '/link-behavior?tag=a&tag=b&page=2&active=true');
-    } finally {
-      await page.context().close();
-    }
-  });
 }

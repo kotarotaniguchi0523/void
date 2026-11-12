@@ -29,7 +29,6 @@ declare global {
   interface Window {
     __SPA_MARKER?: boolean;
     __visitAwaitObserved?: string | null;
-    __hashNavigationReady?: boolean;
     __headRefs?: {
       font: Element | null;
       stylesheet: Element | null;

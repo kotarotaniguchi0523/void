@@ -1,11 +1,8 @@
 import { Link, createLinkClickHandler, useNavigation, useRouter } from '@void/react';
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import type { Props } from './link-behavior.server.ts';
 
 type LinkBehaviorWindow = Window & {
-  __hashNavigationStarts?: number;
-  __hashNavigationEnds?: number;
-  __hashNavigationReady?: boolean;
   __linkOnClick?: boolean;
   __preventedClick?: boolean;
 };
@@ -13,16 +10,8 @@ type LinkBehaviorWindow = Window & {
 export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeUrl }: Props) {
   const [abortTestStatus, setAbortTestStatus] = useState('Not run');
 
-  useEffect(() => {
-    const linkWindow = window as LinkBehaviorWindow;
-    linkWindow.__hashNavigationStarts = 0;
-    linkWindow.__hashNavigationEnds = 0;
-    linkWindow.__hashNavigationReady = true;
-  }, []);
-
   const router = useRouter();
   const navigation = useNavigation();
-  const previousNavigationState = useRef(navigation.state);
   const abortTestCleanupRef = useRef<() => void>(() => {});
 
   const runAbortNavigationTest = () => {
@@ -65,17 +54,6 @@ export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeU
       );
     }, 800);
   };
-
-  useEffect(() => {
-    const linkWindow = window as LinkBehaviorWindow;
-    if (previousNavigationState.current === 'idle' && navigation.state !== 'idle') {
-      linkWindow.__hashNavigationStarts = (linkWindow.__hashNavigationStarts ?? 0) + 1;
-    }
-    if (previousNavigationState.current !== 'idle' && navigation.state === 'idle') {
-      linkWindow.__hashNavigationEnds = (linkWindow.__hashNavigationEnds ?? 0) + 1;
-    }
-    previousNavigationState.current = navigation.state;
-  }, [navigation.state]);
 
   return (
     <div>
@@ -174,26 +152,9 @@ export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeU
       </p>
 
       <p>
-        <Link href="/link-behavior?tag=a&tag=b&page=2&active=true" data-testid="query-data-link">
-          Query data
-        </Link>
-      </p>
-
-      <p>
-        <Link href="#hash-target" data-testid="hash-link">
-          Hash target
-        </Link>
-      </p>
-
-      <p>
         <a href="#plain-hash-target" data-testid="plain-hash-link">
           Plain hash target
         </a>
-      </p>
-
-      <p data-testid="navigation-location">
-        {router.url.pathname}
-        {router.url.hash}
       </p>
       <p data-testid="navigation-state">{navigation.state}</p>
 
@@ -203,10 +164,6 @@ export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeU
           Run interrupted navigation check
         </button>
         <p data-testid="abort-navigation-status">{abortTestStatus}</p>
-      </section>
-
-      <section id="hash-target">
-        <h2>Hash target</h2>
       </section>
 
       <section id="plain-hash-target">

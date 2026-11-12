@@ -123,12 +123,6 @@ export default function LinkBehaviorPage(props: Props) {
           Download users
         </Link>
       </p>
-
-      <p>
-        <Link href="/link-behavior?tag=a&tag=b&page=2&active=true" data-testid="query-data-link">
-          Query data
-        </Link>
-      </p>
     </div>
   );
 }

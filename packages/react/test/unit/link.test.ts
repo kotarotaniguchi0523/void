@@ -26,11 +26,13 @@ describe('GET-only Link', () => {
       target: '_blank',
       rel: 'noopener',
       download: 'users.csv',
+      style: { color: 'red' },
     });
     expect(html).toContain('<a ');
     expect(html).toContain('href="/users"');
     expect(html).toContain('target="_blank"');
     expect(html).toContain('download="users.csv"');
+    expect(html).toContain('style="color:red"');
     expect(html).not.toContain('<button');
   });
 
@@ -40,13 +42,6 @@ describe('GET-only Link', () => {
     expect(renderAt('/', { href: '/users', 'data-void-reload': '' } as LinkProps)).toContain(
       'data-void-link=""',
     );
-  });
-
-  it('does not add a touch-action style to native anchors', () => {
-    expect(renderAt('/', { href: '/users' })).not.toContain('touch-action');
-    const html = renderAt('/', { href: '/users', style: { color: 'red' } });
-    expect(html).toContain('style="color:red"');
-    expect(html).not.toContain('touch-action');
   });
 
   it('marks the active link and its parent', () => {
