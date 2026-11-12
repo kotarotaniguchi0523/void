@@ -6,6 +6,7 @@ import { interpolateRouteParams } from '../runtime/route-url.ts';
 import { withPageQuery } from './action-key.ts';
 import {
   VoidActionError,
+  abortError,
   isAbortError,
   isCallSiteActionError,
   isVoidActionError,
@@ -46,6 +47,7 @@ export {
 } from './link.ts';
 export {
   VoidActionError,
+  abortError,
   categorizeActionError,
   isAbortError,
   isCallSiteActionError,
@@ -77,15 +79,24 @@ export type {
 // --- Types ---
 
 /** Public GET-only navigation options; mutations are handled by actions. */
-export type VisitOptions = Pick<
-  InternalVisitOptions,
-  'preserveScroll' | 'preserveState' | 'replace' | 'viewTransition' | 'resolveOn'
->;
-export type RefreshOptions = Pick<
-  VisitOptions,
-  'preserveScroll' | 'preserveState' | 'viewTransition' | 'resolveOn'
->;
-export type PrefetchOptions = Pick<InternalPrefetchOptions, 'cacheFor'>;
+const REFRESH_OPTION_KEYS = [
+  'preserveScroll',
+  'preserveState',
+  'viewTransition',
+  'resolveOn',
+] as const;
+const VISIT_OPTION_KEYS = [
+  'preserveScroll',
+  'preserveState',
+  'replace',
+  'viewTransition',
+  'resolveOn',
+] as const;
+const PREFETCH_OPTION_KEYS = ['cacheFor'] as const;
+
+export type VisitOptions = Pick<InternalVisitOptions, (typeof VISIT_OPTION_KEYS)[number]>;
+export type RefreshOptions = Pick<VisitOptions, (typeof REFRESH_OPTION_KEYS)[number]>;
+export type PrefetchOptions = Pick<InternalPrefetchOptions, (typeof PREFETCH_OPTION_KEYS)[number]>;
 
 export type NavigationStateType = 'idle' | 'loading' | 'submitting';
 export type NavigationMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
@@ -240,35 +251,17 @@ export function createRouterFacade(
     },
 
     visit(url, options = {}) {
-      return router
-        .visit(
-          url,
-          publicRouterOptions(options, [
-            'preserveScroll',
-            'preserveState',
-            'replace',
-            'viewTransition',
-            'resolveOn',
-          ]),
-        )
-        .then(() => {});
+      return router.visit(url, publicRouterOptions(options, VISIT_OPTION_KEYS)).then(() => {});
     },
 
     refresh(options = {}) {
-      return router
-        .refresh(
-          publicRouterOptions(options, [
-            'preserveScroll',
-            'preserveState',
-            'viewTransition',
-            'resolveOn',
-          ]),
-        )
-        .then(() => {});
+      return router.refresh(publicRouterOptions(options, REFRESH_OPTION_KEYS)).then(() => {});
     },
 
     prefetch(url, options = {}) {
-      return router.prefetch(url, publicRouterOptions(options, ['cacheFor'])).then(() => {});
+      return router
+        .prefetch(url, publicRouterOptions(options, PREFETCH_OPTION_KEYS))
+        .then(() => {});
     },
 
     flush(url) {
@@ -492,7 +485,7 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
         return undefined;
       }
       if (activeNavigationId !== resource.id) {
-        throw new DOMException('Navigation aborted', 'AbortError');
+        throw abortError();
       }
 
       setRouteState(
@@ -546,7 +539,7 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
         if (applied && renderedPage === result) {
           failedRender = { preserveState };
         }
-        throw new DOMException('Navigation aborted', 'AbortError');
+        throw abortError();
       }
       committedPage = result;
       if (renderedPage === result) {
@@ -747,6 +740,7 @@ export {
 
 export type { PageError, ErrorPageProps } from './types.ts';
 export {
+  hasPageBoundaries,
   pageBoundarySlots,
   clientPageError,
   showTerminalPageError,

@@ -1,4 +1,4 @@
-import { useContext, type JSX } from 'react';
+import { useContext, useMemo, type JSX } from 'react';
 import type { AnchorHTMLAttributes } from 'react';
 import { linkPrefetchAttributes, linkStateAttributes, type BaseLinkProps } from 'void/pages-client';
 import { NavigationContext, RouterContext } from './context.ts';
@@ -16,7 +16,10 @@ export function Link({
 }: LinkProps): JSX.Element {
   const router = useContext(RouterContext);
   const navigation = useContext(NavigationContext);
-  const state = linkStateAttributes(router, navigation, href, activeMatch);
+  const state = useMemo(
+    () => linkStateAttributes(router, navigation, href, activeMatch),
+    [router, navigation, href, activeMatch],
+  );
 
   return (
     <a

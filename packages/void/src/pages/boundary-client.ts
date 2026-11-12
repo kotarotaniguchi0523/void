@@ -8,6 +8,11 @@ export type ClientPageBoundary = {
   depth: number;
   load: () => Promise<{ default: unknown }>;
 };
+/** Whether the app declares any not-found or error page. */
+export function hasPageBoundaries(manifest: BoundaryManifest | undefined): boolean {
+  return Object.keys(manifest?.plans ?? {}).length > 0;
+}
+
 export function pageBoundarySlots(
   manifest: BoundaryManifest | undefined,
   component: string,

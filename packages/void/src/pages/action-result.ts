@@ -89,6 +89,10 @@ export function isCallSiteActionError(error: unknown): error is VoidActionError 
   return isVoidActionError(error) && categorizeActionError(error.status) === 'callSite';
 }
 
+export function abortError(): DOMException {
+  return new DOMException('Navigation aborted', 'AbortError');
+}
+
 export function isAbortError(error: unknown): boolean {
   return (
     typeof error === 'object' &&

@@ -2,9 +2,14 @@
 
 import { PAGES_PROTOCOL_VERSION } from '@void/edge';
 import { PRESERVED_QUERY_HEADER, searchWithoutActionKey } from './action-key.ts';
-import { createActionErrorFromResponse, isAbortError } from './action-result.ts';
+import { abortError, createActionErrorFromResponse, isAbortError } from './action-result.ts';
 import { startAnchorPrefetch } from './anchor-prefetch.ts';
-import { pageBoundarySlots, clientPageError, showTerminalPageError } from './boundary-client.ts';
+import {
+  clientPageError,
+  hasPageBoundaries,
+  pageBoundarySlots,
+  showTerminalPageError,
+} from './boundary-client.ts';
 import type { BoundaryManifest } from './boundary-plans.ts';
 import { initClientHead, applyClientHead } from './head-client.ts';
 import type { HeadDescriptor } from './head.ts';
@@ -141,12 +146,11 @@ export type PageNavigationResource = {
   url: string;
   fetchUrl: string;
   hash: string;
-  /** Destination after redirects, including its query and hash. */
-  readonly resolvedUrl?: string;
   method: string;
   options: VisitOptions;
   immediate: boolean;
   shell: Promise<PageNavigationResult | undefined>;
+  /** Destination after redirects, including its query and hash. */
   destination(): string;
   abort(): void;
   /** Resolves false when this visit no longer owns the navigation. */
@@ -266,10 +270,6 @@ function parsePageDataFromHtml(html: string): PageData | null {
   }
 }
 
-function abortError(): DOMException {
-  return new DOMException('Navigation aborted', 'AbortError');
-}
-
 function abortSignalPromise(signal: AbortSignal): Promise<never> {
   if (signal.aborted) {
     return Promise.reject(abortError());
@@ -309,7 +309,7 @@ export async function createPageNavigationEngine(
   const matchRoute = (url: string) =>
     config.matchRoute(decodePagePath(new URL(url, 'http://x').pathname));
 
-  const hasBoundaries = Object.keys(config.boundaryManifest?.plans ?? {}).length > 0;
+  const hasBoundaries = hasPageBoundaries(config.boundaryManifest);
   const _prefetchCache = new PrefetchCache();
   const uncachedPayloads = new WeakSet<object>();
   let _nextNavigationId = 0;
@@ -352,10 +352,6 @@ export async function createPageNavigationEngine(
   ): PageNavigationResource {
     return {
       ...resource,
-      // Redirects update the destination after this copy is made.
-      get resolvedUrl() {
-        return resource.resolvedUrl;
-      },
       options,
       shell: shell.then((result) => {
         resource.options._navigationSignal?.throwIfAborted();
@@ -914,9 +910,7 @@ export async function createPageNavigationEngine(
         commitTarget.hash = target.hash;
       }
       // Deferred initialization and adapters mutate props; retain the cached wire payload.
-      pageData = clonePageData(
-        isPrefetchRedirect(cachedPageData) ? cachedPageData.pageData : (cachedPageData as PageData),
-      );
+      pageData = clonePageData(unwrapPrefetchedPageData(cachedPageData) as PageData);
       deferredRegistry.setup(pageData, true);
       if (!cacheEntry.singleUse && !_prefetchCache.isFresh(cacheEntry)) {
         const staleEntry = cacheEntry;
@@ -1210,9 +1204,8 @@ export async function createPageNavigationEngine(
         }
       }
       unrenderedEntry = undefined;
-      if (_pendingResource?.id === resourceId) {
-        _pendingResource = null;
-      }
+      // ownsCommit() just confirmed that this visit is the pending one.
+      _pendingResource = null;
       const previousResource = _committedResource;
       const previousDeferredRegistry = _committedDeferredRegistry;
       const preservedDeferredRegistry = deferredRegistry.commitPreservedValues(
@@ -1427,9 +1420,6 @@ export async function createPageNavigationEngine(
         url,
         fetchUrl: effectiveFetchUrl,
         hash,
-        get resolvedUrl() {
-          return commitTarget.fetchUrl + commitTarget.hash;
-        },
         method,
         options,
         immediate: false,
@@ -1556,20 +1546,13 @@ export async function createPageNavigationEngine(
         return Promise.resolve(undefined);
       }
 
-      if (components[id]) {
-        void Promise.resolve()
-          .then(components[id])
-          .catch(() => {
-            // Page data prefetch can succeed even if a speculative import fails.
-          });
-      }
-      const layoutIds = layoutTree[id] || [];
-      for (const lid of layoutIds) {
-        if (components[lid]) {
+      for (const componentId of [id, ...(layoutTree[id] || [])]) {
+        if (components[componentId]) {
           void Promise.resolve()
-            .then(components[lid])
+            .then(components[componentId])
             .catch(() => {
-              // The visit will report an import failure if this route is opened.
+              // Page data prefetch can succeed even if a speculative import fails;
+              // the visit reports the import failure if this route is opened.
             });
         }
       }

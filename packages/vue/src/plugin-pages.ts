@@ -353,7 +353,7 @@ import { createApp, createSSRApp, h, reactive, provide, shallowRef, nextTick, on
 import { createDeferred, resolveDeferred, rejectDeferred } from "@void/vue/deferred";
 import { setActionRouter } from "@void/vue/internal";
 import { PageErrorBoundary } from "@void/vue/pages-boundary";
-import { pageBoundarySlots, showTerminalPageError, createRouterFacade, createVoidRouter, idleNavigationState } from "void/pages-client";
+import { hasPageBoundaries, pageBoundarySlots, showTerminalPageError, createRouterFacade, createVoidRouter, idleNavigationState } from "void/pages-client";
 import { parseCacheFor } from "void/pages-prefetch";
 
 ${generateComponentManifest(scan, pagesDir)}
@@ -369,7 +369,7 @@ let currentPageId = "";
 const routeUrl = ref(window.location.pathname + window.location.search + window.location.hash);
 const navigation = reactive(idleNavigationState());
 let captureRenderError;
-const hasPageBoundaries = Object.keys(boundaryManifest.plans).length > 0;
+const hasBoundaries = hasPageBoundaries(boundaryManifest);
 
 ${PATCH_PROPS_RUNTIME}
 
@@ -390,7 +390,7 @@ const { router, initialPageData, initialComponent, initialLayouts, start, commit
         const capture = (error) => { failure ??= { error }; };
         // Page boundaries own render failures when the app declares any; what
         // escapes them reaches the terminal error handler.
-        if (!hasPageBoundaries) captureRenderError = capture;
+        if (!hasBoundaries) captureRenderError = capture;
         try {
           currentPageId = pageData.component;
           boundaryGeneration.value++;
@@ -422,7 +422,7 @@ const { router, initialPageData, initialComponent, initialLayouts, start, commit
       navigation.location = next.location;
       navigation.method = next.method;
     },
-  }).catch(error => { if (hasPageBoundaries) showTerminalPageError(); throw error; });
+  }).catch(error => { if (hasBoundaries) showTerminalPageError(); throw error; });
 
 const reactiveRouter = createRouterFacade(router, () => routeUrl.value, () => params);
 
@@ -470,7 +470,7 @@ const app = createVoidApp({
     };
   }
 });
-if (hasPageBoundaries) app.config.errorHandler = () => showTerminalPageError(routeUrl.value);
+if (hasBoundaries) app.config.errorHandler = () => showTerminalPageError(routeUrl.value);
 
 app.mount(appEl);
 appEl.setAttribute("data-hydrated", "true");

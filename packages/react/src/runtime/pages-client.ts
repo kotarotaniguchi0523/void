@@ -21,6 +21,8 @@ import {
   isCallSiteActionError,
   refreshPage,
   normalizePageUrl,
+  abortError,
+  hasPageBoundaries,
   pageBoundarySlots,
   showTerminalPageError,
   type BoundaryManifest,
@@ -390,9 +392,7 @@ function RouteResource({
               dev: config.dev,
               onFailure: () => {
                 onFailure(resource.fetchUrl);
-                if (resource.resolvedUrl) {
-                  onFailure(resource.resolvedUrl);
-                }
+                onFailure(resource.destination());
               },
             },
             child,
@@ -419,10 +419,6 @@ function RouteResource({
       ),
     ),
   );
-}
-
-function hasPageBoundaries(config: ReactPagesConfig): boolean {
-  return Object.keys(config.boundaryManifest?.plans ?? {}).length > 0;
 }
 
 class RouteRenderBoundary extends React.Component<
@@ -593,7 +589,7 @@ function App({
               // A newer visit committed first. Settle like any abandoned visit.
               visitSettler.resolve(undefined);
             } else {
-              visitSettler.reject(new DOMException('Navigation aborted', 'AbortError'));
+              visitSettler.reject(abortError());
             }
           }
           if (!committed) {
@@ -679,9 +675,6 @@ function App({
 
       const next: ReactPageResource = {
         ...prepared,
-        get resolvedUrl() {
-          return prepared.resolvedUrl;
-        },
         shell: prepared.shell.then(
           (result) => {
             if (!result) {
@@ -748,7 +741,7 @@ function App({
           if (next.method === 'GET' && !options._resolveOnShell) {
             resolveVisit(undefined);
           } else {
-            rejectVisit(new DOMException('Navigation aborted', 'AbortError'));
+            rejectVisit(abortError());
           }
         },
       });
@@ -858,7 +851,7 @@ function App({
         },
         // Page boundaries own render failures when the app declares any; what
         // escapes them reaches the root's terminal error handler.
-        hasPageBoundaries(config)
+        hasPageBoundaries(config.boundaryManifest)
           ? routeResource
           : React.createElement(
               RouteRenderBoundary,
@@ -919,7 +912,7 @@ export async function startReactPages(config: ReactPagesConfig): Promise<ReactPa
     boundaryManifest: config.boundaryManifest,
     dev: config.dev,
   }).catch((error) => {
-    if (hasPageBoundaries(config)) {
+    if (hasPageBoundaries(config.boundaryManifest)) {
       showTerminalPageError();
     }
     throw error;
@@ -954,14 +947,14 @@ export async function startReactPages(config: ReactPagesConfig): Promise<ReactPa
         )
       : appRoot;
   startTransition(() => {
-    const rootOptions = hasPageBoundaries(config)
+    const rootOptions = hasPageBoundaries(config.boundaryManifest)
       ? {
           onUncaughtError: (error: unknown) => {
             const resource = terminalResource;
             if (resource) {
               resource.dispose();
               engine.flush(resource.fetchUrl);
-              engine.flush(resource.resolvedUrl ?? resource.fetchUrl);
+              engine.flush(resource.destination());
             }
             for (const settler of pendingVisitSettlers.values()) {
               settler.reject(error);
@@ -972,9 +965,7 @@ export async function startReactPages(config: ReactPagesConfig): Promise<ReactPa
             }
             viewTransitionWaiters.clear();
             activePendingNavigationId = null;
-            showTerminalPageError(
-              resource ? (resource.resolvedUrl ?? resource.fetchUrl + resource.hash) : currentUrl(),
-            );
+            showTerminalPageError(resource ? resource.destination() : currentUrl());
           },
         }
       : undefined;
