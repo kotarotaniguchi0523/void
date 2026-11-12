@@ -1,8 +1,5 @@
 import { describe, expect, it } from 'vite-plus/test';
-import {
-  getValidationErrors,
-  isModifiedEvent,
-} from '../../src/pages/adapter-helpers.ts';
+import { getValidationErrors, isModifiedEvent } from '../../src/pages/adapter-helpers.ts';
 
 describe('getValidationErrors', () => {
   it('returns the errors record from an action error body', () => {

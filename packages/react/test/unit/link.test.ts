@@ -21,7 +21,12 @@ function renderAt(url: string | null, props: LinkProps, navigation?: NavigationS
 
 describe('GET-only Link', () => {
   it('renders a native anchor with standard attributes', () => {
-    const html = renderAt('/', { href: '/users', target: '_blank', rel: 'noopener', download: 'users.csv' });
+    const html = renderAt('/', {
+      href: '/users',
+      target: '_blank',
+      rel: 'noopener',
+      download: 'users.csv',
+    });
     expect(html).toContain('<a ');
     expect(html).toContain('href="/users"');
     expect(html).toContain('target="_blank"');
@@ -52,7 +57,11 @@ describe('GET-only Link', () => {
       location: new URL('http://localhost/users'),
       method: 'GET',
     };
-    const props = { href: '/users' as const, 'aria-current': 'step' as const, 'data-void-pending': undefined };
+    const props = {
+      href: '/users' as const,
+      'aria-current': 'step' as const,
+      'data-void-pending': undefined,
+    };
     const html = renderAt('/users', props, navigation);
     expect(html).toContain('aria-current="step"');
     expect(html).not.toContain('data-void-pending');
@@ -60,14 +69,17 @@ describe('GET-only Link', () => {
 
   it('marks GET pending states but not mutation submissions', () => {
     const location = new URL('http://localhost/users');
-    expect(renderAt('/', { href: '/users' }, { state: 'loading', location, method: 'GET' }))
-      .toContain('data-void-pending=""');
-    expect(renderAt('/', { href: '/users' }, { state: 'submitting', location, method: 'POST' }))
-      .not.toContain('data-void-pending');
+    expect(
+      renderAt('/', { href: '/users' }, { state: 'loading', location, method: 'GET' }),
+    ).toContain('data-void-pending=""');
+    expect(
+      renderAt('/', { href: '/users' }, { state: 'submitting', location, method: 'POST' }),
+    ).not.toContain('data-void-pending');
   });
 
   it('preserves relative hrefs', () => {
-    expect(renderAt('/', { href: '../users?sort=name#team' }))
-      .toContain('href="../users?sort=name#team"');
+    expect(renderAt('/', { href: '../users?sort=name#team' })).toContain(
+      'href="../users?sort=name#team"',
+    );
   });
 });

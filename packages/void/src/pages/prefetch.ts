@@ -90,7 +90,9 @@ export class PrefetchCache {
       return null;
     }
     if (Date.now() >= entry.expiresAt && !entry.singleUse) {
-      if (entry.timer) clearTimeout(entry.timer);
+      if (entry.timer) {
+        clearTimeout(entry.timer);
+      }
       this.entries.delete(url);
       return null;
     }
@@ -111,7 +113,9 @@ export class PrefetchCache {
     if (existing && this.isUsable(existing)) {
       return;
     }
-    if (existing?.timer) clearTimeout(existing.timer);
+    if (existing?.timer) {
+      clearTimeout(existing.timer);
+    }
 
     const now = Date.now();
     const singleUse = ttl.stale === 0 && ttl.expires === 0;
@@ -126,14 +130,18 @@ export class PrefetchCache {
 
     if (!singleUse && ttl.expires > 0) {
       entry.timer = setTimeout(() => {
-        if (this.entries.get(url) === entry) this.entries.delete(url);
+        if (this.entries.get(url) === entry) {
+          this.entries.delete(url);
+        }
       }, ttl.expires);
     }
 
     this.entries.set(url, entry);
     void response.catch(() => {
       if (this.entries.get(url) === entry) {
-        if (entry.timer) clearTimeout(entry.timer);
+        if (entry.timer) {
+          clearTimeout(entry.timer);
+        }
         this.entries.delete(url);
       }
     });

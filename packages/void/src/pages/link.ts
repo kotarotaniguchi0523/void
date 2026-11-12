@@ -1,7 +1,7 @@
 /// <reference lib="dom" />
 import type { Href } from 'void/routes';
-import { isModifiedEvent } from './adapter-helpers.ts';
 import { isAbortError } from './action-result.ts';
+import { isModifiedEvent } from './adapter-helpers.ts';
 import type { NavigationState, VoidRouter } from './client.ts';
 import type { PrefetchOptions } from './navigation-engine.ts';
 import type { CacheForInput, LinkPrefetchValue, LinkPrefetchStrategy } from './prefetch.ts';
@@ -55,10 +55,16 @@ export function linkPrefetchStrategies(
   props: Pick<BaseLinkProps, 'prefetch'> & { reloadDocument?: boolean },
   defaultStrategy: LinkPrefetchValue = false,
 ): ReadonlyArray<LinkPrefetchStrategy> {
-  if (props.reloadDocument) return [];
+  if (props.reloadDocument) {
+    return [];
+  }
   const prefetch = props.prefetch ?? defaultStrategy;
-  if (prefetch === false) return [];
-  if (prefetch === true) return ['hover'];
+  if (prefetch === false) {
+    return [];
+  }
+  if (prefetch === true) {
+    return ['hover'];
+  }
   return typeof prefetch === 'string' ? [prefetch] : prefetch;
 }
 
@@ -73,9 +79,7 @@ export function linkPrefetchAttributes(
   // The app default is a client setting. Render the same marker during SSR.
   const strategies = linkPrefetchStrategies(props);
   const strategy =
-    !props.reloadDocument && props.prefetch === undefined
-      ? 'default'
-      : strategies.join(' ');
+    !props.reloadDocument && props.prefetch === undefined ? 'default' : strategies.join(' ');
   if (!strategy) {
     return {};
   }
@@ -199,7 +203,9 @@ export function createLinkClickHandler(
 ): (event: LinkClickEvent) => void {
   return (event) => {
     const anchor = event.currentTarget;
-    if (!(anchor instanceof HTMLAnchorElement)) return;
+    if (!(anchor instanceof HTMLAnchorElement)) {
+      return;
+    }
     handleLinkClick(event, router, anchor.href as Href, options);
   };
 }
@@ -215,7 +221,9 @@ function hasQueryParams(current: URLSearchParams, params: URLSearchParams): bool
   for (const [key, value] of params) {
     const values = available.get(key);
     const count = values?.get(value) ?? 0;
-    if (count === 0) return false;
+    if (count === 0) {
+      return false;
+    }
     values!.set(value, count - 1);
   }
   return true;
@@ -261,7 +269,9 @@ export function prefetchLink(
 
   // Use the same host/protocol check as link state, including custom schemes.
   const target = resolveSameOrigin(href, new URL(window.location.href));
-  if (!target) return;
+  if (!target) {
+    return;
+  }
 
   const current = window.location.pathname + window.location.search;
   if (target.pathname + target.search === current) {
@@ -285,17 +295,29 @@ export function handleLinkClick(
   href: Href,
   options: AnchorClickOptions,
 ): void {
-  if (!router || event.defaultPrevented || isModifiedEvent(event)) return;
+  if (!router || event.defaultPrevented || isModifiedEvent(event)) {
+    return;
+  }
   const element = event.currentTarget as HTMLElement;
-  if (element.hasAttribute('download') || element.hasAttribute('data-void-reload')) return;
+  if (element.hasAttribute('download') || element.hasAttribute('data-void-reload')) {
+    return;
+  }
   if (
-    !options.preserveScroll && !options.preserveState &&
-    !options.replace && options.viewTransition === undefined
-  ) return;
-  if (!resolveSameOrigin(href, new URL(window.location.href))) return;
+    !options.preserveScroll &&
+    !options.preserveState &&
+    !options.replace &&
+    options.viewTransition === undefined
+  ) {
+    return;
+  }
+  if (!resolveSameOrigin(href, new URL(window.location.href))) {
+    return;
+  }
   event.preventDefault();
   void router.visit(href, options).catch((error: unknown) => {
-    if (!isAbortError(error)) reportError(error);
+    if (!isAbortError(error)) {
+      reportError(error);
+    }
   });
 }
 

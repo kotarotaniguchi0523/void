@@ -1,5 +1,10 @@
 import type { Href } from 'void/routes';
-import { linkPrefetchStrategies, observeLinkVisible, prefetchLink, resolveSameOrigin } from './link.ts';
+import {
+  linkPrefetchStrategies,
+  observeLinkVisible,
+  prefetchLink,
+  resolveSameOrigin,
+} from './link.ts';
 import type { PrefetchOptions } from './navigation-engine.ts';
 import { parseCacheFor, type CacheForInput, type LinkPrefetchValue } from './prefetch.ts';
 

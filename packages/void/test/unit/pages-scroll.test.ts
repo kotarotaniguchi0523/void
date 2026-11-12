@@ -124,14 +124,17 @@ describe('Pages scroll restoration', () => {
     ['#TOP', 0],
     ['#%74op', 0],
     ['#', 0],
-  ] as const)('keeps native fragment semantics for %s in an imperative visit', async (hash, expected) => {
-    const page = await setup();
-    page.engine.start();
-    page.engine.commitInitialRender();
-    page.window.scrollY = 640;
-    await page.engine.prepareVisit(hash).shell;
-    expect(page.window.scrollY).toBe(expected);
-  });
+  ] as const)(
+    'keeps native fragment semantics for %s in an imperative visit',
+    async (hash, expected) => {
+      const page = await setup();
+      page.engine.start();
+      page.engine.commitInitialRender();
+      page.window.scrollY = 640;
+      await page.engine.prepareVisit(hash).shell;
+      expect(page.window.scrollY).toBe(expected);
+    },
+  );
 
   it('resets scroll for a missing fragment after a cross-page commit', async () => {
     const page = await setup();

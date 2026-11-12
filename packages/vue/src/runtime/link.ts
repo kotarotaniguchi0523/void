@@ -50,20 +50,21 @@ const LinkComponent = defineComponent({
     const state = computed(() =>
       linkStateAttributes(router, navigation, props.href, props.activeMatch),
     );
-    return () => h(
-      'a',
-      {
-        href: props.href,
-        ...linkPrefetchAttributes(router, {
-          prefetch: props.prefetch,
-          cacheFor: props.cacheFor,
-          reloadDocument: Object.hasOwn(attrs, 'data-void-reload'),
-        }),
-        ...state.value,
-        ...attrs,
-      },
-      slots.default?.(),
-    );
+    return () =>
+      h(
+        'a',
+        {
+          href: props.href,
+          ...linkPrefetchAttributes(router, {
+            prefetch: props.prefetch,
+            cacheFor: props.cacheFor,
+            reloadDocument: Object.hasOwn(attrs, 'data-void-reload'),
+          }),
+          ...state.value,
+          ...attrs,
+        },
+        slots.default?.(),
+      );
   },
 });
 

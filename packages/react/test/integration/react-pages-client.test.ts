@@ -19,7 +19,11 @@ import {
   defineSharedIslandTests,
 } from '../../../../test/pages-island-contract.ts';
 import { PAGES_PROTOCOL_VERSION } from '../../../edge/src/pages-protocol.ts';
-import { decodePageData, deserializePageData, serializePageData } from '../../../void/src/pages/serialize.ts';
+import {
+  decodePageData,
+  deserializePageData,
+  serializePageData,
+} from '../../../void/src/pages/serialize.ts';
 
 declare global {
   interface Window {
@@ -418,10 +422,13 @@ function defineTransitionAwaitTests(getBase: () => string) {
     try {
       await page.goto(getBase() + '/transition-await');
       await page.waitForSelector('#app[data-hydrated="true"]');
-      const payload = serializePageData({
-        component: 'transition-await', url: '/transition-await',
-        props: { revision: 'updated', waiting: null }, deferredKeys: { waiting: 'waiting' },
-      }) + '\n';
+      const payload =
+        serializePageData({
+          component: 'transition-await',
+          url: '/transition-await',
+          props: { revision: 'updated', waiting: null },
+          deferredKeys: { waiting: 'waiting' },
+        }) + '\n';
       await page.evaluate((line) => {
         const originalFetch = window.fetch;
         window.fetch = (input, options) => {
@@ -431,15 +438,21 @@ function defineTransitionAwaitTests(getBase: () => string) {
                 controller.enqueue(new TextEncoder().encode(line));
                 document.body.dataset.deferredStream = 'reading';
                 // Model the fetch body's abort contract while keeping the reader pending.
-                options.signal!.addEventListener('abort', () => {
-                  document.body.dataset.deferredStream = 'aborted';
-                  controller.error(new DOMException('Navigation aborted', 'AbortError'));
-                }, { once: true });
+                options.signal!.addEventListener(
+                  'abort',
+                  () => {
+                    document.body.dataset.deferredStream = 'aborted';
+                    controller.error(new DOMException('Navigation aborted', 'AbortError'));
+                  },
+                  { once: true },
+                );
               },
             });
-            return Promise.resolve(new Response(stream, {
-              headers: { 'content-type': 'application/x-ndjson', 'x-voidpages': 'true' },
-            }));
+            return Promise.resolve(
+              new Response(stream, {
+                headers: { 'content-type': 'application/x-ndjson', 'x-voidpages': 'true' },
+              }),
+            );
           }
           return originalFetch(input, options);
         };
@@ -448,11 +461,15 @@ function defineTransitionAwaitTests(getBase: () => string) {
         route.fulfill({ headers: { 'x-voidpages': 'true' }, body: '{' }),
       );
       await page.getByTestId('async-contract').click();
-      await page.waitForFunction(() => document.querySelector('[data-testid="data-ready"]')?.textContent === 'ready');
+      await page.waitForFunction(
+        () => document.querySelector('[data-testid="data-ready"]')?.textContent === 'ready',
+      );
       expect(await page.getByTestId('revision').textContent()).toBe('initial');
       expect(await page.locator('body').getAttribute('data-deferred-stream')).toBe('reading');
       await page.getByTestId('reject-next-navigation').click();
-      await page.waitForFunction(() => document.querySelector('[data-testid="navigation-failed"]')?.textContent === 'failed');
+      await page.waitForFunction(
+        () => document.querySelector('[data-testid="navigation-failed"]')?.textContent === 'failed',
+      );
       await page.waitForSelector('body[data-deferred-stream="aborted"]', { timeout: 5000 });
       expect(page.url()).toBe(getBase() + '/transition-await');
       expect(await page.getByTestId('revision').textContent()).toBe('initial');
@@ -958,7 +975,6 @@ function registerClientTests(getBase: () => string, coverage: 'smoke' | 'full') 
       await page.context().close();
     }
   });
-
 }
 
 describe('react-pages client (dev)', () => {

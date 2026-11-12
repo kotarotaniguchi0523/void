@@ -83,11 +83,7 @@ describe('linkActiveAttributes', () => {
   const page = { 'aria-current': 'page', 'data-void-active': '' };
   const nested = { 'data-void-active': '' };
 
-  function attributes(
-    url: string,
-    props: Pick<BaseLinkProps, 'href'>,
-    match?: LinkActiveMatch,
-  ) {
+  function attributes(url: string, props: Pick<BaseLinkProps, 'href'>, match?: LinkActiveMatch) {
     const router = { url: new URL(url, 'https://app.test') } as VoidRouter;
     return linkActiveAttributes(router, props.href, match);
   }
@@ -186,13 +182,9 @@ describe('linkActiveAttributes', () => {
     vi.stubGlobal('window', undefined);
     const router = createSsrRouter('/users?view=all', {}, 'https://app.test/users?view=all');
     expect(router.url.href).toBe('https://app.test/users?view=all');
-    expect(linkActiveAttributes(router, 'https://app.test/users')).toEqual(
-      page,
-    );
+    expect(linkActiveAttributes(router, 'https://app.test/users')).toEqual(page);
     expect(linkActiveAttributes(router, '//app.test/users')).toEqual(page);
-    expect(linkActiveAttributes(router, 'http://localhost/users')).toEqual(
-      {},
-    );
+    expect(linkActiveAttributes(router, 'http://localhost/users')).toEqual({});
   });
 
   it('preserves the router origin in a server-side facade', () => {
@@ -200,11 +192,8 @@ describe('linkActiveAttributes', () => {
     const router = createRouterFacade(createSsrRouter('https://app.test/previous'), () => '/users');
     expect(router.url.href).toBe('https://app.test/users');
     expect(linkActiveAttributes(router, '//app.test/users')).toEqual(page);
-    expect(linkActiveAttributes(router, 'http://localhost/users')).toEqual(
-      {},
-    );
+    expect(linkActiveAttributes(router, 'http://localhost/users')).toEqual({});
   });
-
 });
 
 describe('linkPendingAttributes', () => {
@@ -274,7 +263,6 @@ describe('prefetchLink', () => {
     expect(resolveSameOrigin('blob:https://app.test/123', base)).toBeNull();
     expect(resolveSameOrigin('javascript:alert(1)', base)).toBeNull();
   });
-
 
   it('rejects other hosts even when a custom scheme has opaque origin', () => {
     const base = new URL('capacitor://localhost/users');

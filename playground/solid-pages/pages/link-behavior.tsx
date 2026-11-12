@@ -84,15 +84,15 @@ export default function LinkBehaviorPage(props: Props) {
         </Link>
       </p>
 
-      
-
       <p>
-        <a href="/users" data-testid="replace-link" onClick={createLinkClickHandler(router, { replace: true })}>
+        <a
+          href="/users"
+          data-testid="replace-link"
+          onClick={createLinkClickHandler(router, { replace: true })}
+        >
           Replace with users
         </a>
       </p>
-
-      
 
       <p>
         <a href="/users" data-testid="reload-link" data-void-reload>
@@ -117,8 +117,6 @@ export default function LinkBehaviorPage(props: Props) {
           Query data
         </Link>
       </p>
-
-
     </div>
   );
 }

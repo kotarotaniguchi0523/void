@@ -9,7 +9,8 @@ const shared = useShared();
     <nav>
       <Link href="/" prefetch="hover">Home</Link> |
       <Link href="/users" active-match="prefix" prefetch="hover">Users</Link> |
-      <Link href="/blog" prefetch="hover">Blog</Link> | <Link href="/deferred" prefetch="hover">Deferred</Link> |
+      <Link href="/blog" prefetch="hover">Blog</Link> |
+      <Link href="/deferred" prefetch="hover">Deferred</Link> |
       <span>{{ shared.appName }}</span>
     </nav>
     <hr />

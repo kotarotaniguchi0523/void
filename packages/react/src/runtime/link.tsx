@@ -22,7 +22,8 @@ export function Link({
     <a
       href={href}
       {...linkPrefetchAttributes(router, {
-        prefetch, cacheFor,
+        prefetch,
+        cacheFor,
         reloadDocument: Object.hasOwn(rest, 'data-void-reload'),
       })}
       {...state}

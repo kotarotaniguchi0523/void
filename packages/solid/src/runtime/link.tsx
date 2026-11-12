@@ -9,7 +9,11 @@ export type LinkProps = CommonProps &
 
 export function Link(props: LinkProps): JSX.Element {
   const [local, rest] = splitProps(props, [
-    'href', 'prefetch', 'cacheFor', 'activeMatch', 'children',
+    'href',
+    'prefetch',
+    'cacheFor',
+    'activeMatch',
+    'children',
   ]);
   const router = useContext(RouterContext);
   const navigation = useContext(NavigationContext);
@@ -25,12 +29,7 @@ export function Link(props: LinkProps): JSX.Element {
   );
 
   return (
-    <a
-      href={local.href}
-      {...prefetch()}
-      {...state()}
-      {...rest}
-    >
+    <a href={local.href} {...prefetch()} {...state()} {...rest}>
       {local.children}
     </a>
   );

@@ -60,13 +60,9 @@ function preventClick(event: Event) {
       </Link>
     </p>
 
-    
-
     <p>
       <a href="/users" data-testid="replace-link" @click="replaceUsers">Replace with users</a>
     </p>
-
-    
 
     <p>
       <a href="/users" data-testid="reload-link" data-void-reload>Reload document</a>

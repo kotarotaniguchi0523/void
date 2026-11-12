@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { createLinkClickHandler, useLinkState, useRouter } from '@void/vue';
-if (typeof document !== 'undefined' && document.documentElement.hasAttribute('data-fail-route-render')) {
+if (
+  typeof document !== 'undefined' &&
+  document.documentElement.hasAttribute('data-fail-route-render')
+) {
   throw new Error('Native anchor render failed');
 }
 const state = useLinkState('/users/1?anchor-prefetch=1');
@@ -24,7 +27,9 @@ const fragment = createLinkClickHandler(useRouter(), { preserveState: true });
     <a href="/users/1?anchor-prefetch=1" data-testid="anchor-duplicate" v-bind="state.attributes"
       >Same user</a
     >
-    <a href="/users/2" data-testid="anchor-blocked" @click="(event) => event.preventDefault()">Blocked</a>
+    <a href="/users/2" data-testid="anchor-blocked" @click="(event) => event.preventDefault()"
+      >Blocked</a
+    >
     <a href="/native-anchor?replace=1" data-testid="anchor-replace" @click="replace"
       >Replace in place</a
     >
