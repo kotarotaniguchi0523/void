@@ -194,7 +194,8 @@ function stubNavigationHistory() {
   let created = 0;
   const createEntry = (url: URL, key = `entry-${++created}`): Entry =>
     Object.assign(new EventTarget(), { key, url: url.href, getState: () => undefined });
-  const entries = [createEntry(new URL('/', window.location.origin), 'initial-entry')];
+  const { origin, pathname, search, hash } = window.location;
+  const entries = [createEntry(new URL(origin + pathname + search + hash), 'initial-entry')];
   const browser = Object.assign(new EventTarget(), {
     currentEntry: entries[0]!,
     entries: () => [...entries],
@@ -3704,5 +3705,76 @@ describe('actions that supersede a navigation with a committed URL', () => {
     expect(window.location.pathname).toBe('/done');
     expect(paths()).toEqual(['/', '/done']);
     expect(reload).not.toHaveBeenCalled();
+  });
+});
+
+describe('visits to the current URL and fragment', () => {
+  function setup() {
+    stubClientGlobals();
+    Object.assign(window.location, { pathname: '/docs', hash: '#top' });
+    const fetchPage = vi.fn(async (url: string) => pageJson({ component: 'home', url, props: {} }));
+    vi.stubGlobal('fetch', fetchPage);
+    return fetchPage;
+  }
+
+  it('scrolls to the fragment without adding a history entry', async () => {
+    const fetchPage = setup();
+    const browser = stubNavigationHistory();
+    const created = await createTestRouter();
+    created.start();
+    created.commitInitialRender();
+
+    await created.router.visit('/docs#top');
+    expect(browser.entries()).toHaveLength(1);
+    expect(browser.currentEntry.key).toBe('initial-entry');
+    expect(window.scrollTo).toHaveBeenCalledWith(0, 0);
+    expect(fetchPage).not.toHaveBeenCalled();
+
+    // Another fragment of the page is a new entry.
+    await created.router.visit('/docs#other');
+    expect(browser.entries().map((entry) => new URL(entry.url).hash)).toEqual(['#top', '#other']);
+    expect(fetchPage).not.toHaveBeenCalled();
+  });
+
+  it('refreshes a URL with a fragment in its entry', async () => {
+    const fetchPage = setup();
+    const browser = stubNavigationHistory();
+    const applyUpdate = vi.fn();
+    const created = await createTestRouter({ adapter: { applyUpdate } });
+    created.start();
+    created.commitInitialRender();
+
+    await created.router.refresh();
+    expect(fetchPage).toHaveBeenCalledOnce();
+    expect(fetchPage.mock.calls[0]![0]).toBe('/docs');
+    expect(applyUpdate).toHaveBeenCalledOnce();
+    expect(browser.entries()).toHaveLength(1);
+    expect(browser.currentEntry.key).toBe('initial-entry');
+  });
+
+  it('replaces the entry when the engine publishes the fragment itself', async () => {
+    setup();
+    const engine = await createPageNavigationEngine({
+      adapter: {
+        createDeferred: () => ({}),
+        isLoading: () => false,
+        resolveDeferred: (_ref, value) => value,
+        rejectDeferred: (_ref, error) => error,
+      },
+      components: { home: loadComponent },
+      layoutTree: {},
+      routeMeta: {},
+      matchRoute: () => 'home',
+      viewTransitions: false,
+      prefetchHoverDelay: 75,
+      prefetchDefaultCacheFor: parseCacheFor('30s'),
+    });
+
+    await engine.prepareVisit('/docs#top').shell;
+    expect(browserWrites.replace).toHaveBeenCalledWith('/docs#top');
+    expect(browserWrites.push).not.toHaveBeenCalled();
+
+    await engine.prepareVisit('/docs#other').shell;
+    expect(browserWrites.push).toHaveBeenCalledWith('/docs#other');
   });
 });

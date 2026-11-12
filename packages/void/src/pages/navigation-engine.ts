@@ -806,6 +806,16 @@ export async function createPageNavigationEngine(
     }
   }
 
+  /**
+   * A visit to the current URL and fragment replaces the entry, as the browser does
+   * for a link to it. Any other visit adds an entry unless it asks to replace.
+   */
+  function replacesEntry(url: string, options: VisitOptions): boolean {
+    const current = documentBaseUrl();
+    const target = new URL(url, current);
+    return !!options.replace || (Boolean(target.hash) && target.href === current.href);
+  }
+
   function navigateEntry(url: string, replace: boolean, info: unknown) {
     return window.navigation.navigate(url, {
       history: replace ? 'replace' : 'push',
@@ -1402,7 +1412,7 @@ export async function createPageNavigationEngine(
             ? (options._entryKey ?? window.navigation.currentEntry?.key)
             : await publishEntry(
                 effectiveFetchUrl + hash,
-                !!options.replace,
+                replacesEntry(effectiveFetchUrl + hash, options),
                 renderedFragmentNavigation,
               );
           if (id === _nextNavigationId && !options._navigationSignal?.aborted) {
@@ -1535,7 +1545,7 @@ export async function createPageNavigationEngine(
         ...(data ? { data } : {}),
       };
       browserVisits.add(request);
-      const navigationResult = navigateEntry(target.href, !!options.replace, request);
+      const navigationResult = navigateEntry(target.href, replacesEntry(url, options), request);
       void navigationResult.committed?.catch(() => {});
       const completion =
         navigationResult.finished ??
