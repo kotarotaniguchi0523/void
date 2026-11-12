@@ -18,6 +18,8 @@ export function createScrollRestoration(): {
   read(key: string | undefined): ScrollPosition | null;
   save(): void;
   commit(key: string | undefined): void;
+  /** Key of the entry whose page is on screen, while that entry exists. */
+  rendered(): string | null;
 } {
   const positions = new Map<string, ScrollPosition>();
   let renderedKey: string | null = null;
@@ -93,5 +95,6 @@ export function createScrollRestoration(): {
     commit(key: string | undefined): void {
       renderedKey = key ?? null;
     },
+    rendered: () => renderedKey,
   };
 }

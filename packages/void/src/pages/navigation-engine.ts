@@ -322,6 +322,7 @@ export async function createPageNavigationEngine(
   const browserVisits = new WeakSet<BrowserVisit>();
   const renderedPageNavigation = Symbol('void:rendered-page-navigation');
   const renderedFragmentNavigation = Symbol('void:rendered-fragment-navigation');
+  const renderedEntryReturn = Symbol('void:rendered-entry-return');
   let started = false;
   let interceptedTraversal: string | null = null;
   const exposedResources = new Set<PageNavigationResource>();
@@ -824,6 +825,35 @@ export async function createPageNavigationEngine(
       throw new Error('Void Router: browser did not start the navigation.');
     }
     return (await navigation.committed).key;
+  }
+
+  /**
+   * An action runs on the page on screen. A visit it supersedes may already have moved
+   * the address to an entry whose page will now never render. Go back to the entry of
+   * the rendered page, so the action updates that page under its own URL and a failed
+   * action leaves the address and the page in agreement. Returns null when the current
+   * entry is the rendered one.
+   */
+  function returnToRenderedEntry(): Promise<void> | null {
+    const current = window.navigation.currentEntry;
+    if (unrenderedEntry === undefined || current?.key !== unrenderedEntry) {
+      return null;
+    }
+    const key = scrollRestoration.rendered();
+    let returned: Promise<unknown>;
+    if (key && key !== current.key && window.navigation.entries().some((e) => e.key === key)) {
+      const traversal = window.navigation.traverseTo(key, { info: renderedEntryReturn });
+      void traversal.finished?.catch(() => {});
+      returned = Promise.resolve(traversal.committed);
+    } else {
+      // The superseded visit replaced the rendered page's entry: give it back its URL.
+      returned = publishEntry(_currentFetchUrl, true, renderedPageNavigation);
+    }
+    return returned.then(
+      () => markUnrenderedEntry(undefined),
+      // A newer navigation took over; the action still runs.
+      () => {},
+    );
   }
 
   async function loadNavigationShell(
@@ -1476,7 +1506,17 @@ export async function createPageNavigationEngine(
         !isClientPage(target)
       ) {
         const resource = engine.prepareVisit(url, options);
-        return applyBrowserVisit(apply, exposeResource(resource));
+        const returned = resource.method === 'GET' ? null : returnToRenderedEntry();
+        return applyBrowserVisit(
+          apply,
+          returned
+            ? // The adapter reads the address when the action settles.
+              exposeResource(
+                resource,
+                Promise.all([resource.shell, returned]).then(([result]) => result),
+              )
+            : exposeResource(resource),
+        );
       }
       let result: PageData | undefined;
       let data: BrowserVisit['data'];
@@ -1676,6 +1716,13 @@ export async function createPageNavigationEngine(
       if (event.info === renderedPageNavigation) {
         preparedEntryUrl = event.destination.url;
       }
+      event.intercept({ scroll: 'manual', focusReset: 'manual' });
+      return;
+    }
+    if (event.info === renderedEntryReturn) {
+      // The page of this entry is on screen: there is nothing to load or scroll.
+      claimEntryHandoff(event);
+      interceptedTraversal = event.destination.key || null;
       event.intercept({ scroll: 'manual', focusReset: 'manual' });
       return;
     }

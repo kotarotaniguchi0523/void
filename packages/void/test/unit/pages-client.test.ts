@@ -188,6 +188,93 @@ function stubBrowserNavigation() {
   Object.assign(window, { navigation: browser });
 }
 
+/** A session history with real entries: push, replace and traversal move through it. */
+function stubNavigationHistory() {
+  type Entry = EventTarget & { key: string; url: string; getState(): unknown };
+  let created = 0;
+  const createEntry = (url: URL, key = `entry-${++created}`): Entry =>
+    Object.assign(new EventTarget(), { key, url: url.href, getState: () => undefined });
+  const entries = [createEntry(new URL('/', window.location.origin), 'initial-entry')];
+  const browser = Object.assign(new EventTarget(), {
+    currentEntry: entries[0]!,
+    entries: () => [...entries],
+    navigate(url: string, options: NavigationNavigateOptions) {
+      const destination = new URL(url, window.location.origin);
+      const index = entries.indexOf(browser.currentEntry);
+      const navigationType = options.history === 'replace' ? 'replace' : 'push';
+      return run(destination, '', navigationType, options.info, () => {
+        const entry = createEntry(
+          destination,
+          navigationType === 'replace' ? browser.currentEntry.key : undefined,
+        );
+        entries.splice(navigationType === 'replace' ? index : index + 1, Infinity, entry);
+        return entry;
+      });
+    },
+    traverseTo(key: string, options: NavigationOptions = {}) {
+      const entry = entries.find((candidate) => candidate.key === key)!;
+      return run(new URL(entry.url), key, 'traverse', options.info, () => entry);
+    },
+  });
+  let active: AbortController | undefined;
+  function run(
+    destination: URL,
+    key: string,
+    navigationType: NavigationType,
+    info: unknown,
+    commit: () => Entry,
+  ) {
+    active?.abort();
+    const controller = new AbortController();
+    active = controller;
+    let interception: NavigationInterceptOptions | undefined;
+    browser.dispatchEvent(
+      Object.assign(new Event('navigate', { cancelable: true }), {
+        canIntercept: true,
+        destination: { url: destination.href, key, sameDocument: true },
+        downloadRequest: null,
+        formData: null,
+        hashChange: false,
+        info,
+        navigationType,
+        signal: controller.signal,
+        intercept(value: NavigationInterceptOptions) {
+          interception = value;
+        },
+      }),
+    );
+    const handlers: Array<() => unknown> = [];
+    const committed = Promise.resolve().then(async () => {
+      await interception?.precommitHandler?.({
+        redirect: () => {
+          throw new Error('Unexpected redirect');
+        },
+        addHandler: (handler) => {
+          handlers.push(handler);
+        },
+      });
+      controller.signal.throwIfAborted();
+      const { pathname, search, hash } = destination;
+      Object.assign(window.location, { pathname, search, hash });
+      const from = browser.currentEntry;
+      browser.currentEntry = commit();
+      browser.dispatchEvent(
+        Object.assign(new Event('currententrychange'), { from, navigationType }),
+      );
+      return browser.currentEntry;
+    });
+    const finished = committed.then(async () => {
+      await interception?.handler?.();
+      for (const handler of handlers) {
+        await handler();
+      }
+    });
+    return { committed, finished };
+  }
+  Object.assign(window, { navigation: browser });
+  return browser;
+}
+
 function createTestRouter({ adapter, ...config }: TestRouterConfig = {}) {
   return createVoidRouter({
     components: { home: loadComponent },
@@ -3515,5 +3602,107 @@ describe('browser navigate events', () => {
       expect(fetchPage.mock.calls[1]![0]).toBe('/api/health');
       await vi.waitFor(() => expect(applyUpdate).toHaveBeenCalledTimes(2));
     });
+  });
+});
+
+describe('actions that supersede a navigation with a committed URL', () => {
+  /** The browser has committed /next, but its page is still rendering. */
+  async function setup(action: (url: string) => Response, linkOptions = {}) {
+    stubClientGlobals();
+    const browser = stubNavigationHistory();
+    const reload = vi.fn();
+    Object.assign(window.location, { reload });
+    const fetchPage = vi.fn(async (url: string, init?: RequestInit) =>
+      init?.method === 'POST' ? action(url) : pageJson({ component: 'home', url, props: {} }),
+    );
+    vi.stubGlobal('fetch', fetchPage);
+    const rendering = controlledPromise<void>();
+    const applyUpdate = vi.fn<() => Promise<void> | undefined>();
+    applyUpdate.mockReturnValueOnce(rendering.promise);
+    const created = await createTestRouter({ adapter: { applyUpdate } });
+    created.start();
+    created.commitInitialRender();
+
+    const link = created.router.visit('/next', linkOptions);
+    await vi.waitFor(() => expect(applyUpdate).toHaveBeenCalledOnce());
+    expect(window.location.pathname).toBe('/next');
+    const paths = () => browser.entries().map((entry) => new URL(entry.url).pathname);
+    const requests = () => fetchPage.mock.calls.map(([url, init]) => [init?.method, url]);
+    return { browser, created, link, rendering, reload, paths, requests };
+  }
+
+  const invalid = () => Response.json({ errors: { name: 'Required' } }, { status: 422 });
+
+  it('returns to the entry of the page on screen when the action fails', async () => {
+    const { browser, created, link, rendering, reload, paths, requests } = await setup(invalid);
+
+    await expect(created.router.visit('/', { method: 'POST' })).rejects.toMatchObject({
+      name: 'VoidActionError',
+      status: 422,
+    });
+    // The address and the router agree with the page that shows the errors.
+    expect(window.location.pathname).toBe('/');
+    expect(created.router.url.pathname).toBe('/');
+    expect(browser.currentEntry.key).toBe('initial-entry');
+    expect(paths()).toEqual(['/', '/next']);
+
+    rendering.resolve();
+    await link;
+    // The page was not loaded again, scrolled or reloaded.
+    expect(requests()).toEqual([
+      ['GET', '/next'],
+      ['POST', '/'],
+    ]);
+    expect(window.scrollTo).not.toHaveBeenCalled();
+    expect(reload).not.toHaveBeenCalled();
+    expect(window.location.pathname).toBe('/');
+  });
+
+  it('gives a replaced entry the URL of the page on screen when the action fails', async () => {
+    const { browser, created, reload, paths, requests } = await setup(invalid, { replace: true });
+    expect(paths()).toEqual(['/next']);
+
+    await expect(created.router.visit('/', { method: 'POST' })).rejects.toMatchObject({
+      status: 422,
+    });
+    expect(window.location.pathname).toBe('/');
+    expect(created.router.url.pathname).toBe('/');
+    expect(browser.currentEntry.key).toBe('initial-entry');
+    expect(paths()).toEqual(['/']);
+    expect(requests()).toEqual([
+      ['GET', '/next'],
+      ['POST', '/'],
+    ]);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it('updates the page on screen in its own entry when the action succeeds', async () => {
+    const { browser, created, reload, paths } = await setup((url) =>
+      pageJson({ component: 'home', url, props: { saved: true } }),
+    );
+
+    await expect(created.router.visit('/', { method: 'POST' })).resolves.toMatchObject({
+      props: { saved: true },
+    });
+    expect(window.location.pathname).toBe('/');
+    expect(browser.currentEntry.key).toBe('initial-entry');
+    // No second entry for the page, and an update in place keeps its scroll position.
+    expect(paths()).toEqual(['/', '/next']);
+    expect(window.scrollTo).not.toHaveBeenCalled();
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it('opens the page an action redirects to after the page on screen', async () => {
+    const { created, reload, paths } = await setup(() =>
+      Object.defineProperties(pageJson({ component: 'home', url: '/done', props: {} }), {
+        redirected: { value: true },
+        url: { value: 'http://localhost/done' },
+      }),
+    );
+
+    await created.router.visit('/', { method: 'POST' });
+    expect(window.location.pathname).toBe('/done');
+    expect(paths()).toEqual(['/', '/done']);
+    expect(reload).not.toHaveBeenCalled();
   });
 });

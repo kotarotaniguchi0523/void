@@ -1647,6 +1647,48 @@ export function registerSharedClientTests({
     }
   });
 
+  it('returns the address to a page whose form fails while a link is rendering', async ({
+    expect,
+  }) => {
+    const page = await newPage();
+    try {
+      await page.goto(BASE + '/users');
+      await waitForHydration(page);
+      const email = page.locator('form').getByRole('textbox').nth(1);
+      await email.fill('typed@example.com');
+      const before = await page.evaluate(() => {
+        const link = document.createElement('a');
+        link.href = '/users/2?action-return=1';
+        link.textContent = 'Other user';
+        document.body.insertBefore(link, document.body.firstChild);
+        // Submit once the link's URL is committed, before its page renders.
+        navigation.addEventListener('currententrychange', function submit() {
+          if (location.search === '?action-return=1') {
+            navigation.removeEventListener('currententrychange', submit);
+            document.body.dataset.submittedAt = location.pathname;
+            document.querySelector<HTMLButtonElement>('button[type="submit"]')!.click();
+          }
+        });
+        return { timeOrigin: performance.timeOrigin, entry: navigation.currentEntry?.key };
+      });
+      await page.getByRole('link', { name: 'Other user' }).click({ noWaitAfter: true });
+      await page.waitForFunction(() => document.body.textContent?.includes('Name is required'));
+      await page.waitForFunction(() => !navigation.transition);
+
+      expect(await page.locator('body').getAttribute('data-submitted-at')).toBe('/users/2');
+      expect(page.url()).toBe(BASE + '/users');
+      expect(await page.locator('h1').textContent()).toBe('Users');
+      expect(await email.inputValue()).toBe('typed@example.com');
+      const after = await page.evaluate(() => ({
+        timeOrigin: performance.timeOrigin,
+        entry: navigation.currentEntry?.key,
+      }));
+      expect(after).toEqual(before);
+    } finally {
+      await page.context().close();
+    }
+  });
+
   it('form submission adds a user and navigates to its detail', { concurrent: false }, async () => {
     const page = await newPage();
     const id = crypto.randomUUID();
