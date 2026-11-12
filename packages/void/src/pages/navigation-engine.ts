@@ -1642,12 +1642,35 @@ export async function createPageNavigationEngine(
     },
   };
 
-  // Register before the adapter mounts: an initial effect can publish an entry.
-  window.navigation.addEventListener('navigate', (event) => {
+  // interceptedTraversal, nativeFragment and preparedEntryUrl tell currententrychange
+  // about the entry a claimed navigation commits. They belong to that navigation:
+  // a navigate event the router leaves alone, such as a classic history write,
+  // must not change them.
+  let entryHandoff: NavigateEvent | null = null;
+  function resetEntryHandoff(): void {
     interceptedTraversal = null;
     nativeFragment = null;
     preparedEntryUrl = undefined;
+  }
+  function claimEntryHandoff(event: NavigateEvent): void {
+    resetEntryHandoff();
+    entryHandoff = event;
+    event.signal.addEventListener(
+      'abort',
+      () => {
+        if (entryHandoff === event) {
+          entryHandoff = null;
+          resetEntryHandoff();
+        }
+      },
+      { once: true },
+    );
+  }
+
+  // Register before the adapter mounts: an initial effect can publish an entry.
+  window.navigation.addEventListener('navigate', (event) => {
     if (event.info === renderedPageNavigation || event.info === renderedFragmentNavigation) {
+      claimEntryHandoff(event);
       // A visit started by currententrychange can still invalidate the resource
       // before Void commits it, even though its DOM update has already run.
       if (event.info === renderedPageNavigation) {
@@ -1694,6 +1717,7 @@ export async function createPageNavigationEngine(
         abortPendingResource(_pendingResource);
       }
       scrollRestoration.save();
+      claimEntryHandoff(event);
       nativeFragment = target.href;
       return;
     }
@@ -1710,6 +1734,7 @@ export async function createPageNavigationEngine(
     }
     if (ownHashVisit) {
       scrollRestoration.save();
+      claimEntryHandoff(event);
       event.intercept({
         scroll: 'manual',
         focusReset: 'manual',
@@ -1727,6 +1752,7 @@ export async function createPageNavigationEngine(
       return;
     }
     if (traversal) {
+      claimEntryHandoff(event);
       interceptedTraversal = event.destination.key || null;
       event.intercept({
         scroll: 'manual',
@@ -1754,6 +1780,7 @@ export async function createPageNavigationEngine(
     if (!event.cancelable) {
       return;
     }
+    claimEntryHandoff(event);
     event.intercept({
       scroll: 'manual',
       focusReset: event.navigationType === 'push' ? 'after-transition' : 'manual',
@@ -1846,15 +1873,25 @@ export async function createPageNavigationEngine(
     const target = new URL(entry.url);
     // This event runs before the post-commit handler. A new navigation can
     // supersede that handler before it gets a chance to apply the page.
-    if (entry.url === preparedEntryUrl || entry.key === interceptedTraversal) {
-      if (entry.url === preparedEntryUrl || target.pathname + target.search !== _currentFetchUrl) {
+    const prepared = entry.url === preparedEntryUrl;
+    const intercepted = entry.key === interceptedTraversal;
+    if (prepared || intercepted) {
+      if (prepared || target.pathname + target.search !== _currentFetchUrl) {
         markUnrenderedEntry(entry.key);
       }
-      preparedEntryUrl = undefined;
+      // This entry consumes what its navigation left for it.
+      if (prepared) {
+        preparedEntryUrl = undefined;
+      }
+      if (intercepted) {
+        interceptedTraversal = null;
+      }
       return;
     }
     const nativeHash = entry.url === nativeFragment;
-    nativeFragment = null;
+    if (nativeHash) {
+      nativeFragment = null;
+    }
     if (
       (!nativeHash && (event.navigationType !== 'traverse' || !isClientPage(target))) ||
       (entry.key === initialEntryKey && _nextNavigationId === 0)

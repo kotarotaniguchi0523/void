@@ -3350,4 +3350,37 @@ describe('browser navigate events', () => {
     await visit;
     expect(reload).not.toHaveBeenCalled();
   });
+
+  it('keeps an intercepted traversal through a history write from other code', async () => {
+    const { fetchPage, applyUpdate } = setup();
+    const created = await createTestRouter({ adapter: { applyUpdate } });
+    created.start();
+
+    const back = dispatchNavigate('/back', { navigationType: 'traverse', key: 'back-entry' });
+    expect(back.interception?.handler).toBeTypeOf('function');
+    // history.replaceState() from app or analytics code, before the traversal commits.
+    const write = dispatchNavigate('/', { navigationType: 'replace' });
+    expect(write.interception).toBeUndefined();
+
+    commitEntry('/back', 'back-entry', 'traverse');
+    expect(fetchPage).not.toHaveBeenCalled();
+    await back.interception!.handler!();
+    expect(fetchPage).toHaveBeenCalledOnce();
+    expect(applyUpdate).toHaveBeenCalledOnce();
+  });
+
+  it('forgets an intercepted traversal that the browser aborts', async () => {
+    const { fetchPage, applyUpdate } = setup();
+    const created = await createTestRouter({ adapter: { applyUpdate } });
+    created.start();
+
+    const back = dispatchNavigate('/back', { navigationType: 'traverse', key: 'back-entry' });
+    expect(back.interception?.handler).toBeTypeOf('function');
+    back.controller.abort();
+
+    // A later traversal to that entry that the router could not intercept.
+    commitEntry('/back', 'back-entry', 'traverse');
+    await vi.waitFor(() => expect(applyUpdate).toHaveBeenCalledOnce());
+    expect(fetchPage).toHaveBeenCalledOnce();
+  });
 });
