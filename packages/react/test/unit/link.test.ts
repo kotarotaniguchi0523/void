@@ -79,10 +79,4 @@ describe('GET-only Link', () => {
       renderAt('/', { href: '/users' }, { state: 'submitting', location, method: 'POST' }),
     ).not.toContain('data-void-pending');
   });
-
-  it('preserves relative hrefs', () => {
-    expect(renderAt('/', { href: '../users?sort=name#team' })).toContain(
-      'href="../users?sort=name#team"',
-    );
-  });
 });

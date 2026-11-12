@@ -5,6 +5,7 @@
   }
   const state = useLinkState('/users/1?anchor-prefetch=1');
   const current = useLinkState('/native-anchor');
+  const replaced = useLinkState('/native-anchor?replace=1');
   const replace = createLinkClickHandler(useRouter(), { replace: true, preserveScroll: true });
   const fragment = createLinkClickHandler(useRouter(), { preserveState: true });
 </script>
@@ -15,7 +16,7 @@
   <a href="/users/1?anchor-prefetch=1" data-testid="anchor-prefetch" data-void-prefetch="hover" data-void-cache-for="30s" {...state.attributes}>Prefetch user</a>
   <a href="/users/1?anchor-prefetch=1" data-testid="anchor-duplicate" {...state.attributes}>Same user</a>
   <a href="/users/2" data-testid="anchor-blocked" onclick={(event) => event.preventDefault()}>Blocked</a>
-  <a href="/native-anchor?replace=1" data-testid="anchor-replace" onclick={replace}>Replace in place</a>
+  <a href="/native-anchor?replace=1" data-testid="anchor-replace" onclick={replace} {...replaced.attributes}>Replace in place</a>
 
     <a href="#missing" data-testid="fragment-missing" onclick={fragment}>Missing fragment</a>
     <a href="#top" data-testid="fragment-top" onclick={fragment}>Top</a>

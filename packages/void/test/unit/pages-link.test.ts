@@ -3,7 +3,6 @@ import {
   createRouterFacade,
   createSsrRouter,
   idleNavigationState,
-  type NavigationMethod,
   type VoidRouter,
 } from '../../src/pages/client.ts';
 import {
@@ -62,7 +61,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('native GET Link contract', () => {
+describe('Link prefetch strategies and attributes', () => {
   it.each([
     [undefined, []],
     [false, []],
@@ -215,11 +214,11 @@ describe('linkPendingAttributes', () => {
   const router = { url: new URL('/admin/users?page=1', 'https://app.test') } as VoidRouter;
 
   /** A visit in flight to `destination`, as the router reports it. */
-  function visiting(destination: string, method: NavigationMethod = 'GET') {
+  function visiting(destination: string) {
     return {
-      state: method === 'GET' ? ('loading' as const) : ('submitting' as const),
+      state: 'loading' as const,
       location: new URL(destination, 'https://app.test'),
-      method,
+      method: 'GET' as const,
     };
   }
 
@@ -271,7 +270,7 @@ describe('linkPendingAttributes', () => {
   });
 });
 
-describe('prefetchLink', () => {
+describe('resolveSameOrigin', () => {
   it('does not treat same-origin blob URLs as Pages links', () => {
     const base = new URL('https://app.test/');
     expect(resolveSameOrigin('blob:https://app.test/123', base)).toBeNull();
@@ -284,7 +283,9 @@ describe('prefetchLink', () => {
     expect(resolveSameOrigin('capacitor://other/settings', base)).toBeNull();
     expect(resolveSameOrigin('https://example.com/settings', base)).toBeNull();
   });
+});
 
+describe('prefetchLink', () => {
   it('uses host and protocol matching for Capacitor prefetch', () => {
     vi.stubGlobal('window', { location: new URL('capacitor://localhost/users?page=1') });
     const router = createRouter();

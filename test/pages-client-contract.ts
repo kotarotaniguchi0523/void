@@ -493,8 +493,10 @@ export function registerSharedClientTests({
     try {
       await page.goto(BASE + '/native-anchor');
       await waitForHydration(page);
-      await page.route('**/native-anchor?replace=1', (route) =>
-        route.fulfill({ headers: { 'x-voidpages': 'true' }, body: '{' }),
+      await page.route(
+        '**/native-anchor?replace=1',
+        (route) => route.fulfill({ headers: { 'x-voidpages': 'true' }, body: '{' }),
+        { times: 1 },
       );
       const initial = await page.evaluate(() => {
         window.scrollTo(0, 600);
@@ -507,16 +509,29 @@ export function registerSharedClientTests({
           },
           { once: true },
         );
-        return { timeOrigin: performance.timeOrigin, scroll: window.scrollY };
+        return {
+          timeOrigin: performance.timeOrigin,
+          scroll: window.scrollY,
+          entry: navigation.currentEntry?.key,
+        };
       });
       await page.getByTestId('anchor-replace').press('Enter', { noWaitAfter: true });
       await page.waitForSelector('body[data-navigation-failed]');
+      expect(await page.evaluate(() => navigation.currentEntry?.key)).toBe(initial.entry);
+      // The failed visit ends: the link to its destination is no longer pending.
+      await page.waitForSelector('[data-testid="anchor-replace"]:not([data-void-pending])');
+      expect(await page.textContent('h1')).toBe('Native anchor');
       expect(page.url()).toBe(BASE + '/native-anchor');
       expect(await page.evaluate(() => window.scrollY)).toBe(initial.scroll);
       expect(await page.evaluate(() => document.activeElement?.getAttribute('data-testid'))).toBe(
         'anchor-replace',
       );
       expect(await page.evaluate(() => performance.timeOrigin)).toBe(initial.timeOrigin);
+
+      // The same link works once the response is valid.
+      await page.getByTestId('anchor-replace').press('Enter', { noWaitAfter: true });
+      await page.waitForURL(BASE + '/native-anchor?replace=1');
+      expect(await page.evaluate(() => navigation.currentEntry?.key)).toBe(initial.entry);
     } finally {
       await page.context().close();
     }
@@ -876,8 +891,6 @@ export function registerSharedClientTests({
       await page.goto(BASE + '/link-behavior');
       await waitForHydration(page);
 
-      // Non-GET Links no longer exist. Action/Forms have their own pending
-      // contract; this assertion covers native GET Link pending state only.
       // Page data, prefetched or not, comes from a JSON request.
       await hold((request) => request.headers().accept === 'application/json');
       await page.click('nav a[href="/users"]');
@@ -1763,7 +1776,7 @@ export function registerSharedClientTests({
     }
   });
 
-  it('Link composes user onClick before SPA navigation', async () => {
+  it('Link runs its onClick handler and still navigates on the client', async () => {
     const page = await newPage();
     try {
       await page.goto(BASE + '/link-behavior');
@@ -1800,7 +1813,7 @@ export function registerSharedClientTests({
     }
   });
 
-  it('Link replace updates the current history entry', async () => {
+  it('opens another page in the current history entry from a replace click handler', async () => {
     const page = await newPage();
     try {
       await page.goto(BASE + '/');
@@ -1823,27 +1836,6 @@ export function registerSharedClientTests({
         document.querySelector('h1')?.textContent?.includes('Welcome'),
       );
       expect(page.url()).toBe(BASE + '/');
-    } finally {
-      await page.context().close();
-    }
-  });
-
-  it('Link reloadDocument uses browser navigation', async () => {
-    const page = await newPage();
-    try {
-      await page.goto(BASE + '/link-behavior');
-      await waitForHydration(page);
-
-      await page.evaluate(() => {
-        (window as TestWindow).__SPA_MARKER = true;
-      });
-      await page.click('[data-testid="reload-link"]');
-      await page.waitForFunction(() =>
-        document.querySelector('h1')?.textContent?.includes('Users'),
-      );
-
-      expect(page.url()).toBe(BASE + '/users');
-      expect(await page.evaluate(() => (window as TestWindow).__SPA_MARKER)).toBeUndefined();
     } finally {
       await page.context().close();
     }

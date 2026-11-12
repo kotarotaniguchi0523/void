@@ -923,57 +923,6 @@ function registerClientTests(getBase: () => string, coverage: 'smoke' | 'full') 
       await page.context().close();
     }
   });
-  async function waitForIdle(page: Page) {
-    await page.waitForFunction(
-      () => document.querySelector('[data-testid="navigation-state"]')?.textContent === 'idle',
-    );
-  }
-
-  it('explicit replace keeps the current page when precommit rejects', async () => {
-    const link = 'replace-link';
-    const page = await newPage();
-
-    try {
-      await page.goto(BASE + '/link-behavior');
-      await waitForHydration(page);
-      const heading = await page.textContent('h1');
-      const entry = await page.evaluate(() => {
-        navigation.addEventListener(
-          'navigateerror',
-          () => {
-            document.body.setAttribute('data-precommit-rejected', '');
-          },
-          { once: true },
-        );
-        return navigation.currentEntry?.key;
-      });
-      await page.route(
-        '**/users',
-        (route) =>
-          route.fulfill({
-            status: 200,
-            headers: { 'X-VoidPages': 'true', 'Content-Type': 'application/json' },
-            body: 'invalid JSON',
-          }),
-        { times: 1 },
-      );
-
-      await page.getByTestId(link).click();
-      await page.waitForSelector('body[data-precommit-rejected]');
-      expect(await page.evaluate(() => navigation.currentEntry?.key)).toBe(entry);
-      await waitForIdle(page);
-      expect(await page.textContent('h1')).toBe(heading);
-      expect(page.url()).toBe(BASE + '/link-behavior');
-
-      await page.click(`[data-testid="${link}"]`);
-      await page.waitForURL(BASE + '/users');
-      await page.waitForFunction(() =>
-        document.querySelector('h1')?.textContent?.includes('Users'),
-      );
-    } finally {
-      await page.context().close();
-    }
-  });
 }
 
 describe('react-pages client (dev)', () => {
@@ -1266,33 +1215,6 @@ describe('react-pages client (dev)', () => {
   });
 
   defineClientTests(() => DEV_BASE, 'smoke');
-
-  it('reloads the destination document when React cannot commit the new route', async () => {
-    const page = await browser.newPage();
-    try {
-      await page.goto(DEV_BASE);
-      await page.waitForSelector('#app[data-hydrated="true"]');
-      const timeOrigin = await page.evaluate(() => {
-        document.documentElement.setAttribute('data-fail-route-render', '');
-        const anchor = document.createElement('a');
-        anchor.href = '/client-only';
-        anchor.textContent = 'Open failing route';
-        document.body.prepend(anchor);
-        return performance.timeOrigin;
-      });
-      const documentLoad = page.waitForRequest(
-        (request) =>
-          request.isNavigationRequest() && new URL(request.url()).pathname === '/client-only',
-      );
-      await page.getByRole('link', { name: 'Open failing route' }).click({ noWaitAfter: true });
-      await documentLoad;
-      await page.getByRole('heading', { name: 'Client-only Page' }).waitFor();
-      expect(await page.evaluate(() => performance.timeOrigin)).not.toBe(timeOrigin);
-      expect(new URL(page.url()).pathname).toBe('/client-only');
-    } finally {
-      await page.close();
-    }
-  });
   defineTransitionAwaitTests(() => DEV_BASE);
   defineSharedIslandTests(
     () => DEV_BASE,

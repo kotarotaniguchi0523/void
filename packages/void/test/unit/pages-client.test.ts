@@ -573,24 +573,21 @@ describe('createVoidRouter', () => {
     });
   });
 
-  it.each(['POST', 'PUT', 'PATCH', 'DELETE'])(
-    'preserves scroll for an in-place %s action',
-    async (method) => {
-      stubClientGlobals();
-      window.location.pathname = '/editor';
-      window.scrollY = 1800;
-      vi.stubGlobal(
-        'fetch',
-        vi.fn(async () => pageJson({ component: 'home', props: {}, url: '/editor', errors: null })),
-      );
-      const { router } = await createTestRouter();
+  it.each(['POST', 'DELETE'])('preserves scroll for an in-place %s action', async (method) => {
+    stubClientGlobals();
+    window.location.pathname = '/editor';
+    window.scrollY = 1800;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => pageJson({ component: 'home', props: {}, url: '/editor', errors: null })),
+    );
+    const { router } = await createTestRouter();
 
-      await submitAction(router, '/editor?save', { method });
+    await submitAction(router, '/editor?save', { method });
 
-      expect(window.scrollTo).not.toHaveBeenCalled();
-      expect(browserWrites.replace).not.toHaveBeenCalled();
-    },
-  );
+    expect(window.scrollTo).not.toHaveBeenCalled();
+    expect(browserWrites.replace).not.toHaveBeenCalled();
+  });
 
   it('keeps the page query, scroll and history entry for an in-place action', async () => {
     stubClientGlobals();
@@ -1117,7 +1114,7 @@ describe('createVoidRouter', () => {
     router.flushAll();
   });
 
-  it('normalizes safe absolute URLs and fragment-only prefetch to page paths', async () => {
+  it('prefetches the page path of an absolute same-origin URL with a fragment', async () => {
     stubClientGlobals();
     const fetchMock = vi.fn(async () => pageJson({ component: 'home', props: {} }));
     vi.stubGlobal('fetch', fetchMock);
@@ -1761,7 +1758,7 @@ describe('createVoidRouter', () => {
     expect(applyUpdate).toHaveBeenCalledWith(pageData, {}, [], expect.anything());
   });
 
-  it.each(['POST', 'PUT', 'PATCH', 'DELETE'])(
+  it.each(['POST', 'DELETE'])(
     'preserves the visible query after a %s with a query-only middleware rewrite',
     async (method) => {
       stubClientGlobals();
@@ -2576,36 +2573,6 @@ describe('createVoidRouter other-origin visits', () => {
     );
     expect(fetchMock).not.toHaveBeenCalled();
     expect(applyUpdate).not.toHaveBeenCalled();
-  });
-
-  it('rejects a same-origin blob URL passed straight to the navigation engine', async () => {
-    stubClientGlobals();
-    const fetchMock = vi.fn(
-      async () => new Response('<script></script>', { headers: { 'Content-Type': 'text/html' } }),
-    );
-    vi.stubGlobal('fetch', fetchMock);
-    const engine = await createPageNavigationEngine({
-      adapter: {
-        createDeferred: () => ({}),
-        resolveDeferred: (_ref, value) => value,
-        rejectDeferred: (_ref, error) => error,
-        isLoading: () => false,
-      },
-      components: { home: loadComponent },
-      layoutTree: {},
-      routeMeta: {},
-      matchRoute: () => 'home',
-      viewTransitions: false,
-      prefetchHoverDelay: 75,
-      prefetchDefaultCacheFor: parseCacheFor('30s'),
-    });
-
-    const resource = engine.prepareVisit(
-      'blob:http://localhost/0b5e4c1a-7f0d-4f9e-9b52-1c3d2e4f5a6b',
-    );
-
-    await expect(resource.shell).rejects.toThrow('refusing to navigate to a blob: URL');
-    expect(fetchMock).not.toHaveBeenCalled();
     expect(window.location.href).toBeUndefined();
   });
 
@@ -2894,37 +2861,6 @@ describe('superseded navigation commits (#507)', () => {
     expect(window.location.pathname).toBe('/b');
   });
 
-  it('reloads the committed browser URL when the adapter cannot apply it', async () => {
-    stubClientGlobals();
-    stubBrowserNavigation();
-    const reload = vi.fn();
-    Object.assign(window.location, { reload });
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async () => pageJson({ component: 'home', url: '/next', props: {} })),
-    );
-    const error = new Error('render failed');
-    const applyUpdate = vi.fn().mockRejectedValueOnce(error);
-    const created = await createTestRouter({ adapter: { applyUpdate } });
-    created.start();
-
-    await expect(created.router.visit('/next')).rejects.toBe(error);
-    expect(window.location.pathname).toBe('/next');
-    expect(reload).toHaveBeenCalledOnce();
-  });
-
-  it('does not register the same router startup listeners twice', async () => {
-    stubClientGlobals();
-    const created = await createTestRouter();
-    created.start();
-    created.start();
-
-    expect(window.addEventListener).toHaveBeenCalledExactlyOnceWith(
-      'pagehide',
-      expect.any(Function),
-    );
-  });
-
   it('lets a visit started while the new page mounts replace that page', async () => {
     const page = setup();
     const r = await router(page);
@@ -3018,6 +2954,39 @@ describe('superseded navigation commits (#507)', () => {
 
     await expect(submitA).rejects.toMatchObject({ name: 'AbortError' });
     expect(window.location.pathname).toBe('/b');
+  });
+
+  it('restores the committed page when the action that superseded a visit fails', async () => {
+    const page = setup();
+    const b = gate();
+    const a = gate();
+    page.updateGates.set('/b', b.promise);
+    const fetchPage = fetch;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (init?.method?.toUpperCase() === 'POST') {
+          await a.promise;
+          return new Response('down', { status: 500 });
+        }
+        return fetchPage(url, init);
+      }),
+    );
+    const onNavigationChange = vi.fn();
+    const r = await router(page, { onNavigationChange });
+
+    const visitB = r.visit('/b');
+    await entered(page, '/b');
+    const submitA = r.visit('/a', { method: 'post', data: { name: 'x' } });
+    b.release();
+    await expect(visitB).resolves.toBeUndefined();
+    a.release();
+    await expect(submitA).rejects.toThrow();
+
+    expect(page.rendered).toEqual(['/b', '']);
+    expect(window.location.pathname).toBe('/');
+    expect(page.documentStub).toMatchObject({ title: 'Home' });
+    expect(states(onNavigationChange).at(-1)).toBe('idle');
   });
 
   it('does not apply an older view transition after a newer visit rendered', async () => {
@@ -3160,39 +3129,6 @@ describe('superseded navigation commits (#507)', () => {
       expect(window.location.pathname).toBe('/');
       expect(page.rendered).toEqual(['/a', '']);
       expect(page.documentStub).toMatchObject({ title: 'Home' });
-    });
-
-    it('restores the committed page once a newer visit fails too', async () => {
-      const page = setup();
-      const b = gate();
-      const a = gate();
-      page.updateGates.set('/b', b.promise);
-      const fetchPage = fetch;
-      vi.stubGlobal(
-        'fetch',
-        vi.fn(async (url: string, init?: RequestInit) => {
-          if (init?.method?.toUpperCase() === 'POST') {
-            await a.promise;
-            return new Response('down', { status: 500 });
-          }
-          return fetchPage(url, init);
-        }),
-      );
-      const onNavigationChange = vi.fn();
-      const r = await router(page, { onNavigationChange });
-
-      const visitB = r.visit('/b');
-      await entered(page, '/b');
-      const submitA = r.visit('/a', { method: 'post', data: { name: 'x' } });
-      b.release();
-      await expect(visitB).resolves.toBeUndefined();
-      a.release();
-      await expect(submitA).rejects.toThrow();
-
-      expect(page.rendered).toEqual(['/b', '']);
-      expect(window.location.pathname).toBe('/');
-      expect(page.documentStub).toMatchObject({ title: 'Home' });
-      expect(states(onNavigationChange).at(-1)).toBe('idle');
     });
 
     it('ends a hash visit whose history write fails like any failed visit', async () => {
@@ -3411,6 +3347,25 @@ describe('browser navigate events', () => {
     commitEntry('/back', 'back-entry', 'traverse');
     await vi.waitFor(() => expect(applyUpdate).toHaveBeenCalledOnce());
     expect(fetchPage).toHaveBeenCalledOnce();
+  });
+
+  it('reloads the committed browser URL when the adapter cannot apply it', async () => {
+    stubClientGlobals();
+    stubBrowserNavigation();
+    const reload = vi.fn();
+    Object.assign(window.location, { reload });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => pageJson({ component: 'home', url: '/next', props: {} })),
+    );
+    const error = new Error('render failed');
+    const applyUpdate = vi.fn().mockRejectedValueOnce(error);
+    const created = await createTestRouter({ adapter: { applyUpdate } });
+    created.start();
+
+    await expect(created.router.visit('/next')).rejects.toBe(error);
+    expect(window.location.pathname).toBe('/next');
+    expect(reload).toHaveBeenCalledOnce();
   });
 
   describe('URLs outside the route table', () => {

@@ -71,10 +71,6 @@ function preventClick(event: Event) {
     </p>
 
     <p>
-      <a href="/users" data-testid="reload-link" data-void-reload>Reload document</a>
-    </p>
-
-    <p>
       <Link href="/users" data-testid="blank-link" target="_blank"> Open users in a new tab </Link>
     </p>
 

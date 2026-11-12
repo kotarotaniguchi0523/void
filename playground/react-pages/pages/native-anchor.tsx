@@ -9,6 +9,7 @@ export default function NativeAnchor() {
   }
   const state = useLinkState('/users/1?anchor-prefetch=1');
   const current = useLinkState('/native-anchor');
+  const replaced = useLinkState('/native-anchor?replace=1');
   const replace = createLinkClickHandler(useRouter(), { replace: true, preserveScroll: true });
   const fragment = createLinkClickHandler(useRouter(), { preserveState: true });
   return (
@@ -32,7 +33,12 @@ export default function NativeAnchor() {
       <a href="/users/2" data-testid="anchor-blocked" onClick={(event) => event.preventDefault()}>
         Blocked
       </a>
-      <a href="/native-anchor?replace=1" data-testid="anchor-replace" onClick={replace}>
+      <a
+        href="/native-anchor?replace=1"
+        data-testid="anchor-replace"
+        onClick={replace}
+        {...replaced.attributes}
+      >
         Replace in place
       </a>
 

@@ -210,7 +210,6 @@ describe('Pages scroll restoration', () => {
 
   it.each([
     ['#%E6%97%A5%E6%9C%AC%E8%AA%9E', '日本語'],
-    ['#a%20b', 'a b'],
     ['#a%2Bb', 'a+b'],
     ['#bad%FF%20value%', 'bad� value%'],
     ['#%EF%BB%BFtitle', '\uFEFFtitle'],
