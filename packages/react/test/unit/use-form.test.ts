@@ -57,7 +57,6 @@ function deferred<T>() {
 
 function routerWithVisit(visit: RuntimeVoidRouter['visit']): VoidRouter {
   const runtime = {
-    _hoverDelay: 75,
     get url() {
       return new URL('http://localhost/');
     },

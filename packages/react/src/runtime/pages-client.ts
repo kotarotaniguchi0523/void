@@ -285,8 +285,6 @@ function createRouter(
   engine: Awaited<ReturnType<typeof createPageNavigationEngine>>,
 ): RuntimeVoidRouter {
   const router: RuntimeVoidRouter = {
-    _hoverDelay: engine._hoverDelay,
-    _prefetchDefaultStrategy: engine._prefetchDefaultStrategy,
     get url() {
       return new URL(currentUrl(), window.location.origin);
     },

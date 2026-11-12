@@ -771,14 +771,36 @@ describe('createVoidRouter', () => {
     expect(window.scrollTo).toHaveBeenCalledWith(0, 0);
   });
 
-  it('keeps the default prefetch strategy on the engine, not the public facade', async () => {
+  it('keeps the prefetch hover delay and default strategy on the engine', async () => {
     stubClientGlobals();
-    const { router } = await createTestRouter({ prefetchDefaultStrategy: ['hover', 'click'] });
-    expect(router._prefetchDefaultStrategy).toEqual(['hover', 'click']);
-    expect('_prefetchDefaultStrategy' in createRouterFacade(router, () => '/')).toBe(false);
+    const config = {
+      adapter: {
+        createDeferred: () => ({}),
+        resolveDeferred: (_ref: unknown, value: unknown) => value,
+        rejectDeferred: (_ref: unknown, error: unknown) => error,
+        isLoading: () => false,
+      },
+      components: { home: loadComponent },
+      layoutTree: {},
+      routeMeta: {},
+      matchRoute: () => 'home',
+      viewTransitions: false,
+      prefetchHoverDelay: 75,
+      prefetchDefaultCacheFor: parseCacheFor('30s'),
+    };
+    const engine = await createPageNavigationEngine({
+      ...config,
+      prefetchDefaultStrategy: ['hover', 'click'],
+    });
+    expect(engine._hoverDelay).toBe(75);
+    expect(engine._prefetchDefaultStrategy).toEqual(['hover', 'click']);
 
-    const { router: plain } = await createTestRouter();
+    const plain = await createPageNavigationEngine(config);
     expect(plain._prefetchDefaultStrategy).toBe(false);
+
+    const { router } = await createTestRouter({ prefetchDefaultStrategy: ['hover', 'click'] });
+    expect('_hoverDelay' in router).toBe(false);
+    expect('_prefetchDefaultStrategy' in router).toBe(false);
   });
 
   it('filters mutation and internal options at every public facade boundary', async () => {
@@ -789,7 +811,6 @@ describe('createVoidRouter', () => {
       params: {},
       path: '/',
       query: new URLSearchParams(),
-      _hoverDelay: 75,
       visit,
       refresh: vi.fn(async () => ({})),
       prefetch: vi.fn(async () => ({})),
@@ -832,8 +853,6 @@ describe('createVoidRouter', () => {
       prefetch: vi.fn(async () => ({ component: 'users' })),
       flush: vi.fn(),
       flushAll: vi.fn(),
-      _hoverDelay: 75,
-      _prefetchDefaultStrategy: 'hover',
     } satisfies RuntimeVoidRouter;
     vi.stubGlobal('window', { location: { pathname: '/users', search: '' } });
     createActionClient().setActionRouter(raw);
@@ -854,13 +873,10 @@ describe('createVoidRouter', () => {
       method: 'POST',
       data: { name: 'Ada' },
     });
-    expect('_hoverDelay' in router).toBe(false);
-    expect('_prefetchDefaultStrategy' in router).toBe(false);
   });
 
   it('rejects Action access on arbitrary GET routers without a registered transport', async () => {
     const fake = {
-      _hoverDelay: 75,
       visit: vi.fn(async () => ({})),
     } as unknown as RuntimeVoidRouter;
     await expect(submitAction(fake, '/users?save', { method: 'POST' })).rejects.toThrow(

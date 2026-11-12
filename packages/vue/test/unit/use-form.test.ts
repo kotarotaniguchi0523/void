@@ -26,7 +26,6 @@ const useForm = typedUseForm as unknown as (
 async function renderForm(url: string, params: Record<string, string>) {
   const visits: Array<string> = [];
   const router = {
-    _hoverDelay: 75,
     visit: async (target: string) => {
       visits.push(target);
       return {};
@@ -140,7 +139,7 @@ describe('useForm setError', () => {
         },
       }),
     );
-    app.provide('__void_router', { _hoverDelay: 75, visit: async () => ({}) });
+    app.provide('__void_router', { visit: async () => ({}) });
     await renderToString(app);
   });
 

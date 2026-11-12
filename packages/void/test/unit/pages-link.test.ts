@@ -13,7 +13,7 @@ import {
   linkPrefetchAttributes,
   linkPrefetchStrategies,
   observeLinkVisible,
-  prefetchLink,
+  prefetchResolvedLink,
   resolveSameOrigin,
   type BaseLinkProps,
   type LinkActiveMatch,
@@ -283,21 +283,25 @@ describe('resolveSameOrigin', () => {
     expect(resolveSameOrigin('capacitor://other/settings', base)).toBeNull();
     expect(resolveSameOrigin('https://example.com/settings', base)).toBeNull();
   });
+
+  it('accepts absolute same-origin URLs and rejects other sites and schemes', () => {
+    const base = new URL('https://app.test/users?page=1');
+    expect(resolveSameOrigin('https://app.test/users/42', base)?.pathname).toBe('/users/42');
+    expect(resolveSameOrigin('https://example.com/users/42', base)).toBeNull();
+    expect(resolveSameOrigin('mailto:ada@example.com', base)).toBeNull();
+  });
 });
 
-describe('prefetchLink', () => {
-  it('uses host and protocol matching for Capacitor prefetch', () => {
-    vi.stubGlobal('window', { location: new URL('capacitor://localhost/users?page=1') });
-    const router = createRouter();
-    prefetchLink(router, 'capacitor://localhost/users/42', undefined);
-    prefetchLink(router, 'capacitor://other/users/42', undefined);
-    expect(router.prefetch.mock.calls).toEqual([['capacitor://localhost/users/42', {}]]);
-  });
+describe('prefetchResolvedLink', () => {
+  /** Prefetch `href` as the delegated anchor listener does once it has resolved the anchor. */
+  function prefetch(router: ReturnType<typeof createRouter>, href: string, cacheFor?: string) {
+    prefetchResolvedLink(router, new URL(href, window.location.href), href, cacheFor);
+  }
 
   it('prefetches other destinations with cacheFor only when given', () => {
     const router = createRouter();
-    prefetchLink(router, '/users/42', undefined);
-    prefetchLink(router, '/users/43', '30s');
+    prefetch(router, '/users/42');
+    prefetch(router, '/users/43', '30s');
 
     expect(router.prefetch.mock.calls).toEqual([
       ['/users/42', {}],
@@ -305,21 +309,11 @@ describe('prefetchLink', () => {
     ]);
   });
 
-  it('skips the current page and missing routers', () => {
+  it('skips the current page', () => {
     const router = createRouter();
-    prefetchLink(router, '/users?page=1', undefined);
-    prefetchLink(null, '/users/42', undefined);
+    prefetch(router, '/users?page=1');
 
     expect(router.prefetch).not.toHaveBeenCalled();
-  });
-
-  it('prefetches same-origin URLs and skips other sites and schemes', () => {
-    const router = createRouter();
-    prefetchLink(router, 'https://app.test/users/42', undefined);
-    prefetchLink(router, 'https://example.com/users/42', undefined);
-    prefetchLink(router, 'mailto:ada@example.com', undefined);
-
-    expect(router.prefetch.mock.calls).toEqual([['https://app.test/users/42', {}]]);
   });
 
   it('skips while data saver is on or the connection is 2G-class', () => {
@@ -330,7 +324,7 @@ describe('prefetchLink', () => {
       { effectiveType: 'slow-2g' },
     ]) {
       vi.stubGlobal('navigator', { connection });
-      prefetchLink(router, '/users/42', undefined);
+      prefetch(router, '/users/42');
     }
 
     expect(router.prefetch).not.toHaveBeenCalled();
@@ -344,7 +338,7 @@ describe('prefetchLink', () => {
       {},
     ]) {
       vi.stubGlobal('navigator', stub);
-      prefetchLink(router, '/users/42', undefined);
+      prefetch(router, '/users/42');
     }
 
     expect(router.prefetch).toHaveBeenCalledTimes(3);
@@ -354,9 +348,9 @@ describe('prefetchLink', () => {
     const router = createRouter();
     const connection = { saveData: true };
     vi.stubGlobal('navigator', { connection });
-    prefetchLink(router, '/users/42', undefined);
+    prefetch(router, '/users/42');
     connection.saveData = false;
-    prefetchLink(router, '/users/43', undefined);
+    prefetch(router, '/users/43');
 
     expect(router.prefetch.mock.calls).toEqual([['/users/43', {}]]);
   });

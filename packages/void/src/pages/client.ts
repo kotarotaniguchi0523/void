@@ -21,23 +21,15 @@ import {
   type VoidRouterAdapter as PageNavigationAdapter,
   type PrefetchOptions as InternalPrefetchOptions,
 } from './navigation-engine.ts';
-import type { LinkPrefetchValue } from './prefetch.ts';
 import { deserializePageData, ISLAND_FRONTMATTER_ID } from './serialize.ts';
 import { documentBaseUrl, isPageUrlProtocol, isSameOrigin } from './url.ts';
 
-export { getValidationErrors, isModifiedEvent } from './adapter-helpers.ts';
-export { isSameOrigin } from './url.ts';
+export { getValidationErrors } from './adapter-helpers.ts';
 export {
   createLinkClickHandler,
   createLinkState,
-  handleLinkClick,
-  linkActiveAttributes,
-  linkPendingAttributes,
   linkPrefetchAttributes,
-  linkPrefetchStrategies,
   linkStateAttributes,
-  observeLinkVisible,
-  prefetchLink,
   type BaseLinkProps,
   type LinkActiveAttributes,
   type LinkActiveMatch,
@@ -120,10 +112,8 @@ export type VoidRouter = {
   flushAll(): void;
 };
 
-/** Internal route execution preserves action data and engine configuration. */
+/** Internal route execution preserves action data. */
 export type RuntimeVoidRouter = Omit<VoidRouter, 'visit' | 'refresh' | 'prefetch'> & {
-  _hoverDelay: number;
-  _prefetchDefaultStrategy?: LinkPrefetchValue;
   visit(url: RouteUrlInput, options?: InternalVisitOptions): Promise<unknown>;
   refresh(options?: InternalVisitOptions): Promise<unknown>;
   prefetch(url: RouteUrlInput, options?: InternalPrefetchOptions): Promise<unknown>;
@@ -585,9 +575,6 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
   }
 
   const router: RuntimeVoidRouter = {
-    _hoverDelay: engine._hoverDelay,
-    _prefetchDefaultStrategy: engine._prefetchDefaultStrategy,
-
     get url() {
       return toUrl(routeUrl);
     },

@@ -267,26 +267,9 @@ function isConstrainedConnection(): boolean {
   );
 }
 
-/** Link's automatic prefetch. `router.prefetch()` called directly is not limited by the connection. */
-export function prefetchLink(
-  router: PrefetchRouter | null | undefined,
-  href: Href,
-  cacheFor: CacheForInput | undefined,
-): void {
-  if (!router?.prefetch || isConstrainedConnection()) {
-    return;
-  }
-
-  // Use the same host/protocol check as link state, including custom schemes.
-  const target = resolveSameOrigin(href, documentBaseUrl());
-  if (target) {
-    prefetchTarget(router, target, href, cacheFor);
-  }
-}
-
 /**
- * `prefetchLink` for a destination the caller has already resolved as same-origin,
- * so the delegated anchor listener does not resolve each anchor twice.
+ * Link's automatic prefetch, for a destination the caller has already resolved as
+ * same-origin. `router.prefetch()` called directly is not limited by the connection.
  */
 export function prefetchResolvedLink(
   router: PrefetchRouter,

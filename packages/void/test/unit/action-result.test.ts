@@ -25,7 +25,6 @@ declare module 'void/routes' {
 
 function routerWithVisit(visit: RuntimeVoidRouter['visit']): RuntimeVoidRouter {
   const router: RuntimeVoidRouter = {
-    _hoverDelay: 75,
     get url() {
       return new URL('http://localhost/');
     },
