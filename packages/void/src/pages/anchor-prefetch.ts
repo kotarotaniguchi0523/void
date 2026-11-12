@@ -7,6 +7,7 @@ import {
 } from './link.ts';
 import type { PrefetchOptions } from './navigation-engine.ts';
 import { parseCacheFor, type CacheForInput, type LinkPrefetchValue } from './prefetch.ts';
+import { documentBaseUrl } from './url.ts';
 
 export function startAnchorPrefetch(router: {
   _hoverDelay: number;
@@ -38,7 +39,7 @@ export function startAnchorPrefetch(router: {
     if (
       !anchor.isConnected ||
       !eligible(anchor) ||
-      !resolveSameOrigin(anchor.href, new URL(window.location.href))
+      !resolveSameOrigin(anchor.href, documentBaseUrl())
     ) {
       return;
     }

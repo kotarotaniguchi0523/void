@@ -3,6 +3,18 @@ export function isPageUrlProtocol(url: URL): boolean {
   return url.protocol === 'http:' || url.protocol === 'https:' || url.protocol === 'capacitor:';
 }
 
+/**
+ * The current document URL: the base for relative URLs and for `isSameOrigin`.
+ * A full URL, because the opaque origin of a Capacitor WebView is not a URL base.
+ */
+export function documentBaseUrl(): URL {
+  if (typeof window === 'undefined') {
+    return new URL('http://localhost/');
+  }
+  const { href, origin, pathname, search, hash } = window.location;
+  return new URL(href || origin + pathname + search + hash);
+}
+
 /** Use the browser's origin or a URL base for custom schemes with opaque origins. */
 export function isSameOrigin(url: URL, origin: string | URL): boolean {
   if (url.protocol === 'capacitor:') {

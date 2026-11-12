@@ -18,7 +18,7 @@ import type { CacheForInput, CacheForResult, LinkPrefetchValue } from './prefetc
 import type { PageObject } from './protocol.ts';
 import { createScrollRestoration } from './scroll-restoration.ts';
 import { decodePageData, deserializePageData, serializePageData } from './serialize.ts';
-import { decodePagePath, isPageUrlProtocol, isSameOrigin } from './url.ts';
+import { decodePagePath, documentBaseUrl, isPageUrlProtocol, isSameOrigin } from './url.ts';
 
 /**
  * The server leaves a named action's key out of the page URL. When the page URL
@@ -52,12 +52,6 @@ type DeferredWindow = Window & {
 type PageFetchOptions = RequestInit & { headers: Record<string, string> };
 
 type StaticPageDataResult = { pageData: PageData; resolvedDeferred: boolean };
-
-/** Use a full document URL: opaque Capacitor origins are not URL bases. */
-function documentBaseUrl(): URL {
-  const { href, origin, pathname, search, hash } = window.location;
-  return new URL(href || origin + pathname + search + hash);
-}
 
 const PREFETCH_REDIRECT = Symbol('void:prefetch-redirect');
 type PrefetchRedirect = {

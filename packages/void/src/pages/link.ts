@@ -5,7 +5,7 @@ import { isModifiedEvent } from './adapter-helpers.ts';
 import type { NavigationState, VoidRouter } from './client.ts';
 import type { PrefetchOptions } from './navigation-engine.ts';
 import type { CacheForInput, LinkPrefetchValue, LinkPrefetchStrategy } from './prefetch.ts';
-import { decodePagePath, isPageUrlProtocol, isSameOrigin } from './url.ts';
+import { decodePagePath, documentBaseUrl, isPageUrlProtocol, isSameOrigin } from './url.ts';
 
 export type { LinkPrefetchValue, LinkPrefetchStrategy };
 export type LinkActiveMatch = 'exact' | 'prefix';
@@ -268,7 +268,7 @@ export function prefetchLink(
   }
 
   // Use the same host/protocol check as link state, including custom schemes.
-  const target = resolveSameOrigin(href, new URL(window.location.href));
+  const target = resolveSameOrigin(href, documentBaseUrl());
   if (!target) {
     return;
   }
@@ -310,7 +310,7 @@ export function handleLinkClick(
   ) {
     return;
   }
-  if (!resolveSameOrigin(href, new URL(window.location.href))) {
+  if (!resolveSameOrigin(href, documentBaseUrl())) {
     return;
   }
   event.preventDefault();

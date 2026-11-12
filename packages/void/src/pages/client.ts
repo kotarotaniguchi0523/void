@@ -23,7 +23,7 @@ import {
 } from './navigation-engine.ts';
 import type { LinkPrefetchValue } from './prefetch.ts';
 import { deserializePageData, ISLAND_FRONTMATTER_ID } from './serialize.ts';
-import { isPageUrlProtocol, isSameOrigin } from './url.ts';
+import { documentBaseUrl, isPageUrlProtocol, isSameOrigin } from './url.ts';
 
 export { getValidationErrors, isModifiedEvent } from './adapter-helpers.ts';
 export { isSameOrigin } from './url.ts';
@@ -158,28 +158,9 @@ function currentUrl(): string {
   return window.location.pathname + window.location.search + window.location.hash;
 }
 
-function getUrlOrigin(): string {
-  if (typeof window === 'undefined') {
-    return 'http://localhost';
-  }
-  const { origin, href } = window.location;
-  // Capacitor WebViews may expose an opaque origin even for a local app.
-  if (origin === 'null' && href) {
-    const url = new URL(href);
-    if (url.protocol === 'capacitor:') {
-      return `capacitor://${url.host}`;
-    }
-  }
-  return origin;
-}
-
 /** Relative URLs such as `?page=2` resolve against the current page, as in an anchor. */
-function getUrlBase(): string {
-  return typeof window === 'undefined' ? 'http://localhost/' : getUrlOrigin() + currentUrl();
-}
-
 function toUrl(value: string | URL): URL {
-  return value instanceof URL ? new URL(value.href) : new URL(value || '/', getUrlBase());
+  return value instanceof URL ? new URL(value.href) : new URL(value || '/', documentBaseUrl());
 }
 
 /** Normalize typed destinations uniformly across all Pages adapters. */
@@ -189,7 +170,7 @@ export function normalizePageUrl(value: RouteUrlInput): string {
     return urlString;
   }
   const url = toUrl(urlString);
-  return isPageUrlProtocol(url) && isSameOrigin(url, getUrlOrigin())
+  return isPageUrlProtocol(url) && isSameOrigin(url, documentBaseUrl())
     ? url.pathname + url.search + url.hash
     : url.href;
 }
@@ -286,7 +267,7 @@ export function createSsrRouter(
 ): VoidRouter {
   const router = {
     get url() {
-      return new URL(url || '/', requestUrl ?? getUrlBase());
+      return new URL(url || '/', requestUrl ?? documentBaseUrl());
     },
     get path() {
       return this.url.pathname;
