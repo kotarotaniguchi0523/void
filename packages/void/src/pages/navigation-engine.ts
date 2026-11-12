@@ -314,6 +314,9 @@ export async function createPageNavigationEngine(
   const uncachedPayloads = new WeakSet<object>();
   let _nextNavigationId = 0;
   let unrenderedEntry: string | undefined;
+  // The visit that renders that entry. Unset while the entry has no such visit:
+  // the one that published it lost its commit, or its handler has yet to run.
+  let unrenderedEntryVisit: number | undefined;
   let preparedEntryUrl: string | undefined;
   let _pendingResource: PageNavigationResource | null = null;
   let _committedResource: PageNavigationResource | null = null;
@@ -764,13 +767,24 @@ export async function createPageNavigationEngine(
   deferredWindow.__rejectDeferred = (group: string, error: unknown) =>
     _htmlDeferredRegistry?.resolve(group, undefined, error);
 
+  function markUnrenderedEntry(key: string | undefined, visitId?: number): void {
+    unrenderedEntry = key;
+    unrenderedEntryVisit = visitId;
+  }
+
+  /**
+   * Reload when the latest visit ends and the current entry's page was never rendered.
+   * Another visit's failure, such as a rejected action, leaves the entry to the
+   * visit that is rendering it.
+   */
   function recoverUnrenderedEntry(id: number): void {
     if (
       id === _nextNavigationId &&
+      (unrenderedEntryVisit === undefined || unrenderedEntryVisit === id) &&
       unrenderedEntry !== undefined &&
       window.navigation.currentEntry?.key === unrenderedEntry
     ) {
-      unrenderedEntry = undefined;
+      markUnrenderedEntry(undefined);
       window.location.reload();
     }
   }
@@ -1203,7 +1217,7 @@ export async function createPageNavigationEngine(
           throw error;
         }
       }
-      unrenderedEntry = undefined;
+      markUnrenderedEntry(undefined);
       // ownsCommit() just confirmed that this visit is the pending one.
       _pendingResource = null;
       const previousResource = _committedResource;
@@ -1390,7 +1404,7 @@ export async function createPageNavigationEngine(
 
       if (options._entryCommitted) {
         // The browser has already moved to this entry.
-        unrenderedEntry = options._entryKey ?? window.navigation.currentEntry?.key;
+        markUnrenderedEntry(options._entryKey ?? window.navigation.currentEntry?.key, id);
       }
 
       const controller = new AbortController();
@@ -1799,7 +1813,7 @@ export async function createPageNavigationEngine(
               event.signal.throwIfAborted();
             }
             resource.options._entryKey = window.navigation.currentEntry?.key;
-            unrenderedEntry = resource.options._entryKey;
+            markUnrenderedEntry(resource.options._entryKey, resource.id);
             release(true);
             const result = await applyBrowserVisit(() => applied, resource);
             event.signal.throwIfAborted();
@@ -1834,7 +1848,7 @@ export async function createPageNavigationEngine(
     // supersede that handler before it gets a chance to apply the page.
     if (entry.url === preparedEntryUrl || entry.key === interceptedTraversal) {
       if (entry.url === preparedEntryUrl || target.pathname + target.search !== _currentFetchUrl) {
-        unrenderedEntry = entry.key;
+        markUnrenderedEntry(entry.key);
       }
       preparedEntryUrl = undefined;
       return;

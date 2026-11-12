@@ -3316,4 +3316,38 @@ describe('browser navigate events', () => {
     expect(window.scrollTo).not.toHaveBeenCalled();
     expect(applyUpdate).not.toHaveBeenCalled();
   });
+
+  it('keeps a failed action away from an entry that another visit is rendering', async () => {
+    stubClientGlobals();
+    stubBrowserNavigation();
+    const reload = vi.fn();
+    Object.assign(window.location, { reload });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) =>
+        init?.method === 'POST'
+          ? Response.json({ errors: { name: 'Required' } }, { status: 422 })
+          : pageJson({ component: 'home', url, props: {} }),
+      ),
+    );
+    const rendering = controlledPromise<void>();
+    const applyUpdate = vi.fn(() => rendering.promise);
+    const created = await createTestRouter({ adapter: { applyUpdate } });
+    created.start();
+
+    // The browser has committed /next, but its page is still rendering.
+    const visit = created.router.visit('/next');
+    await vi.waitFor(() => expect(applyUpdate).toHaveBeenCalledOnce());
+    expect(window.location.pathname).toBe('/next');
+
+    await expect(created.router.visit('/', { method: 'POST' })).rejects.toMatchObject({
+      name: 'VoidActionError',
+      status: 422,
+    });
+    expect(reload).not.toHaveBeenCalled();
+
+    rendering.resolve();
+    await visit;
+    expect(reload).not.toHaveBeenCalled();
+  });
 });
