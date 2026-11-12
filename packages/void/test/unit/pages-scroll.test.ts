@@ -125,13 +125,13 @@ describe('Pages scroll restoration', () => {
     ['#%74op', 0],
     ['#', 0],
   ] as const)(
-    'keeps native fragment semantics for %s in an imperative visit',
+    'keeps native fragment semantics for a traversal to %s without a saved position',
     async (hash, expected) => {
       const page = await setup();
       page.engine.start();
       page.engine.commitInitialRender();
       page.window.scrollY = 640;
-      await page.engine.prepareVisit(hash).shell;
+      page.changeEntry({ key: 'fragment-entry', url: 'http://localhost/' + hash });
       expect(page.window.scrollY).toBe(expected);
     },
   );
@@ -173,7 +173,7 @@ describe('Pages scroll restoration', () => {
     );
     page.engine.start();
     page.engine.commitInitialRender();
-    await page.engine.prepareVisit('#a%20b').shell;
+    page.changeEntry({ key: 'fragment-entry', url: 'http://localhost/#a%20b' });
     expect(named).toHaveBeenCalledOnce();
     expect(decoded).not.toHaveBeenCalled();
   });
@@ -331,12 +331,23 @@ describe('Pages scroll restoration', () => {
     expect(page.window.scrollY).toBe(3500);
   });
 
-  it('does not apply initial restoration over a subsequent router navigation', async () => {
+  it('does not apply initial restoration over a subsequent fragment navigation', async () => {
     const { state, storage } = await departedPage();
     const page = await setup(state, storage);
     page.engine.start();
-    await page.engine.prepareVisit('#missing-target').shell;
-    page.window.scrollTo.mockClear();
+    const fragment = { key: 'fragment-entry', url: 'http://localhost/#missing-target' };
+    page.navigation.dispatchEvent(
+      Object.assign(new Event('navigate'), {
+        canIntercept: true,
+        destination: { ...fragment, sameDocument: true },
+        downloadRequest: null,
+        formData: null,
+        hashChange: true,
+        navigationType: 'push',
+        signal: new AbortController().signal,
+      }),
+    );
+    page.changeEntry(fragment, 'push');
     page.engine.commitInitialRender();
     expect(page.window.scrollTo).not.toHaveBeenCalled();
   });
@@ -439,7 +450,8 @@ describe('Pages scroll restoration', () => {
     });
     const state = page.navigation.currentEntry.key;
     page.window.scrollY = 3500;
-    await page.engine.prepareVisit('#next').shell;
+    page.changeEntry({ key: 'next-entry', url: 'http://localhost/#next' }, 'push');
+    page.window.scrollY = 0;
     page.changeEntry({ key: state, url: 'http://localhost/' });
     expect(page.window.scrollY).toBe(3500);
   });

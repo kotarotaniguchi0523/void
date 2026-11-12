@@ -111,7 +111,8 @@ type AppAction =
   | { type: 'reveal'; resource: ReactPageResource }
   | { type: 'finish'; resource: ReactPageResource; location: string }
   | { type: 'fail'; resource: ReactPageResource; location: string }
-  | { type: 'abandon'; resource: ReactPageResource; location: string };
+  | { type: 'abandon'; resource: ReactPageResource; location: string }
+  | { type: 'location'; location: string };
 
 const deferredState = new WeakMap<DeferredResource, DeferredResourceState>();
 const viewTransitionWaiters = new Map<number, () => void>();
@@ -247,9 +248,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
         return state;
       }
       return {
-        resource: action.resource.immediate
-          ? state.rollbackResource || state.resource
-          : action.resource,
+        resource: action.resource,
         rollbackResource: null,
         pendingId: null,
         routeUrl: action.location,
@@ -278,6 +277,8 @@ function appReducer(state: AppState, action: AppAction): AppState {
         routeUrl: action.location,
         navigation: idleNavigationState(),
       };
+    case 'location':
+      return { ...state, routeUrl: action.location };
   }
 }
 
@@ -501,7 +502,6 @@ function App({
       hash: window.location.hash,
       method: 'GET',
       options: {},
-      immediate: false,
       shell: Promise.resolve({
         pageData: initialPageData,
         component: engine.initialComponent,
@@ -639,31 +639,6 @@ function App({
       const options = prepared.options;
       const resolveOnData =
         prepared.options.resolveOn === 'data' || prepared.options._resolveOnShell;
-      if (prepared.immediate) {
-        const navigation = navigationForResource(prepared);
-        navigationStore.set(navigation);
-
-        activePendingNavigationId = prepared.id;
-        dispatch({ type: 'begin', resource: prepared, navigation });
-
-        return prepared.shell.then(
-          (result) => {
-            if (activePendingNavigationId === prepared.id) {
-              activePendingNavigationId = null;
-            }
-            dispatch({ type: 'finish', resource: prepared, location: currentUrl() });
-            return result?.pageData;
-          },
-          (error) => {
-            if (activePendingNavigationId === prepared.id) {
-              activePendingNavigationId = null;
-            }
-            dispatch({ type: 'fail', resource: prepared, location: currentUrl() });
-            throw error;
-          },
-        );
-      }
-
       let resolveVisit!: (pageData: ReactPageData | undefined) => void;
       let rejectVisit!: (error: unknown) => void;
       const pagePromise = new Promise<ReactPageData | undefined>((resolve, reject) => {
@@ -798,8 +773,10 @@ function App({
   useInsertionEffect(() => {
     scheduleVisit = schedule;
     engine.setBrowserVisitHandler(schedule);
+    engine.setLocationHandler(() => dispatch({ type: 'location', location: currentUrl() }));
     return () => {
       engine.setBrowserVisitHandler(null);
+      engine.setLocationHandler(null);
       if (scheduleVisit === schedule) {
         scheduleVisit = null;
       }

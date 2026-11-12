@@ -532,7 +532,7 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
       }
       throw error;
     } finally {
-      // A same-page hash visit can settle before this one, so no visit may be active.
+      // A newer visit can settle before this one, so no visit may be active.
       const ownsNavigation = activeNavigationId === resource.id;
       if (ownsNavigation || activeNavigationId === null) {
         let restored = false;
@@ -621,6 +621,7 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
     initialLayouts: engine.initialLayouts,
     start() {
       engine.setBrowserVisitHandler(applyNavigationResource);
+      engine.setLocationHandler(() => setRouteState(currentUrl()));
       engine.start();
     },
     commitInitialRender: engine.commitInitialRender,

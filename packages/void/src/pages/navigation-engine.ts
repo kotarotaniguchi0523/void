@@ -88,8 +88,6 @@ export type VisitOptions = {
   /** @internal The browser has already committed this destination. */
   _entryCommitted?: boolean;
   _entryKey?: string;
-  /** @internal A native fragment navigation already controls scrolling. */
-  _nativeScroll?: boolean;
   /** @internal The browser owns this visit’s URL and cancellation. */
   _navigationSignal?: AbortSignal;
   /** @internal Used by router.refresh() to refetch the current URL even when it has a hash */
@@ -143,7 +141,6 @@ export type PageNavigationResource = {
   hash: string;
   method: string;
   options: VisitOptions;
-  immediate: boolean;
   shell: Promise<PageNavigationResult | undefined>;
   /** Destination after redirects, including its query and hash. */
   destination(): string;
@@ -169,6 +166,8 @@ export type PageNavigationEngine = {
   prepareVisit(url: string, options?: VisitOptions): PageNavigationResource;
   visit(url: string, options: VisitOptions, apply: ApplyVisit): Promise<PageData | undefined>;
   setBrowserVisitHandler(handler: ApplyVisit | null): void;
+  /** The handler runs when the browser moves to another fragment of the rendered page. */
+  setLocationHandler(handler: (() => void) | null): void;
   /** Called after a renderer commit identifies the resources still in its tree. */
   releaseRetiredResources(retainedIds: ReadonlySet<number>): void;
   prefetch(url: string, options?: PrefetchOptions): Promise<unknown>;
@@ -319,9 +318,9 @@ export async function createPageNavigationEngine(
   let _htmlDeferredRegistry: DeferredRegistry | null = null;
   let _currentFetchUrl = window.location.pathname + window.location.search;
   let browserVisitHandler: ApplyVisit | null = null;
+  let locationHandler: (() => void) | null = null;
   const browserVisits = new WeakSet<BrowserVisit>();
   const renderedPageNavigation = Symbol('void:rendered-page-navigation');
-  const renderedFragmentNavigation = Symbol('void:rendered-fragment-navigation');
   const renderedEntryReturn = Symbol('void:rendered-entry-return');
   let started = false;
   let interceptedTraversal: string | null = null;
@@ -361,7 +360,6 @@ export async function createPageNavigationEngine(
       }),
     };
   }
-  let nativeFragment: string | null = null;
   let initialScrollPosition: { x: number; y: number } | null = null;
   const initialEntryKey = window.navigation.currentEntry?.key;
   const scrollRestoration = createScrollRestoration();
@@ -791,7 +789,7 @@ export async function createPageNavigationEngine(
   ): Promise<PageData | undefined> {
     try {
       const result = await apply(resource);
-      if (!result && !resource.immediate && !resource.options._navigationSignal?.aborted) {
+      if (!result && !resource.options._navigationSignal?.aborted) {
         recoverUnrenderedEntry(resource.id);
       }
       return result;
@@ -806,30 +804,21 @@ export async function createPageNavigationEngine(
     }
   }
 
-  /**
-   * A visit to the current URL and fragment replaces the entry, as the browser does
-   * for a link to it. Any other visit adds an entry unless it asks to replace.
-   */
-  function replacesEntry(url: string, options: VisitOptions): boolean {
-    const current = documentBaseUrl();
-    const target = new URL(url, current);
-    return !!options.replace || (Boolean(target.hash) && target.href === current.href);
-  }
-
-  function navigateEntry(url: string, replace: boolean, info: unknown) {
+  function navigateEntry(url: string, history: 'push' | 'replace' | 'auto', info: unknown) {
     return window.navigation.navigate(url, {
-      history: replace ? 'replace' : 'push',
-      ...(replace && { state: window.navigation.currentEntry?.getState() }),
+      history,
+      ...(history === 'replace' && { state: window.navigation.currentEntry?.getState() }),
       info,
     });
   }
 
-  async function publishEntry(
-    url: string,
-    replace: boolean,
-    info: typeof renderedPageNavigation | typeof renderedFragmentNavigation,
-  ): Promise<string | undefined> {
-    const navigation = navigateEntry(url, replace, info);
+  /** Whether the URL is the rendered page's, apart from its fragment. */
+  function isRenderedPageUrl(url: URL): boolean {
+    return isSameOrigin(url, documentBaseUrl()) && url.pathname + url.search === _currentFetchUrl;
+  }
+
+  async function publishEntry(url: string, replace: boolean): Promise<string | undefined> {
+    const navigation = navigateEntry(url, replace ? 'replace' : 'push', renderedPageNavigation);
     void navigation.finished?.catch(() => {});
     if (!navigation.committed) {
       throw new Error('Void Router: browser did not start the navigation.');
@@ -857,7 +846,7 @@ export async function createPageNavigationEngine(
       returned = Promise.resolve(traversal.committed);
     } else {
       // The superseded visit replaced the rendered page's entry: give it back its URL.
-      returned = publishEntry(_currentFetchUrl, true, renderedPageNavigation);
+      returned = publishEntry(_currentFetchUrl, true);
     }
     return returned.then(
       () => markUnrenderedEntry(undefined),
@@ -1240,7 +1229,7 @@ export async function createPageNavigationEngine(
           entryKey =
             resource.method !== 'GET' && replaceHistory && historyUrl === visibleUrl
               ? window.navigation.currentEntry?.key
-              : await publishEntry(historyUrl, replaceHistory, renderedPageNavigation);
+              : await publishEntry(historyUrl, replaceHistory);
           if (!ownsCommit()) {
             return false;
           }
@@ -1392,55 +1381,11 @@ export async function createPageNavigationEngine(
       const effectiveFetchUrl = fetchUrl || currentPath;
       const method = (options.method || 'GET').toUpperCase();
       const id = ++_nextNavigationId;
-      const hashNavigationBaseUrl = options._entryCommitted ? _currentFetchUrl : currentPath;
 
       if (_pendingResource) {
         supersedeResource(_pendingResource);
       }
       _pendingResource = null;
-
-      const isSamePageHashNavigation =
-        !options._refresh &&
-        effectiveFetchUrl === hashNavigationBaseUrl &&
-        method === 'GET' &&
-        !options.data &&
-        Boolean(hash || options._entryCommitted);
-
-      if (isSamePageHashNavigation) {
-        async function finishFragment(): Promise<undefined> {
-          const key = options._entryCommitted
-            ? (options._entryKey ?? window.navigation.currentEntry?.key)
-            : await publishEntry(
-                effectiveFetchUrl + hash,
-                replacesEntry(effectiveFetchUrl + hash, options),
-                renderedFragmentNavigation,
-              );
-          if (id === _nextNavigationId && !options._navigationSignal?.aborted) {
-            _currentFetchUrl = effectiveFetchUrl;
-            scrollRestoration.commit(key);
-            if (!options._nativeScroll) {
-              restoreScroll(options._scrollPosition, hash, false);
-            }
-          }
-          return undefined;
-        }
-        return {
-          id,
-          url,
-          fetchUrl: effectiveFetchUrl,
-          hash,
-          method,
-          options,
-          immediate: true,
-          shell: finishFragment(),
-          destination: () => effectiveFetchUrl + hash,
-          abort() {},
-          async commit() {
-            return id === _nextNavigationId && !options._navigationSignal?.aborted;
-          },
-          dispose() {},
-        };
-      }
 
       if (options._entryCommitted) {
         // The browser has already moved to this entry.
@@ -1476,7 +1421,6 @@ export async function createPageNavigationEngine(
         hash,
         method,
         options,
-        immediate: false,
         shell,
         destination: () => commitTarget.fetchUrl + commitTarget.hash,
         abort: stop,
@@ -1508,13 +1452,32 @@ export async function createPageNavigationEngine(
 
     async visit(url, options, apply) {
       const target = new URL(url, documentBaseUrl());
+      const get = !options.data && (options.method ?? 'GET').toUpperCase() === 'GET';
       if (
-        !browserVisitHandler ||
-        options._entryCommitted ||
-        options.data ||
-        (options.method ?? 'GET').toUpperCase() !== 'GET' ||
-        !isClientPage(target)
+        get &&
+        !options._refresh &&
+        !options._entryCommitted &&
+        Boolean(target.hash) &&
+        isRenderedPageUrl(target) &&
+        target.pathname + target.search === window.location.pathname + window.location.search
       ) {
+        // A fragment of the page on screen: the browser navigates and scrolls to it.
+        // Without `replace` it adds an entry, unless the URL is already the current one.
+        const request: BrowserVisit = { options, apply };
+        browserVisits.add(request);
+        const navigation = navigateEntry(
+          target.href,
+          options.replace ? 'replace' : 'auto',
+          request,
+        );
+        void navigation.committed?.catch(() => {});
+        if (!navigation.finished) {
+          throw new Error('Void Router: browser did not start the navigation.');
+        }
+        await navigation.finished;
+        return undefined;
+      }
+      if (!browserVisitHandler || options._entryCommitted || !get || !isClientPage(target)) {
         const resource = engine.prepareVisit(url, options);
         const returned = resource.method === 'GET' ? null : returnToRenderedEntry();
         return applyBrowserVisit(
@@ -1545,7 +1508,11 @@ export async function createPageNavigationEngine(
         ...(data ? { data } : {}),
       };
       browserVisits.add(request);
-      const navigationResult = navigateEntry(target.href, replacesEntry(url, options), request);
+      const navigationResult = navigateEntry(
+        target.href,
+        options.replace ? 'replace' : 'push',
+        request,
+      );
       void navigationResult.committed?.catch(() => {});
       const completion =
         navigationResult.finished ??
@@ -1582,6 +1549,10 @@ export async function createPageNavigationEngine(
 
     setBrowserVisitHandler(handler) {
       browserVisitHandler = handler;
+    },
+
+    setLocationHandler(handler) {
+      locationHandler = handler;
     },
 
     prefetch(url, options = {}) {
@@ -1692,14 +1663,13 @@ export async function createPageNavigationEngine(
     },
   };
 
-  // interceptedTraversal, nativeFragment and preparedEntryUrl tell currententrychange
+  // interceptedTraversal and preparedEntryUrl tell currententrychange
   // about the entry a claimed navigation commits. They belong to that navigation:
   // a navigate event the router leaves alone, such as a classic history write,
   // must not change them.
   let entryHandoff: NavigateEvent | null = null;
   function resetEntryHandoff(): void {
     interceptedTraversal = null;
-    nativeFragment = null;
     preparedEntryUrl = undefined;
   }
   function claimEntryHandoff(event: NavigateEvent): void {
@@ -1719,13 +1689,11 @@ export async function createPageNavigationEngine(
 
   // Register before the adapter mounts: an initial effect can publish an entry.
   window.navigation.addEventListener('navigate', (event) => {
-    if (event.info === renderedPageNavigation || event.info === renderedFragmentNavigation) {
+    if (event.info === renderedPageNavigation) {
       claimEntryHandoff(event);
       // A visit started by currententrychange can still invalidate the resource
       // before Void commits it, even though its DOM update has already run.
-      if (event.info === renderedPageNavigation) {
-        preparedEntryUrl = event.destination.url;
-      }
+      preparedEntryUrl = event.destination.url;
       event.intercept({ scroll: 'manual', focusReset: 'manual' });
       return;
     }
@@ -1739,19 +1707,40 @@ export async function createPageNavigationEngine(
     const request = event.info as BrowserVisit | undefined;
     const own = !!request && browserVisits.has(request);
     const apply = own ? request.apply : browserVisitHandler;
+    const options = own ? request.options : {};
     const target = new URL(event.destination.url);
     const traversal = event.navigationType === 'traverse';
-    if (
-      !apply ||
-      !event.canIntercept ||
-      event.downloadRequest !== null ||
-      event.formData !== null
-    ) {
+    if (!event.canIntercept || event.downloadRequest !== null || event.formData !== null) {
       return;
     }
     const anchor = event.sourceElement?.closest('a[href],area[href]');
     const link =
       !!anchor && !anchor.hasAttribute('download') && !anchor.hasAttribute('data-void-reload');
+    // The browser owns a navigation to another fragment of the rendered page, or between
+    // two entries of that page: it commits the entry and scrolls to the fragment, and
+    // currententrychange updates the route. A link or a visit to the current URL and
+    // fragment is such a navigation too, though the browser reports hashChange as false.
+    if (
+      isRenderedPageUrl(target) &&
+      (traversal
+        ? event.destination.sameDocument
+        : !options._refresh &&
+          (event.hashChange ||
+            ((own || link) &&
+              Boolean(target.hash) &&
+              event.destination.sameDocument &&
+              target.href === documentBaseUrl().href)))
+    ) {
+      if (_pendingResource) {
+        abortPendingResource(_pendingResource);
+      }
+      // A visit that has just committed must not scroll after the browser does.
+      _nextNavigationId++;
+      return;
+    }
+    if (!apply) {
+      return;
+    }
     // A Link to a URL outside the route table is fetched and its response decides.
     // A plain anchor to such a URL stays a document load: fetching it first could
     // request the document twice. A same-document entry with such a URL is one that
@@ -1765,58 +1754,17 @@ export async function createPageNavigationEngine(
     }
 
     const url = target.pathname + target.search + target.hash;
-    const options = own ? request.options : {};
-    const ownHashVisit =
-      own &&
-      !options._refresh &&
-      target.pathname + target.search === _currentFetchUrl &&
-      (event.hashChange || Boolean(target.hash));
-    // A link to the current URL and fragment is also a native fragment navigation:
-    // the browser scrolls and replaces the entry, but reports hashChange as false.
-    const nativeFragmentNavigation =
-      event.hashChange ||
-      (link &&
-        Boolean(target.hash) &&
-        event.destination.sameDocument &&
-        target.href === documentBaseUrl().href);
-    if (nativeFragmentNavigation && !ownHashVisit && !traversal) {
-      if (_pendingResource) {
-        abortPendingResource(_pendingResource);
-      }
-      scrollRestoration.save();
-      claimEntryHandoff(event);
-      nativeFragment = target.href;
-      return;
-    }
-    // A classic history write also emits navigate. Only claim a link, a
-    // traversal, or a visit initiated by this router.
-    if (!own && !traversal && !link) {
+    // A classic history write also emits navigate. Only claim a link, a traversal,
+    // a visit initiated by this router, or a fragment of a URL whose page has yet
+    // to render.
+    if (!own && !traversal && !link && !event.hashChange) {
       return;
     }
     if (traversal && !event.destination.sameDocument) {
       return;
     }
-    if ((ownHashVisit || traversal || event.cancelable) && _pendingResource) {
+    if ((traversal || event.cancelable) && _pendingResource) {
       abortPendingResource(_pendingResource);
-    }
-    if (ownHashVisit) {
-      scrollRestoration.save();
-      claimEntryHandoff(event);
-      event.intercept({
-        scroll: 'manual',
-        focusReset: 'manual',
-        handler: async () => {
-          await apply(
-            engine.prepareVisit(url, {
-              ...options,
-              _entryCommitted: true,
-              _entryKey: window.navigation.currentEntry?.key,
-              _navigationSignal: event.signal,
-            }),
-          );
-        },
-      });
-      return;
     }
     if (traversal) {
       claimEntryHandoff(event);
@@ -1836,7 +1784,7 @@ export async function createPageNavigationEngine(
           });
           const result = await applyBrowserVisit(apply, exposeResource(resource));
           event.signal.throwIfAborted();
-          if (!resource.immediate && !result) {
+          if (!result) {
             throw abortError();
           }
         },
@@ -1955,21 +1903,28 @@ export async function createPageNavigationEngine(
       }
       return;
     }
-    const nativeHash = entry.url === nativeFragment;
-    if (nativeHash) {
-      nativeFragment = null;
+    if (isRenderedPageUrl(target)) {
+      // The rendered page under another fragment. The browser has not scrolled yet.
+      if (entry.key === event.from?.key && entry.url === event.from.url) {
+        return;
+      }
+      scrollRestoration.save();
+      scrollRestoration.commit(entry.key);
+      if (event.navigationType === 'traverse') {
+        // Entries keep their own positions: the browser restores none of them.
+        restoreScroll(scrollRestoration.read(entry.key), target.hash, false);
+      }
+      locationHandler?.();
+      return;
     }
     if (
-      (!nativeHash &&
-        (event.navigationType !== 'traverse' ||
-          !(isClientPage(target) || isServerRoutedUrl(target)))) ||
+      event.navigationType !== 'traverse' ||
+      !(isClientPage(target) || isServerRoutedUrl(target)) ||
       (entry.key === initialEntryKey && _nextNavigationId === 0)
     ) {
       return;
     }
-    if (!nativeHash) {
-      scrollRestoration.save();
-    }
+    scrollRestoration.save();
     if (!browserVisitHandler) {
       return;
     }
@@ -1978,7 +1933,6 @@ export async function createPageNavigationEngine(
       _scrollPosition: scrollRestoration.read(entry.key),
       _entryCommitted: true,
       _entryKey: entry.key,
-      _nativeScroll: nativeHash && target.pathname + target.search === _currentFetchUrl,
     });
     void applyBrowserVisit(browserVisitHandler, exposeResource(resource)).catch((error) =>
       reportError(error),

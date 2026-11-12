@@ -188,7 +188,10 @@ function stubBrowserNavigation() {
   Object.assign(window, { navigation: browser });
 }
 
-/** A session history with real entries: push, replace and traversal move through it. */
+/**
+ * A session history with real entries: push, replace and traversal move through it.
+ * As in a browser, `history: 'auto'` replaces the entry when the URL is the current one.
+ */
 function stubNavigationHistory() {
   type Entry = EventTarget & { key: string; url: string; getState(): unknown };
   let created = 0;
@@ -202,7 +205,11 @@ function stubNavigationHistory() {
     navigate(url: string, options: NavigationNavigateOptions) {
       const destination = new URL(url, window.location.origin);
       const index = entries.indexOf(browser.currentEntry);
-      const navigationType = options.history === 'replace' ? 'replace' : 'push';
+      const navigationType =
+        options.history === 'replace' ||
+        (options.history === 'auto' && destination.href === browser.currentEntry.url)
+          ? 'replace'
+          : 'push';
       return run(destination, '', navigationType, options.info, () => {
         const entry = createEntry(
           destination,
@@ -229,13 +236,16 @@ function stubNavigationHistory() {
     const controller = new AbortController();
     active = controller;
     let interception: NavigationInterceptOptions | undefined;
+    const current = new URL(browser.currentEntry.url);
     browser.dispatchEvent(
       Object.assign(new Event('navigate', { cancelable: true }), {
         canIntercept: true,
         destination: { url: destination.href, key, sameDocument: true },
         downloadRequest: null,
         formData: null,
-        hashChange: false,
+        hashChange:
+          destination.pathname + destination.search === current.pathname + current.search &&
+          destination.hash !== current.hash,
         info,
         navigationType,
         signal: controller.signal,
@@ -1819,33 +1829,38 @@ describe('createVoidRouter', () => {
     },
   );
 
-  it('runs navigation listeners for same-page hash visits', async () => {
+  it('leaves a same-page hash visit to the browser and follows its URL', async () => {
     const documentStub = stubClientGlobals();
     window.location.pathname = '/docs';
     window.location.search = '?tab=api';
+    const browser = stubNavigationHistory();
     const applyUpdate = vi.fn();
     const matchRoute = vi.fn(() => 'home');
+    const onRouteChange = vi.fn();
     vi.stubGlobal('fetch', vi.fn());
 
-    const events: Array<string> = [];
-    const { router } = await createTestRouter({
-      adapter: { applyUpdate },
-      matchRoute,
-      onNavigationChange(navigation) {
-        events.push(navigation.state);
-      },
-    });
+    const created = await createTestRouter({ adapter: { applyUpdate }, matchRoute, onRouteChange });
+    created.start();
+    created.commitInitialRender();
 
-    await router.visit('#section');
+    await created.router.visit('#section');
 
-    expect(events).toEqual(['loading', 'idle']);
-    expect(browserWrites.push).toHaveBeenCalledWith('/docs?tab=api#section');
-    expect(browserWrites.replace).not.toHaveBeenCalled();
+    expect(browser.entries().map((entry) => entry.url)).toEqual([
+      'http://localhost/docs?tab=api',
+      'http://localhost/docs?tab=api#section',
+    ]);
+    expect(onRouteChange).toHaveBeenLastCalledWith('/docs?tab=api#section');
+    expect(created.router.url.hash).toBe('#section');
+    // The browser scrolls to the fragment.
     expect(window.scrollTo).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
     expect(applyUpdate).not.toHaveBeenCalled();
     expect(matchRoute).not.toHaveBeenCalled();
     expect(documentStub.head.appendChild).not.toHaveBeenCalled();
+
+    await created.router.visit('#other', { replace: true });
+    expect(browser.entries().map((entry) => new URL(entry.url).hash)).toEqual(['', '#other']);
+    expect(created.router.url.hash).toBe('#other');
   });
 
   it('resolves query-only visits against the current page', async () => {
@@ -1964,55 +1979,44 @@ describe('createVoidRouter', () => {
     await expect(slowVisit).resolves.toBeUndefined();
   });
 
-  it('does not fetch or write history for same-page hash traversal visits', async () => {
+  it('restores entry positions without fetching on traversals between fragments', async () => {
     stubClientGlobals();
     window.location.pathname = '/docs';
     window.location.search = '?tab=api';
-    const applyUpdate = vi.fn();
-    vi.stubGlobal('fetch', vi.fn());
-
-    const { router } = await createTestRouter({ adapter: { applyUpdate } });
-
-    await router.visit('/docs?tab=api#section', {
-      preserveState: true,
-      _entryCommitted: true,
-      _scrollPosition: { x: 0, y: 42 },
-    });
-
-    expect(fetch).not.toHaveBeenCalled();
-    expect(applyUpdate).not.toHaveBeenCalled();
-    expect(browserWrites.push).not.toHaveBeenCalled();
-    expect(browserWrites.replace).not.toHaveBeenCalled();
-    expect(window.scrollTo).toHaveBeenCalledWith(0, 42);
-  });
-
-  it('does not fetch or write history for same-page hash removal traversal visits', async () => {
-    stubClientGlobals();
-    window.location.pathname = '/docs';
-    window.location.search = '?tab=api';
+    const browser = stubNavigationHistory();
     const applyUpdate = vi.fn();
     const matchRoute = vi.fn(() => 'home');
     vi.stubGlobal('fetch', vi.fn());
 
-    const { router } = await createTestRouter({ adapter: { applyUpdate }, matchRoute });
+    const created = await createTestRouter({ adapter: { applyUpdate }, matchRoute });
+    created.start();
+    created.commitInitialRender();
 
-    await router.visit('/docs?tab=api', {
-      preserveState: true,
-      _entryCommitted: true,
-      _scrollPosition: { x: 0, y: 42 },
-    });
+    Object.assign(window, { scrollY: 42 });
+    await created.router.visit('#section');
+    const section = browser.currentEntry.key;
 
+    // Back to the entry without a fragment.
+    Object.assign(window, { scrollY: 300 });
+    await browser.traverseTo('initial-entry').finished;
+    expect(window.scrollTo).toHaveBeenLastCalledWith(0, 42);
+    expect(created.router.url.hash).toBe('');
+
+    Object.assign(window, { scrollY: 42 });
+    await browser.traverseTo(section).finished;
+    expect(window.scrollTo).toHaveBeenLastCalledWith(0, 300);
+    expect(created.router.url.hash).toBe('#section');
+
+    expect(browser.entries()).toHaveLength(2);
     expect(fetch).not.toHaveBeenCalled();
     expect(applyUpdate).not.toHaveBeenCalled();
     expect(matchRoute).not.toHaveBeenCalled();
-    expect(browserWrites.push).not.toHaveBeenCalled();
-    expect(browserWrites.replace).not.toHaveBeenCalled();
-    expect(window.scrollTo).toHaveBeenCalledWith(0, 42);
   });
 
-  it('aborts pending navigations before same-page hash traversal visits', async () => {
+  it('aborts a pending visit when the browser moves to a fragment of the page', async () => {
     stubClientGlobals();
     window.location.pathname = '/docs';
+    stubNavigationHistory();
     const applyUpdate = vi.fn();
     let aborted = false;
     let resolveSlow!: (response: Response) => void;
@@ -2038,15 +2042,11 @@ describe('createVoidRouter', () => {
     const slowVisit = router.visit('/slow').catch(() => undefined);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    await router.visit('/docs#section', {
-      preserveState: true,
-      _entryCommitted: true,
-      _scrollPosition: { x: 0, y: 42 },
-    });
+    await router.visit('/docs#section');
 
     expect(aborted).toBe(true);
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(window.scrollTo).toHaveBeenCalledWith(0, 42);
+    expect(window.location.hash).toBe('#section');
 
     resolveSlow(pageJson({ component: 'slow', props: { title: 'Slow' } }));
     await slowVisit;
@@ -2898,6 +2898,7 @@ describe('superseded navigation commits (#507)', () => {
 
   it('keeps page and URL together when a same-page hash visit starts during an update', async () => {
     const page = setup();
+    stubNavigationHistory();
     const a = gate();
     page.updateGates.set('/a', a.promise);
     const onNavigationChange = vi.fn();
@@ -2939,6 +2940,7 @@ describe('superseded navigation commits (#507)', () => {
 
   it('keeps page and URL together after Back to a same-page hash entry during an update', async () => {
     const page = setup();
+    const browser = stubNavigationHistory();
     const a = gate();
     page.updateGates.set('/a', a.promise);
     const r = await router(page);
@@ -2947,8 +2949,7 @@ describe('superseded navigation commits (#507)', () => {
     const visitA = r.visit('/a');
     await entered(page, '/a');
     // Back from /#s to /: a same-page entry, so nothing new renders.
-    window.location.hash = '';
-    await r.visit('/', { _entryCommitted: true, _scrollPosition: null });
+    await browser.traverseTo('initial-entry').finished;
     a.release();
 
     await expect(visitA).resolves.toBeUndefined();
@@ -3147,7 +3148,7 @@ describe('superseded navigation commits (#507)', () => {
       expect(page.documentStub).toMatchObject({ title: 'Home' });
     });
 
-    it('ends a hash visit whose history write fails like any failed visit', async () => {
+    it('rejects a hash visit whose history write fails and stays ready', async () => {
       const page = setup();
       const onNavigationChange = vi.fn();
       const r = await router(page, { onNavigationChange });
@@ -3155,7 +3156,7 @@ describe('superseded navigation commits (#507)', () => {
 
       const visit = r.visit('#x');
       await expect(visit).rejects.toBe(error);
-      expect(states(onNavigationChange)).toEqual(['loading', 'idle']);
+      expect(states(onNavigationChange)).toEqual([]);
       expect(window.location.hash).toBe('');
 
       await r.visit('/#y');
@@ -3217,6 +3218,7 @@ describe('browser navigate events', () => {
     navigationType: NavigationType;
     key?: string;
     sourceElement?: unknown;
+    hashChange?: boolean;
   };
 
   /** Deliver the event a browser fires before it commits `url`. */
@@ -3234,7 +3236,7 @@ describe('browser navigate events', () => {
       },
       downloadRequest: null,
       formData: null,
-      hashChange: false,
+      hashChange: init.hashChange ?? false,
       info: undefined,
       navigationType: init.navigationType,
       signal: controller.signal,
@@ -3296,6 +3298,44 @@ describe('browser navigate events', () => {
     expect(fetchPage).not.toHaveBeenCalled();
     expect(window.scrollTo).not.toHaveBeenCalled();
     expect(applyUpdate).not.toHaveBeenCalled();
+  });
+
+  it('follows the URL of a fragment navigation it leaves to the browser', async () => {
+    const { fetchPage, applyUpdate } = setup();
+    window.location.pathname = '/docs';
+    const onRouteChange = vi.fn();
+    const created = await createTestRouter({ adapter: { applyUpdate }, onRouteChange });
+    created.start();
+
+    const click = dispatchNavigate('/docs#install', { navigationType: 'push', hashChange: true });
+    expect(click.interception).toBeUndefined();
+    commitEntry('/docs#install', 'install-entry', 'push');
+    expect(created.router.url.hash).toBe('#install');
+    expect(onRouteChange).toHaveBeenLastCalledWith('/docs#install');
+
+    // history.pushState() from app code changes the fragment without a hashChange.
+    const write = dispatchNavigate('/docs#usage', { navigationType: 'push' });
+    expect(write.interception).toBeUndefined();
+    commitEntry('/docs#usage', 'usage-entry', 'push');
+    expect(created.router.url.hash).toBe('#usage');
+
+    expect(fetchPage).not.toHaveBeenCalled();
+    expect(window.scrollTo).not.toHaveBeenCalled();
+    expect(applyUpdate).not.toHaveBeenCalled();
+  });
+
+  it('loads the page for a fragment navigation from an entry whose page never rendered', async () => {
+    const { fetchPage, applyUpdate } = setup();
+    const created = await createTestRouter({ adapter: { applyUpdate } });
+    created.start();
+    // The address shows /next while the page on screen is still the one at /.
+    window.location.pathname = '/next';
+
+    const click = dispatchNavigate('/next#details', { navigationType: 'push', hashChange: true });
+    expect(click.interception?.precommitHandler).toBeTypeOf('function');
+    await click.interception!.precommitHandler!({ redirect: vi.fn(), addHandler: vi.fn() });
+    expect(fetchPage).toHaveBeenCalledOnce();
+    expect(fetchPage.mock.calls[0]![0]).toBe('/next');
   });
 
   it('keeps a failed action away from an entry that another visit is rendering', async () => {
@@ -3600,7 +3640,7 @@ describe('visits to the current URL and fragment', () => {
     return fetchPage;
   }
 
-  it('scrolls to the fragment without adding a history entry', async () => {
+  it('adds no history entry and leaves the scroll to the browser', async () => {
     const fetchPage = setup();
     const browser = stubNavigationHistory();
     const created = await createTestRouter();
@@ -3610,7 +3650,7 @@ describe('visits to the current URL and fragment', () => {
     await created.router.visit('/docs#top');
     expect(browser.entries()).toHaveLength(1);
     expect(browser.currentEntry.key).toBe('initial-entry');
-    expect(window.scrollTo).toHaveBeenCalledWith(0, 0);
+    expect(window.scrollTo).not.toHaveBeenCalled();
     expect(fetchPage).not.toHaveBeenCalled();
 
     // Another fragment of the page is a new entry.
@@ -3633,31 +3673,5 @@ describe('visits to the current URL and fragment', () => {
     expect(applyUpdate).toHaveBeenCalledOnce();
     expect(browser.entries()).toHaveLength(1);
     expect(browser.currentEntry.key).toBe('initial-entry');
-  });
-
-  it('replaces the entry when the engine publishes the fragment itself', async () => {
-    setup();
-    const engine = await createPageNavigationEngine({
-      adapter: {
-        createDeferred: () => ({}),
-        isLoading: () => false,
-        resolveDeferred: (_ref, value) => value,
-        rejectDeferred: (_ref, error) => error,
-      },
-      components: { home: loadComponent },
-      layoutTree: {},
-      routeMeta: {},
-      matchRoute: () => 'home',
-      viewTransitions: false,
-      prefetchHoverDelay: 75,
-      prefetchDefaultCacheFor: parseCacheFor('30s'),
-    });
-
-    await engine.prepareVisit('/docs#top').shell;
-    expect(browserWrites.replace).toHaveBeenCalledWith('/docs#top');
-    expect(browserWrites.push).not.toHaveBeenCalled();
-
-    await engine.prepareVisit('/docs#other').shell;
-    expect(browserWrites.push).toHaveBeenCalledWith('/docs#other');
   });
 });
