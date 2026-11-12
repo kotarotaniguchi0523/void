@@ -518,6 +518,8 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
       if (useTransition && document.startViewTransition) {
         // The callback runs on a later frame. A newer visit started by then renders instead.
         const transition = document.startViewTransition(applyUpdate);
+        // A rejected callback rejects these too; the visit reports the error once, below.
+        void Promise.allSettled([transition.ready, transition.finished]);
         await transition.updateCallbackDone;
       } else {
         await applyUpdate();

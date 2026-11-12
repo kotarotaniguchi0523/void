@@ -2978,6 +2978,35 @@ describe('superseded navigation commits (#507)', () => {
     expect(window.location.pathname).toBe('/b');
   });
 
+  it('reports a render error in a view transition once, through the visit', async () => {
+    const page = setup();
+    const error = new Error('render failed');
+    page.applyUpdate.mockRejectedValueOnce(error);
+    Object.assign(document, {
+      // As in browsers: a rejected callback also rejects `ready` and `finished`.
+      startViewTransition(callback: () => Promise<void>) {
+        const updateCallbackDone = Promise.resolve().then(callback);
+        return {
+          updateCallbackDone,
+          ready: updateCallbackDone.then(() => {}),
+          finished: updateCallbackDone.then(() => {}),
+        };
+      },
+    });
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      const r = await router(page);
+
+      await expect(r.visit('/a', { viewTransition: true })).rejects.toBe(error);
+      // Node reports unhandled rejections after the microtask queue drains.
+      await new Promise((resolve) => setTimeout(resolve));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', unhandled);
+    }
+  });
+
   it('skips an older engine commit after a newer one, as the React adapter calls it', async () => {
     const page = setup();
     const engine = await createPageNavigationEngine({
