@@ -410,6 +410,7 @@ describe('Pages scroll restoration', () => {
         formData: null,
         hashChange: true,
         navigationType: 'push',
+        signal: new AbortController().signal,
       }),
     );
     page.changeEntry(fragment, 'push');
