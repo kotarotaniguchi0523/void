@@ -2,7 +2,7 @@ import { action, createLinkClickHandler, Form, Link, useForm, useRouter } from '
 import { startTransition } from 'react';
 import type { Props } from './scroll-restoration.server.ts';
 
-export default function ScrollRestorationPage({ requestId }: Props) {
+export default function ScrollRestorationPage({ requestId, page }: Props) {
   const visitUser = createLinkClickHandler(useRouter(), { preserveScroll: true });
   const form = useForm('/scroll-restoration?touch', {});
   return (
@@ -10,6 +10,7 @@ export default function ScrollRestorationPage({ requestId }: Props) {
       <h1>Scroll restoration</h1>
       <p>Scroll down, follow a link, then use the browser Back button.</p>
       <output data-testid="scroll-request">{requestId}</output>
+      <output data-testid="scroll-page">{page}</output>
       <a href="/users/1?action-race=1" data-testid="race-link" onClick={visitUser}>
         Visit user with preserved scroll
       </a>

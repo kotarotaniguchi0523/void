@@ -153,7 +153,7 @@ import { flushSync, hydrate, mount, tick } from "svelte";
 import { writable } from "svelte/store";
 import App from "@void/svelte/App.svelte";
 import { setActionRouter } from "@void/svelte/internal";
-import { createRouterFacade, createVoidRouter, idleNavigationState } from "void/pages-client";
+import { showTerminalPageError, createRouterFacade, createVoidRouter, idleNavigationState } from "void/pages-client";
 import { parseCacheFor } from "void/pages-prefetch";
 
 ${generateComponentManifest(scan, pagesDir)}
@@ -181,6 +181,8 @@ const { router, initialPageData, initialComponent, initialLayouts, start, commit
         // Flush inside the router's call so a render exception propagates to
         // the visit instead of throwing in Svelte's queued update.
         flushSync(() => {
+          boundaryGenerationStore.update(n => n + 1);
+          pageIdStore.set(pageData.component);
           propsStore.set(pageData.props);
           sharedStore.set(pageData.shared || {});
           routeParams = pageData.params || {};

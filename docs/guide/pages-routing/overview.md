@@ -365,7 +365,11 @@ import { createLinkClickHandler, useLinkState, useRouter } from '@void/react';
 export function UsersLink() {
   const users = useLinkState('/users');
   const click = createLinkClickHandler(useRouter(), { replace: true, preserveScroll: true });
-  return <a href="/users" {...users.attributes} onClick={click}>Users</a>;
+  return (
+    <a href="/users" {...users.attributes} onClick={click}>
+      Users
+    </a>
+  );
 }
 ```
 
@@ -399,7 +403,11 @@ import { createLinkClickHandler, useLinkState, useRouter } from '@void/solid';
 export function UsersLink() {
   const users = useLinkState('/users');
   const click = createLinkClickHandler(useRouter(), { replace: true, preserveScroll: true });
-  return <a href="/users" {...users.attributes} onClick={click}>Users</a>;
+  return (
+    <a href="/users" {...users.attributes} onClick={click}>
+      Users
+    </a>
+  );
 }
 ```
 

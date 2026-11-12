@@ -352,7 +352,8 @@ function generateClientEntry(
 import { createApp, createSSRApp, h, reactive, provide, shallowRef, nextTick, onErrorCaptured, ref } from "vue";
 import { createDeferred, resolveDeferred, rejectDeferred } from "@void/vue/deferred";
 import { setActionRouter } from "@void/vue/internal";
-import { createRouterFacade, createVoidRouter, idleNavigationState } from "void/pages-client";
+import { PageErrorBoundary } from "@void/vue/pages-boundary";
+import { pageBoundarySlots, showTerminalPageError, createRouterFacade, createVoidRouter, idleNavigationState } from "void/pages-client";
 import { parseCacheFor } from "void/pages-prefetch";
 
 ${generateComponentManifest(scan, pagesDir)}
@@ -368,6 +369,7 @@ let currentPageId = "";
 const routeUrl = ref(window.location.pathname + window.location.search + window.location.hash);
 const navigation = reactive(idleNavigationState());
 let captureRenderError;
+const hasPageBoundaries = Object.keys(boundaryManifest.plans).length > 0;
 
 ${PATCH_PROPS_RUNTIME}
 
@@ -386,8 +388,12 @@ const { router, initialPageData, initialComponent, initialLayouts, start, commit
       async applyUpdate(pageData, comp, layouts, options) {
         let failure;
         const capture = (error) => { failure ??= { error }; };
-        captureRenderError = capture;
+        // Page boundaries own render failures when the app declares any; what
+        // escapes them reaches the terminal error handler.
+        if (!hasPageBoundaries) captureRenderError = capture;
         try {
+          currentPageId = pageData.component;
+          boundaryGeneration.value++;
           if (!options?.preserveState) currentPageKey.value++;
           replaceRecord(shared, pageData.shared || {});
           replaceRecord(params, pageData.params || {});
@@ -416,7 +422,7 @@ const { router, initialPageData, initialComponent, initialLayouts, start, commit
       navigation.location = next.location;
       navigation.method = next.method;
     },
-  }).catch(error => { if (Object.keys(boundaryManifest.plans).length) showTerminalPageError(); throw error; });
+  }).catch(error => { if (hasPageBoundaries) showTerminalPageError(); throw error; });
 
 const reactiveRouter = createRouterFacade(router, () => routeUrl.value, () => params);
 
@@ -464,7 +470,7 @@ const app = createVoidApp({
     };
   }
 });
-if (Object.keys(boundaryManifest.plans).length) app.config.errorHandler = () => showTerminalPageError(routeUrl.value);
+if (hasPageBoundaries) app.config.errorHandler = () => showTerminalPageError(routeUrl.value);
 
 app.mount(appEl);
 appEl.setAttribute("data-hydrated", "true");

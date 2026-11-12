@@ -240,15 +240,31 @@ export function createRouterFacade(
     },
 
     visit(url, options = {}) {
-      return router.visit(url, publicRouterOptions(options, [
-        'preserveScroll', 'preserveState', 'replace', 'viewTransition', 'resolveOn',
-      ])).then(() => {});
+      return router
+        .visit(
+          url,
+          publicRouterOptions(options, [
+            'preserveScroll',
+            'preserveState',
+            'replace',
+            'viewTransition',
+            'resolveOn',
+          ]),
+        )
+        .then(() => {});
     },
 
     refresh(options = {}) {
-      return router.refresh(publicRouterOptions(options, [
-        'preserveScroll', 'preserveState', 'viewTransition', 'resolveOn',
-      ])).then(() => {});
+      return router
+        .refresh(
+          publicRouterOptions(options, [
+            'preserveScroll',
+            'preserveState',
+            'viewTransition',
+            'resolveOn',
+          ]),
+        )
+        .then(() => {});
     },
 
     prefetch(url, options = {}) {
@@ -331,10 +347,18 @@ export async function submitAction(
   router: VoidRouter | RuntimeVoidRouter,
   url: string,
   options: InternalVisitOptions,
+  errorOptions?: { throwOnError?: boolean },
 ): Promise<ActionResult> {
   const transport = actionTransportOf(router);
   if (!transport) {
     throw new Error('submitAction(): internal Pages action router is not available.');
+  }
+  // An action on the page it runs on re-renders that page, so its loader sees the
+  // page query and the URL, scroll and history entry stay as they are.
+  const page = withPageQuery(url, window.location);
+  if (page.preserved) {
+    url = page.url;
+    options = { ...options, _preservedQuery: page.preserved };
   }
   try {
     const pageData = await transport.visit(url, options);

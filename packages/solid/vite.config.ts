@@ -3,6 +3,7 @@ import { defineConfig } from 'vite-plus';
 export default defineConfig({
   pack: {
     entry: [
+      'src/runtime/PageErrorBoundary.ts',
       'src/plugin.ts',
       'src/runtime/index.ts',
       'src/runtime/context.ts',

@@ -7,8 +7,8 @@ import { pathToFileURL } from 'node:url';
 import type { Component } from 'svelte';
 import { compile, compileModule } from 'svelte/compiler';
 import { transformWithOxc } from 'vite';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vite-plus/test';
-import { createActionClient, type RuntimeVoidRouter } from 'void/pages-client';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vite-plus/test';
+import { createActionClient, type RuntimeVoidRouter, type VoidRouter } from 'void/pages-client';
 
 type TestForm = {
   readonly data: Record<string, unknown>;
@@ -98,9 +98,12 @@ afterEach(() => {
   }
 });
 
-function mountForm(defaults: Record<string, unknown>): TestForm {
-  const router = { _hoverDelay: 75, visit: async () => ({}) } as unknown as RuntimeVoidRouter;
-  createActionClient().setActionRouter(router);
+function mountForm(
+  defaults: Record<string, unknown>,
+  router = { visit: async () => ({}) } as unknown as VoidRouter,
+  options?: { resetOnSuccess?: boolean },
+): TestForm {
+  createActionClient().setActionRouter(router as unknown as RuntimeVoidRouter);
   let form!: TestForm;
   mounted.push(
     svelte.mount(Host, {
