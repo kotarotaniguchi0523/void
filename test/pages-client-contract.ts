@@ -1109,6 +1109,48 @@ export function registerSharedClientTests({
     }
   });
 
+  it('scrolls without a new entry when a link repeats the current fragment', async ({ expect }) => {
+    const page = await newPage();
+    try {
+      await page.goto(BASE + '/native-anchor');
+      await waitForHydration(page);
+      // A plain anchor: the playground's fragment links start router visits.
+      const clickFragment = () =>
+        page.evaluate(() => {
+          const anchor = document.createElement('a');
+          anchor.href = '#named-section';
+          document.body.appendChild(anchor);
+          anchor.click();
+          anchor.remove();
+        });
+      const targetTop = () =>
+        page.evaluate(
+          () => document.querySelector('a[name="named-section"]')!.getBoundingClientRect().top,
+        );
+      const entryState = () =>
+        page.evaluate(() => ({
+          entries: navigation.entries().length,
+          key: navigation.currentEntry!.key,
+          length: history.length,
+        }));
+      await clickFragment();
+      await page.waitForURL(BASE + '/native-anchor#named-section');
+      await expect.poll(targetTop).toBeCloseTo(0, 0);
+      await page.waitForFunction(() => !navigation.transition);
+      const before = await entryState();
+      await page.evaluate(() => window.scrollTo(0, 0));
+      expect(await targetTop()).toBeGreaterThan(100);
+
+      await clickFragment();
+      await expect.poll(targetTop).toBeCloseTo(0, 0);
+      await page.waitForFunction(() => !navigation.transition);
+      expect(page.url()).toBe(BASE + '/native-anchor#named-section');
+      expect(await entryState()).toEqual(before);
+    } finally {
+      await page.context().close();
+    }
+  });
+
   if (coverage === 'smoke') {
     return;
   }

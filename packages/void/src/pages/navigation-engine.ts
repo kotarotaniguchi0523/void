@@ -1664,7 +1664,18 @@ export async function createPageNavigationEngine(
       !options._refresh &&
       target.pathname + target.search === _currentFetchUrl &&
       (event.hashChange || Boolean(target.hash));
-    if (event.hashChange && !ownHashVisit && !traversal) {
+    const anchor = event.sourceElement?.closest('a[href],area[href]');
+    const link =
+      !!anchor && !anchor.hasAttribute('download') && !anchor.hasAttribute('data-void-reload');
+    // A link to the current URL and fragment is also a native fragment navigation:
+    // the browser scrolls and replaces the entry, but reports hashChange as false.
+    const nativeFragmentNavigation =
+      event.hashChange ||
+      (link &&
+        Boolean(target.hash) &&
+        event.destination.sameDocument &&
+        target.href === documentBaseUrl().href);
+    if (nativeFragmentNavigation && !ownHashVisit && !traversal) {
       if (_pendingResource) {
         abortPendingResource(_pendingResource);
       }
@@ -1674,12 +1685,7 @@ export async function createPageNavigationEngine(
     }
     // A classic history write also emits navigate. Only claim a link, a
     // traversal, or a visit initiated by this router.
-    const anchor = event.sourceElement?.closest('a[href],area[href]');
-    if (
-      !own &&
-      !traversal &&
-      (!anchor || anchor.hasAttribute('download') || anchor.hasAttribute('data-void-reload'))
-    ) {
+    if (!own && !traversal && !link) {
       return;
     }
     if (traversal && !event.destination.sameDocument) {

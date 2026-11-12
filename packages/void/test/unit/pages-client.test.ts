@@ -3230,3 +3230,90 @@ describe('superseded navigation commits (#507)', () => {
     });
   });
 });
+
+describe('browser navigate events', () => {
+  type NavigateInit = {
+    navigationType: NavigationType;
+    key?: string;
+    sourceElement?: unknown;
+  };
+
+  /** Deliver the event a browser fires before it commits `url`. */
+  function dispatchNavigate(url: string, init: NavigateInit) {
+    const controller = new AbortController();
+    const result: { controller: AbortController; interception?: NavigationInterceptOptions } = {
+      controller,
+    };
+    const event = Object.assign(new Event('navigate', { cancelable: true }), {
+      canIntercept: true,
+      destination: {
+        url: new URL(url, window.location.origin).href,
+        key: init.key ?? '',
+        sameDocument: true,
+      },
+      downloadRequest: null,
+      formData: null,
+      hashChange: false,
+      info: undefined,
+      navigationType: init.navigationType,
+      signal: controller.signal,
+      sourceElement: init.sourceElement ?? null,
+      intercept(value: NavigationInterceptOptions) {
+        result.interception = value;
+      },
+    });
+    window.navigation.dispatchEvent(event);
+    return result;
+  }
+
+  /** Make `url` the current entry, as the browser does when a navigation commits. */
+  function commitEntry(url: string, key: string, navigationType: NavigationType) {
+    const destination = new URL(url, window.location.origin);
+    const { pathname, search, hash } = destination;
+    Object.assign(window.location, { pathname, search, hash });
+    const from = window.navigation.currentEntry;
+    Object.assign(window.navigation, {
+      currentEntry: Object.assign(new EventTarget(), {
+        key,
+        url: destination.href,
+        getState: () => undefined,
+      }),
+    });
+    window.navigation.dispatchEvent(
+      Object.assign(new Event('currententrychange'), { from, navigationType }),
+    );
+  }
+
+  function setup() {
+    stubClientGlobals();
+    const fetchPage = vi.fn(async (url: string) => pageJson({ component: 'home', url, props: {} }));
+    vi.stubGlobal('fetch', fetchPage);
+    return { fetchPage, applyUpdate: vi.fn() };
+  }
+
+  it('leaves a link to the current URL and fragment to the browser', async () => {
+    const { fetchPage, applyUpdate } = setup();
+    Object.assign(window.location, { pathname: '/docs', hash: '#install' });
+    const created = await createTestRouter({ adapter: { applyUpdate } });
+    created.start();
+    const navigate = vi.spyOn(window.navigation, 'navigate');
+    const anchor = { hasAttribute: () => false };
+
+    const click = dispatchNavigate('/docs#install', {
+      navigationType: 'replace',
+      sourceElement: { closest: () => anchor },
+    });
+    // An interception would start its own history write from the precommit handler.
+    await click.interception?.precommitHandler?.({ redirect: vi.fn(), addHandler: vi.fn() });
+    expect(click.interception).toBeUndefined();
+    expect(navigate).not.toHaveBeenCalled();
+
+    // The browser replaces the entry and scrolls to the fragment itself.
+    commitEntry('/docs#install', 'docs-entry', 'replace');
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(navigate).not.toHaveBeenCalled();
+    expect(fetchPage).not.toHaveBeenCalled();
+    expect(window.scrollTo).not.toHaveBeenCalled();
+    expect(applyUpdate).not.toHaveBeenCalled();
+  });
+});
