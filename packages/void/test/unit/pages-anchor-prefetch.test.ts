@@ -47,6 +47,29 @@ describe('delegated anchor prefetch', () => {
     });
   });
 
+  it('skips the current page and other origins', () => {
+    const prefetch = vi.fn(async () => {});
+    addAnchor(window.location.pathname + window.location.search + '#section', 'mount');
+    addAnchor('https://example.com/users', 'mount');
+    addAnchor('/users?page=2#top', 'mount');
+    stopPrefetch = startAnchorPrefetch({ prefetch, _hoverDelay: 75 });
+
+    expect(prefetch).toHaveBeenCalledExactlyOnceWith('/users?page=2', {});
+  });
+
+  it('does not prefetch on a constrained connection', () => {
+    const prefetch = vi.fn(async () => {});
+    addAnchor('/users', 'mount');
+    vi.stubGlobal('navigator', { connection: { saveData: true } });
+    try {
+      stopPrefetch = startAnchorPrefetch({ prefetch, _hoverDelay: 75 });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(prefetch).not.toHaveBeenCalled();
+  });
+
   it('uses the explicit strategy in place of the app default', () => {
     const prefetch = vi.fn(async () => {});
     const anchor = addAnchor('/users', 'hover');

@@ -2,7 +2,7 @@ import type { Href } from 'void/routes';
 import {
   linkPrefetchStrategies,
   observeLinkVisible,
-  prefetchLink,
+  prefetchResolvedLink,
   resolveSameOrigin,
 } from './link.ts';
 import type { PrefetchOptions } from './navigation-engine.ts';
@@ -36,6 +36,7 @@ export function startAnchorPrefetch(router: {
     ['', '_self'].includes(anchor.target.toLowerCase());
 
   function prefetch(anchor: HTMLAnchorElement) {
+    // The only origin check on this path: the router is handed a bare path.
     if (
       !anchor.isConnected ||
       !eligible(anchor) ||
@@ -59,7 +60,7 @@ export function startAnchorPrefetch(router: {
         return;
       }
     }
-    prefetchLink(router, href as Href, cacheFor);
+    prefetchResolvedLink(router, anchor, href as Href, cacheFor);
   }
 
   function stopHover(anchor: HTMLAnchorElement) {

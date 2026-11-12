@@ -259,7 +259,7 @@ function isConstrainedConnection(): boolean {
 
 /** Link's automatic prefetch. `router.prefetch()` called directly is not limited by the connection. */
 export function prefetchLink(
-  router: { prefetch(href: Href, options?: PrefetchOptions): Promise<unknown> } | null | undefined,
+  router: PrefetchRouter | null | undefined,
   href: Href,
   cacheFor: CacheForInput | undefined,
 ): void {
@@ -269,10 +269,35 @@ export function prefetchLink(
 
   // Use the same host/protocol check as link state, including custom schemes.
   const target = resolveSameOrigin(href, documentBaseUrl());
-  if (!target) {
-    return;
+  if (target) {
+    prefetchTarget(router, target, href, cacheFor);
   }
+}
 
+/**
+ * `prefetchLink` for a destination the caller has already resolved as same-origin,
+ * so the delegated anchor listener does not resolve each anchor twice.
+ */
+export function prefetchResolvedLink(
+  router: PrefetchRouter,
+  target: PrefetchTarget,
+  href: Href,
+  cacheFor: CacheForInput | undefined,
+): void {
+  if (!isConstrainedConnection()) {
+    prefetchTarget(router, target, href, cacheFor);
+  }
+}
+
+type PrefetchRouter = { prefetch(href: Href, options?: PrefetchOptions): Promise<unknown> };
+type PrefetchTarget = Pick<URL, 'pathname' | 'search'>;
+
+function prefetchTarget(
+  router: PrefetchRouter,
+  target: PrefetchTarget,
+  href: Href,
+  cacheFor: CacheForInput | undefined,
+): void {
   const current = window.location.pathname + window.location.search;
   if (target.pathname + target.search === current) {
     return;
