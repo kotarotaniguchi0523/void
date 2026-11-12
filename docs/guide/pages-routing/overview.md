@@ -169,6 +169,8 @@ The destination can still be rendering after the address changes.
 
 If a native link cannot prepare its page data or component, Void loads the destination as a document. Handle preparation errors from programmatic `router.visit()` calls with `try/catch`.
 
+A plain anchor navigates on the client only when its URL matches a page file. For a URL that middleware or a route handler [rewrites](../edge/rewrites.md) or redirects to a page, such as `/dashboard` or `/logout`, use `Link`: it asks the server for the page and navigates without reloading the document. If the response is not a page, the browser loads the URL as a document.
+
 Use the `Link` component for checked `href` values, prefetching, active and pending styles, or other link options. Build dynamic URLs with [`routeUrl()`](../type-safety.md#typed-urls-and-navigation) to check the route pattern and its parameters:
 
 ::: code-group

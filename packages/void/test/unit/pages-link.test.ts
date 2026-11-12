@@ -11,6 +11,7 @@ import {
   LINK_VISIBLE_PREFETCH_DELAY,
   linkActiveAttributes,
   linkPendingAttributes,
+  linkPrefetchAttributes,
   linkPrefetchStrategies,
   observeLinkVisible,
   prefetchLink,
@@ -76,6 +77,19 @@ describe('native GET Link contract', () => {
     expect(linkPrefetchStrategies({ prefetch: 'visible' }, 'mount')).toEqual(['visible']);
     expect(linkPrefetchStrategies({ prefetch: false }, 'hover')).toEqual([]);
     expect(linkPrefetchStrategies({ reloadDocument: true }, 'hover')).toEqual([]);
+  });
+
+  it('marks every Link anchor, on the server and the client', () => {
+    const marker = { 'data-void-link': '' };
+    for (const router of [createSsrRouter('/'), createRouter()]) {
+      expect(linkPrefetchAttributes(router, {})).toEqual({
+        ...marker,
+        'data-void-prefetch': 'default',
+      });
+      expect(linkPrefetchAttributes(router, { prefetch: false })).toEqual(marker);
+      expect(linkPrefetchAttributes(router, { reloadDocument: true })).toEqual(marker);
+    }
+    expect(linkPrefetchAttributes(null, {})).toEqual({});
   });
 });
 

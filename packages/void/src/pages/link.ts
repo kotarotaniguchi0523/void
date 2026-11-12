@@ -68,11 +68,20 @@ export function linkPrefetchStrategies(
   return typeof prefetch === 'string' ? [prefetch] : prefetch;
 }
 
-/** Use the same delegated prefetching for Link and authored anchors. */
+/**
+ * The attribute that marks an anchor rendered by Link. The router fetches a marked link
+ * even when its URL is not a known page: the server may rewrite or redirect it to one.
+ */
+export const LINK_MARKER_ATTRIBUTE = 'data-void-link';
+
+/**
+ * Attributes every Link renders on its anchor, on the server and the client: the Link
+ * marker, and the same delegated prefetching that authored anchors use.
+ */
 export function linkPrefetchAttributes(
   router: VoidRouter | null | undefined,
   props: Pick<BaseLinkProps, 'prefetch' | 'cacheFor'> & { reloadDocument?: boolean },
-): { 'data-void-prefetch'?: string; 'data-void-cache-for'?: string } {
+): { 'data-void-link'?: ''; 'data-void-prefetch'?: string; 'data-void-cache-for'?: string } {
   if (!router) {
     return {};
   }
@@ -81,10 +90,11 @@ export function linkPrefetchAttributes(
   const strategy =
     !props.reloadDocument && props.prefetch === undefined ? 'default' : strategies.join(' ');
   if (!strategy) {
-    return {};
+    return { [LINK_MARKER_ATTRIBUTE]: '' };
   }
   const { cacheFor } = props;
   return {
+    [LINK_MARKER_ATTRIBUTE]: '',
     'data-void-prefetch': strategy,
     ...(cacheFor !== undefined && { 'data-void-cache-for': String(cacheFor) }),
   };

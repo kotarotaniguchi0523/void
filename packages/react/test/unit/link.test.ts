@@ -34,6 +34,14 @@ describe('GET-only Link', () => {
     expect(html).not.toContain('<button');
   });
 
+  it('marks its anchor for the router, with or without prefetching', () => {
+    expect(renderAt('/', { href: '/users' })).toContain('data-void-link=""');
+    expect(renderAt('/', { href: '/users', prefetch: false })).toContain('data-void-link=""');
+    expect(renderAt('/', { href: '/users', 'data-void-reload': '' } as LinkProps)).toContain(
+      'data-void-link=""',
+    );
+  });
+
   it('does not add a touch-action style to native anchors', () => {
     expect(renderAt('/', { href: '/users' })).not.toContain('touch-action');
     const html = renderAt('/', { href: '/users', style: { color: 'red' } });

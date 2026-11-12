@@ -3412,4 +3412,108 @@ describe('browser navigate events', () => {
     await vi.waitFor(() => expect(applyUpdate).toHaveBeenCalledOnce());
     expect(fetchPage).toHaveBeenCalledOnce();
   });
+
+  describe('URLs outside the route table', () => {
+    /** `/dashboard` and `/api/health` are not pages: only the server knows what they serve. */
+    async function setupUnmatched(respond: (url: string) => Response) {
+      stubClientGlobals();
+      const fetchPage = vi.fn(async (url: string) => respond(url));
+      vi.stubGlobal('fetch', fetchPage);
+      const applyUpdate = vi.fn();
+      const created = await createTestRouter({
+        adapter: { applyUpdate },
+        matchRoute: (path) => (path === '/dashboard' || path === '/api/health' ? null : 'home'),
+      });
+      created.start();
+      return { fetchPage, applyUpdate };
+    }
+
+    function clickAnchor(url: string, attributes: Array<string>) {
+      const anchor = { hasAttribute: (name: string) => attributes.includes(name) };
+      return dispatchNavigate(url, {
+        navigationType: 'push',
+        sourceElement: { closest: () => anchor },
+      }).interception;
+    }
+
+    const page = (url: string) => pageJson({ component: 'home', url, props: {} });
+
+    it('fetches a Link once and renders the page the server selects', async () => {
+      const { fetchPage, applyUpdate } = await setupUnmatched(page);
+      const interception = clickAnchor('/dashboard', ['data-void-link']);
+      expect(interception?.precommitHandler).toBeTypeOf('function');
+
+      const handlers: Array<() => unknown> = [];
+      const redirect = vi.fn();
+      await interception!.precommitHandler!({
+        redirect,
+        addHandler: (handler) => {
+          handlers.push(handler);
+        },
+      });
+      expect(redirect).not.toHaveBeenCalled();
+      expect(handlers).toHaveLength(1);
+      commitEntry('/dashboard', 'dashboard-entry', 'push');
+      await handlers[0]!();
+
+      expect(fetchPage).toHaveBeenCalledOnce();
+      expect(fetchPage.mock.calls[0]![0]).toBe('/dashboard');
+      expect(applyUpdate).toHaveBeenCalledOnce();
+      expect(window.location.href).toBeUndefined();
+    });
+
+    it('leaves a plain anchor to the browser', async () => {
+      const { fetchPage, applyUpdate } = await setupUnmatched(page);
+      expect(clickAnchor('/dashboard', [])).toBeUndefined();
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(fetchPage).not.toHaveBeenCalled();
+      expect(applyUpdate).not.toHaveBeenCalled();
+    });
+
+    it.each(['download', 'data-void-reload'])(
+      'leaves a Link with %s to the browser',
+      async (attribute) => {
+        const { fetchPage } = await setupUnmatched(page);
+        expect(clickAnchor('/dashboard', ['data-void-link', attribute])).toBeUndefined();
+        expect(fetchPage).not.toHaveBeenCalled();
+      },
+    );
+
+    it('loads the document when a Link does not return a page', async () => {
+      const { fetchPage, applyUpdate } = await setupUnmatched(() =>
+        Response.json({ status: 'ok' }),
+      );
+      const interception = clickAnchor('/api/health', ['data-void-link']);
+      expect(interception?.precommitHandler).toBeTypeOf('function');
+
+      const addHandler = vi.fn();
+      // The precommit handler settles without an error: the document load takes over.
+      await interception!.precommitHandler!({ redirect: vi.fn(), addHandler });
+
+      expect(window.location.href).toBe('/api/health');
+      expect(fetchPage).toHaveBeenCalledOnce();
+      expect(addHandler).not.toHaveBeenCalled();
+      expect(applyUpdate).not.toHaveBeenCalled();
+    });
+
+    it('renders a same-document entry again on traversal', async () => {
+      const { fetchPage, applyUpdate } = await setupUnmatched(page);
+
+      const back = dispatchNavigate('/dashboard', {
+        navigationType: 'traverse',
+        key: 'dashboard-entry',
+      });
+      expect(back.interception?.handler).toBeTypeOf('function');
+      commitEntry('/dashboard', 'dashboard-entry', 'traverse');
+      await back.interception!.handler!();
+      expect(fetchPage).toHaveBeenCalledOnce();
+      expect(applyUpdate).toHaveBeenCalledOnce();
+
+      // A traversal that the router could not intercept is rendered after it commits.
+      commitEntry('/api/health', 'other-entry', 'traverse');
+      await vi.waitFor(() => expect(fetchPage).toHaveBeenCalledTimes(2));
+      expect(fetchPage.mock.calls[1]![0]).toBe('/api/health');
+      await vi.waitFor(() => expect(applyUpdate).toHaveBeenCalledTimes(2));
+    });
+  });
 });

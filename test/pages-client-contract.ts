@@ -1794,6 +1794,78 @@ export function registerSharedClientTests({
     }
   });
 
+  it('Link navigates on the client to a URL that the server redirects or rewrites to a page', async () => {
+    const page = await newPage();
+    const documents: Array<string> = [];
+    try {
+      const html = await (await page.request.get(BASE + '/link-behavior')).text();
+      expect(html).toMatch(/<a(?=[^>]*data-testid="server-rewrite-link")(?=[^>]*data-void-link)/);
+      await page.goto(BASE + '/link-behavior');
+      await waitForHydration(page);
+      const timeOrigin = await page.evaluate(() => performance.timeOrigin);
+      page.on('request', (request) => {
+        if (request.isNavigationRequest()) {
+          documents.push(request.url());
+        }
+      });
+
+      // routes/link-redirect.ts redirects to a page: the address shows the page's URL.
+      await page.click('[data-testid="server-redirect-link"]');
+      await page.getByText('alice@example.com').waitFor();
+      expect(page.url()).toBe(BASE + '/users/1');
+
+      await page.evaluate(() => navigation.back().finished?.then(() => {}));
+      expect(page.url()).toBe(BASE + '/link-behavior');
+      await page.getByTestId('server-rewrite-link').waitFor();
+
+      // routes/link-rewrite.ts serves a page under its own URL.
+      await page.click('[data-testid="server-rewrite-link"]');
+      await page.getByText('bob@example.com').waitFor();
+      expect(page.url()).toBe(BASE + '/link-rewrite');
+
+      // History traversal renders the rewritten entry again.
+      await page.evaluate(() => navigation.back().finished?.then(() => {}));
+      await page.getByTestId('server-rewrite-link').waitFor();
+      await page.evaluate(() => navigation.forward().finished?.then(() => {}));
+      expect(page.url()).toBe(BASE + '/link-rewrite');
+      await page.getByText('bob@example.com').waitFor({ timeout: 5000 });
+
+      expect(documents).toEqual([]);
+      expect(await page.evaluate(() => performance.timeOrigin)).toBe(timeOrigin);
+    } finally {
+      await page.context().close();
+    }
+  });
+
+  it('loads the document once when a Link outside the route table is not a page', async () => {
+    const page = await newPage();
+    const errors: Array<string> = [];
+    const documents: Array<string> = [];
+    try {
+      await page.goto(BASE + '/link-behavior');
+      await waitForHydration(page);
+      page.on('pageerror', (error) => errors.push(error.message));
+      page.on('request', (request) => {
+        if (request.isNavigationRequest()) {
+          documents.push(request.url());
+        }
+      });
+
+      await page.click('[data-testid="non-page-link"]', { noWaitAfter: true });
+      await page.waitForURL(BASE + '/api/health');
+      await page.waitForLoadState();
+      expect(await page.evaluate(() => document.body.textContent)).toContain('"status":"ok"');
+      expect(documents).toEqual([BASE + '/api/health']);
+      expect(errors).toEqual([]);
+
+      await page.goBack();
+      await page.getByTestId('non-page-link').waitFor();
+      expect(page.url()).toBe(BASE + '/link-behavior');
+    } finally {
+      await page.context().close();
+    }
+  });
+
   it('Link follows a prebuilt query URL', async () => {
     const page = await newPage();
     try {

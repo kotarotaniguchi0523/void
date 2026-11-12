@@ -60,6 +60,7 @@ describe('Link delegated prefetch attributes', () => {
     const { router, prefetch } = createRouter();
     const link = await mountLink(router, { href: '/users' });
     expect(link.getAttribute('data-void-prefetch')).toBe('default');
+    expect(link.getAttribute('data-void-link')).toBe('');
     expect(prefetch).not.toHaveBeenCalled();
   });
 
@@ -80,6 +81,8 @@ describe('Link delegated prefetch attributes', () => {
       const { router } = createRouter();
       const link = await mountLink(router, { href: '/users', ...props });
       expect(link.hasAttribute('data-void-prefetch')).toBe(false);
+      // The client renders the same marker as the server.
+      expect(link.getAttribute('data-void-link')).toBe('');
     },
   );
 });

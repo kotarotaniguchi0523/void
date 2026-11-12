@@ -49,6 +49,12 @@ function preventClick(event: Event) {
     </p>
 
     <p>
+      <Link href="/link-redirect" data-testid="server-redirect-link">Server redirect</Link>
+      <Link href="/link-rewrite" data-testid="server-rewrite-link">Server rewrite</Link>
+      <Link href="/api/health" data-testid="non-page-link">Not a page</Link>
+    </p>
+
+    <p>
       <Link href="/users" data-testid="onclick-link" @click="setClicked">
         User handler then SPA
       </Link>

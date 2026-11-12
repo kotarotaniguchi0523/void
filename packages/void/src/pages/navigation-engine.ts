@@ -13,6 +13,7 @@ import {
 import type { BoundaryManifest } from './boundary-plans.ts';
 import { initClientHead, applyClientHead } from './head-client.ts';
 import type { HeadDescriptor } from './head.ts';
+import { LINK_MARKER_ATTRIBUTE } from './link.ts';
 import { PrefetchCache, parseCacheFor } from './prefetch.ts';
 import type { CacheForInput, CacheForResult, LinkPrefetchValue } from './prefetch.ts';
 import type { PageObject } from './protocol.ts';
@@ -1327,6 +1328,11 @@ export async function createPageNavigationEngine(
     return !!id && !!components[id] && !routeMeta[id]?.island;
   }
 
+  /** Outside the route table: the server may rewrite or redirect this URL to a page. */
+  function isServerRoutedUrl(url: URL): boolean {
+    return isPageUrlProtocol(url) && isSameOrigin(url, documentBaseUrl()) && !matchRoute(url.href);
+  }
+
   const engine: PageNavigationEngine = {
     _hoverDelay: PREFETCH_HOVER_DELAY,
     _prefetchDefaultStrategy: PREFETCH_DEFAULT_STRATEGY,
@@ -1682,9 +1688,22 @@ export async function createPageNavigationEngine(
       !apply ||
       !event.canIntercept ||
       event.downloadRequest !== null ||
-      event.formData !== null ||
-      !isClientPage(target)
+      event.formData !== null
     ) {
+      return;
+    }
+    const anchor = event.sourceElement?.closest('a[href],area[href]');
+    const link =
+      !!anchor && !anchor.hasAttribute('download') && !anchor.hasAttribute('data-void-reload');
+    // A Link to a URL outside the route table is fetched and its response decides.
+    // A plain anchor to such a URL stays a document load: fetching it first could
+    // request the document twice. A same-document entry with such a URL is one that
+    // the router rendered, so a traversal renders it again.
+    const serverRouted =
+      (traversal
+        ? event.destination.sameDocument
+        : link && anchor.hasAttribute(LINK_MARKER_ATTRIBUTE)) && isServerRoutedUrl(target);
+    if (!serverRouted && !isClientPage(target)) {
       return;
     }
 
@@ -1695,9 +1714,6 @@ export async function createPageNavigationEngine(
       !options._refresh &&
       target.pathname + target.search === _currentFetchUrl &&
       (event.hashChange || Boolean(target.hash));
-    const anchor = event.sourceElement?.closest('a[href],area[href]');
-    const link =
-      !!anchor && !anchor.hasAttribute('download') && !anchor.hasAttribute('data-void-reload');
     // A link to the current URL and fragment is also a native fragment navigation:
     // the browser scrolls and replaces the entry, but reports hashChange as false.
     const nativeFragmentNavigation =
@@ -1887,7 +1903,9 @@ export async function createPageNavigationEngine(
       nativeFragment = null;
     }
     if (
-      (!nativeHash && (event.navigationType !== 'traverse' || !isClientPage(target))) ||
+      (!nativeHash &&
+        (event.navigationType !== 'traverse' ||
+          !(isClientPage(target) || isServerRoutedUrl(target)))) ||
       (entry.key === initialEntryKey && _nextNavigationId === 0)
     ) {
       return;
