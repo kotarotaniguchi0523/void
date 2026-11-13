@@ -24,7 +24,6 @@ import {
   refreshPage,
   normalizePageUrl,
   abortError,
-  abortedVisitResolvesUndefined,
   hasPageBoundaries,
   pageBoundarySlots,
   showTerminalPageError,
@@ -91,10 +90,13 @@ type ReactPageResource = PageNavigationResource & {
   shell: Promise<PageNavigationResult | undefined>;
 };
 
+/**
+ * Reports a visit's commit to the engine, which settles the promise of the visit: the page
+ * data once the page has committed, or the error. An aborted visit rejects with an AbortError.
+ */
 type VisitSettler = {
   resolve(pageData: ReactPageData | undefined): void;
   reject(error: unknown): void;
-  abort(): void;
 };
 
 type AppState = {
@@ -660,11 +662,9 @@ function App({
           if (visitSettler) {
             if (committed) {
               visitSettler.resolve(result.pageData);
-            } else if (resource.method === 'GET') {
-              // A newer visit committed first. Settle like any abandoned visit. The method alone
-              // decides: a visit that resolves on its shell has dropped its settler by now.
-              visitSettler.resolve(undefined);
             } else {
+              // A newer visit committed first: report this one as aborted, like any abandoned
+              // visit. A visit that resolves on its shell has dropped its settler by now.
               visitSettler.reject(abortError());
             }
           }
@@ -697,11 +697,10 @@ function App({
     (resource: PageNavigationResource) => {
       const supersededId = activeVisit.id;
       if (supersededId !== null) {
-        activeVisit.takeSettler(supersededId)?.abort();
+        activeVisit.takeSettler(supersededId)?.reject(abortError());
         activeVisit.releaseViewTransition(supersededId);
       }
       const prepared = resource as ReactPageResource;
-      const options = prepared.options;
       const resolveOnData =
         prepared.options.resolveOn === 'data' || prepared.options._resolveOnShell;
       let resolveVisit!: (pageData: ReactPageData | undefined) => void;
@@ -721,6 +720,8 @@ function App({
             dispatch({ type: 'abandon', resource: prepared, location: currentUrl() });
             resolveVisit(undefined);
           } else if (resolveOnData) {
+            // The engine has resolved the visit with this data and nothing waits for the
+            // commit: the report ends here, and a failure after it is reported as an error.
             activeVisit.takeSettler(prepared.id);
             resolveVisit(result.pageData);
           }
@@ -729,14 +730,7 @@ function App({
         (error) => {
           activeVisit.releaseViewTransition(prepared.id);
           activeVisit.takeSettler(prepared.id);
-          // Public data completion keeps the usual cancellation behavior for GETs.
-          const abortingGetVisit =
-            isAbortError(error) && abortedVisitResolvesUndefined(prepared.method, prepared.options);
-          if (abortingGetVisit) {
-            resolveVisit(undefined);
-          } else {
-            rejectVisit(error);
-          }
+          rejectVisit(error);
           activeVisit.end(prepared.id);
           if (
             NavigationFallback ||
@@ -774,21 +768,7 @@ function App({
       const navigation = navigationStateFor(next.fetchUrl + next.hash, next.method);
       navigationStore.set(navigation);
 
-      activeVisit.begin(
-        next,
-        {
-          resolve: resolveVisit,
-          reject: rejectVisit,
-          abort() {
-            if (abortedVisitResolvesUndefined(next.method, options)) {
-              resolveVisit(undefined);
-            } else {
-              rejectVisit(abortError());
-            }
-          },
-        },
-        settleCapture,
-      );
+      activeVisit.begin(next, { resolve: resolveVisit, reject: rejectVisit }, settleCapture);
       dispatch({ type: 'begin', resource: next, navigation });
 
       if (NavigationFallback) {

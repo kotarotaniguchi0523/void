@@ -7,8 +7,6 @@ import { withPageQuery } from './action-key.ts';
 import {
   VoidActionError,
   abortError,
-  abortedVisitResolvesUndefined,
-  isAbortError,
   isCallSiteActionError,
   isVoidActionError,
   type ActionResult,
@@ -449,6 +447,10 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
     config.onNavigationChange?.(navigation);
   };
 
+  /**
+   * Renders a visit and reports its commit. The engine settles the promise of the visit
+   * from this report, or earlier for a visit that resolves on its data.
+   */
   async function applyNavigationResource(resource: ReturnType<typeof engine.prepareVisit>) {
     activeNavigationId = resource.id;
     setNavigation(navigationStateFor(resource.fetchUrl + resource.hash, resource.method));
@@ -523,11 +525,6 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
         setRouteState(currentUrl(), result.pageData.params ?? {});
       }
       return result.pageData;
-    } catch (error) {
-      if (isAbortError(error) && abortedVisitResolvesUndefined(resource.method, resource.options)) {
-        return undefined;
-      }
-      throw error;
     } finally {
       // A newer visit can settle before this one, so no visit may be active.
       const ownsNavigation = activeNavigationId === resource.id;

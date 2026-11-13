@@ -3081,6 +3081,117 @@ describe('superseded navigation commits (#507)', () => {
     expect(window.location.pathname).toBe('/b');
   });
 
+  describe('resolveOn data on visits that no navigate event carries', () => {
+    async function settledState(promise: Promise<unknown>) {
+      let state = 'pending';
+      promise.then(
+        () => (state = 'resolved'),
+        () => (state = 'rejected'),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      return state;
+    }
+
+    it('resolves a GET with its page data before the page is applied', async () => {
+      const page = setup();
+      const a = gate();
+      page.updateGates.set('/a', a.promise);
+      const r = await router(page);
+
+      const visit = r.visit('/a', { resolveOn: 'data' });
+      await entered(page, '/a');
+
+      expect(await settledState(visit)).toBe('resolved');
+      await expect(visit).resolves.toMatchObject({ component: 'a', url: '/a' });
+      expect(window.location.pathname).toBe('/');
+      expect(browserWrites.push).not.toHaveBeenCalled();
+
+      a.release();
+      await vi.waitFor(() => expect(window.location.pathname).toBe('/a'));
+    });
+
+    it('resolves an action with its page data before the page is applied', async () => {
+      const page = setup();
+      const a = gate();
+      page.updateGates.set('/a', a.promise);
+      const r = await router(page);
+
+      const submit = r.visit('/a', { method: 'post', data: { name: 'x' }, resolveOn: 'data' });
+      await entered(page, '/a');
+
+      expect(await settledState(submit)).toBe('resolved');
+      await expect(submit).resolves.toMatchObject({ component: 'a' });
+      expect(window.location.pathname).toBe('/');
+      a.release();
+      await vi.waitFor(() => expect(window.location.pathname).toBe('/a'));
+    });
+
+    it('waits for the commit by default', async () => {
+      const page = setup();
+      const a = gate();
+      page.updateGates.set('/a', a.promise);
+      const r = await router(page);
+
+      const visit = r.visit('/a');
+      await entered(page, '/a');
+      expect(await settledState(visit)).toBe('pending');
+
+      a.release();
+      await expect(visit).resolves.toMatchObject({ url: '/a' });
+      expect(window.location.pathname).toBe('/a');
+    });
+
+    it('keeps its page data when the page then fails to render', async () => {
+      const page = setup();
+      const a = gate();
+      page.updateGates.set(
+        '/a',
+        a.promise.then(() => {
+          throw new Error('render failed');
+        }),
+      );
+      const r = await router(page);
+
+      const visit = r.visit('/a', { resolveOn: 'data' });
+      await entered(page, '/a');
+      a.release();
+
+      await expect(visit).resolves.toMatchObject({ url: '/a' });
+      await vi.waitFor(() => expect(page.rendered).toEqual(['/a', '']));
+      expect(window.location.pathname).toBe('/');
+    });
+
+    it('rejects when the page data fails to load', async () => {
+      const page = setup();
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('No', { status: 500 })),
+      );
+      const r = await router(page);
+
+      await expect(
+        r.visit('/a', { method: 'post', data: {}, resolveOn: 'data' }),
+      ).rejects.toMatchObject({ status: 500 });
+      expect(page.rendered).toEqual([]);
+    });
+
+    it('settles a visit that is superseded before its data is ready as an abandoned visit', async () => {
+      const page = setup();
+      const a = gate();
+      page.fetchGates.set('/a', a.promise);
+      const r = await router(page);
+
+      const visitA = r.visit('/a', { resolveOn: 'data' });
+      const submitA = r.visit('/a', { method: 'post', data: {}, resolveOn: 'data' });
+      await r.visit('/b');
+      a.release();
+
+      await expect(visitA).resolves.toBeUndefined();
+      await expect(submitA).rejects.toMatchObject({ name: 'AbortError' });
+      expect(page.rendered).toEqual(['/b']);
+    });
+  });
+
   it('restores the committed page when the action that superseded a visit fails', async () => {
     const page = setup();
     const b = gate();
@@ -3956,6 +4067,30 @@ describe('browser navigate events', () => {
       expect(fetchPage.mock.calls[0]![0]).toBe('/dashboard');
       expect(applyUpdate).toHaveBeenCalledOnce();
       expect(window.location.href).toBeUndefined();
+    });
+
+    it('resolves a visit with resolveOn data once the server has selected the page', async () => {
+      stubClientGlobals();
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string) => page(url)),
+      );
+      const applying = controlledPromise<void>();
+      const applyUpdate = vi.fn(() => applying.promise);
+      const created = await createTestRouter({
+        adapter: { applyUpdate },
+        matchRoute: (path) => (path === '/dashboard' ? null : 'home'),
+      });
+      created.start();
+
+      await expect(
+        created.router.visit('/dashboard', { resolveOn: 'data' }),
+      ).resolves.toMatchObject({ url: '/dashboard' });
+      expect(applyUpdate).toHaveBeenCalledOnce();
+      expect(browserWrites.push).not.toHaveBeenCalled();
+
+      applying.resolve();
+      await vi.waitFor(() => expect(browserWrites.push).toHaveBeenCalledWith('/dashboard'));
     });
 
     it('leaves a plain anchor to the browser', async () => {

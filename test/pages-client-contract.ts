@@ -2110,4 +2110,21 @@ export function registerSharedClientTests({
       await page.context().close();
     }
   });
+
+  it('resolves a visit with resolveOn data before the page that the server selects commits', async () => {
+    const page = await newPage();
+    try {
+      await page.goto(BASE + '/link-behavior');
+      await waitForHydration(page);
+
+      // routes/link-rewrite.ts is outside the route table. The page renders in a view
+      // transition, which starts on a later frame than the one its data arrives in.
+      await page.getByTestId('server-rewrite-data-visit').click();
+      await page.getByText('bob@example.com').waitFor();
+      await page.waitForURL(BASE + '/link-rewrite');
+      expect(await page.getAttribute('body', 'data-visit-resolved-at')).toBe('/link-behavior');
+    } finally {
+      await page.context().close();
+    }
+  });
 }

@@ -24,6 +24,8 @@ All four adapters support typed URLs through [`routeUrl()`](./types.md#routeurl-
 
 Public `useRouter()` returns a GET-only router: `visit()`, `refresh()`, and `prefetch()` return `Promise<void>`, while mutations use `action()` or `useForm()`. Internal action payloads and prefetch data are not exposed through the public router. Options outside each public method's documented contract are ignored at runtime.
 
+`await router.visit()` and `await router.refresh()` resolve once the updated page and its URL have committed. Pass `{ resolveOn: 'data' }` to resolve as soon as the destination's page data is ready instead. The promise rejects if that data fails to load. The DOM and URL may still show the previous page after `await`, and a failure while the page renders no longer rejects the promise. `{ resolveOn: 'commit' }` requests the default explicitly. Both values work in all four adapters; React apps need `'data'` inside transitions and Actions, see [React navigation completion](#react-navigation-completion).
+
 The router's `visit(destination, options?)`, `prefetch(destination, options?)`, and `flush(destination)` accept [`RouteUrlInput`](./types.md#route-types): a string, `URL`, or typed destination object.
 
 With [`routing.typedRoutes`](../config.md#routing-typedroutes), `href` and router strings must match one of your routes, or be a same-page or external URL. Without it, both accept any string.

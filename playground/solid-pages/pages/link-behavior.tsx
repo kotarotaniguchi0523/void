@@ -11,6 +11,13 @@ type LinkBehaviorWindow = Window & {
 export default function LinkBehaviorPage(props: Props) {
   const router = useRouter();
 
+  // Records the address at the moment the visit's promise resolves.
+  function visitRewriteOnData() {
+    void router.visit('/link-rewrite', { resolveOn: 'data', viewTransition: true }).then(() => {
+      document.body.setAttribute('data-visit-resolved-at', window.location.pathname);
+    });
+  }
+
   function setBoundClicked(label: string, event: MouseEvent) {
     event.preventDefault();
     const linkWindow = window as LinkBehaviorWindow;
@@ -59,6 +66,9 @@ export default function LinkBehaviorPage(props: Props) {
         <Link href="/api/health" data-testid="non-page-link">
           Not a page
         </Link>
+        <button data-testid="server-rewrite-data-visit" onClick={visitRewriteOnData}>
+          Server rewrite, resolved on data
+        </button>
       </p>
 
       <p>

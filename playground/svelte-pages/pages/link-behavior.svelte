@@ -11,6 +11,13 @@
   const router = useRouter();
   const replaceUsers = createLinkClickHandler(router, { replace: true });
 
+  // Records the address at the moment the visit's promise resolves.
+  function visitRewriteOnData() {
+    void router.visit("/link-rewrite", { resolveOn: "data", viewTransition: true }).then(() => {
+      document.body.setAttribute("data-visit-resolved-at", window.location.pathname);
+    });
+  }
+
   function setClicked() {
     (window as LinkBehaviorWindow).__linkOnClick = true;
   }
@@ -54,6 +61,9 @@
     <Link href="/link-redirect" data-testid="server-redirect-link">Server redirect</Link>
     <Link href="/link-rewrite" data-testid="server-rewrite-link">Server rewrite</Link>
     <Link href="/api/health" data-testid="non-page-link">Not a page</Link>
+    <button data-testid="server-rewrite-data-visit" onclick={visitRewriteOnData}>
+      Server rewrite, resolved on data
+    </button>
   </p>
 
   <p>

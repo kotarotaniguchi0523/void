@@ -107,9 +107,12 @@ export type VisitOptions = {
   preserveState?: boolean;
   replace?: boolean;
   viewTransition?: boolean;
-  /** React navigation completion: page data readiness or UI commit (default). */
+  /** When the visit's promise resolves: page data readiness or UI commit (default). */
   resolveOn?: 'data' | 'commit';
-  /** @internal Used by React Actions to avoid waiting for a commit blocked by the action itself. */
+  /**
+   * @internal Used by React Actions to avoid waiting for a commit blocked by the action itself.
+   * Resolves like `resolveOn: 'data'`; an aborted GET rejects instead of resolving `undefined`.
+   */
   _resolveOnShell?: boolean;
   /** @internal Used by router.refresh() to refetch the current URL even when it has a hash */
   _refresh?: boolean;
@@ -199,12 +202,39 @@ export type PageNavigationResource = {
   dispose(): void;
 };
 
+/**
+ * An adapter renders the visit and reports its commit: the page data once the page and its
+ * URL have committed, `undefined` when the visit ended without a page, or the error. An
+ * aborted visit rejects with its AbortError. The engine settles the caller's promise.
+ */
 type ApplyVisit = (resource: PageNavigationResource) => Promise<PageData | undefined>;
 type BrowserVisit = {
   options: VisitOptions;
   apply: ApplyVisit;
-  data?: { resolve(value: PageData | undefined): void; reject(reason: unknown): void };
+  /** Resolves the promise of a visit that resolves on its data. */
+  dataReady?(pageData: PageData): void;
 };
+
+/** Whether the visit's promise resolves when its page data is ready, before the commit. */
+function resolvesOnData(options: VisitOptions): boolean {
+  return options.resolveOn === 'data' || !!options._resolveOnShell;
+}
+
+/**
+ * The promise of a visit that resolves on its data. `ready` resolves it with the page data;
+ * a visit that ends before its data is ready settles it with its outcome instead.
+ */
+function dataCompletion(outcome: Promise<PageData | undefined>): {
+  promise: Promise<PageData | undefined>;
+  ready(pageData: PageData): void;
+} {
+  let ready!: (pageData: PageData) => void;
+  const promise = new Promise<PageData | undefined>((resolve, reject) => {
+    ready = resolve;
+    outcome.then(resolve, reject);
+  });
+  return { promise, ready };
+}
 
 export type PageNavigationEngine = {
   _hoverDelay: number;
@@ -862,23 +892,33 @@ export async function createPageNavigationEngine(
     }
   }
 
+  /**
+   * Runs the adapter for the resource it was handed and returns what a commit-mode visit
+   * settles with. An aborted GET resolves `undefined`, as a visit with no page does.
+   */
   async function applyBrowserVisit(
     apply: ApplyVisit,
     resource: PageNavigationResource,
   ): Promise<PageData | undefined> {
+    let result: PageData | undefined;
     try {
-      const result = await apply(resource);
-      if (!result) {
-        recoverUnrenderedEntry(resource);
-      }
-      return result;
+      result = await apply(resource);
     } catch (error) {
-      recoverUnrenderedEntry(resource);
-      if (_pendingResource?.id === resource.id) {
-        abortPendingResource(_pendingResource);
+      if (
+        !isAbortError(error) ||
+        !abortedVisitResolvesUndefined(resource.method, resource.options)
+      ) {
+        recoverUnrenderedEntry(resource);
+        if (_pendingResource?.id === resource.id) {
+          abortPendingResource(_pendingResource);
+        }
+        throw error;
       }
-      throw error;
     }
+    if (!result) {
+      recoverUnrenderedEntry(resource);
+    }
+    return result;
   }
 
   /**
@@ -1567,32 +1607,36 @@ export async function createPageNavigationEngine(
       if (!browserVisitHandler || !get || !isClientPage(target)) {
         const resource = engine.prepareVisit(url, options);
         const returned = resource.method === 'GET' ? null : returnToRenderedEntry();
-        return applyBrowserVisit(
-          apply,
-          returned
-            ? // The adapter reads the address when the action settles.
-              exposeResource(
-                resource,
-                Promise.all([resource.shell, returned]).then(([result]) => result),
-              )
-            : exposeResource(resource),
+        const exposed = returned
+          ? // The adapter reads the address when the action settles.
+            exposeResource(
+              resource,
+              Promise.all([resource.shell, returned]).then(([result]) => result),
+            )
+          : exposeResource(resource);
+        const committed = applyBrowserVisit(apply, exposed);
+        if (!resolvesOnData(options)) {
+          return committed;
+        }
+        const completion = dataCompletion(committed);
+        exposed.shell.then(
+          (result) => {
+            // A visit that lost the navigation while it loaded settles as an aborted one.
+            if (result && _pendingResource === resource) {
+              completion.ready(result.pageData);
+            }
+          },
+          () => {},
         );
+        return completion.promise;
       }
       let result: PageData | undefined;
-      let data: BrowserVisit['data'];
-      const dataReady =
-        options.resolveOn === 'data' || options._resolveOnShell
-          ? new Promise<PageData | undefined>((resolve, reject) => {
-              data = { resolve, reject };
-            })
-          : undefined;
       const request: BrowserVisit = {
         options,
         async apply(resource) {
           result = await apply(resource);
           return result;
         },
-        ...(data ? { data } : {}),
       };
       browserVisits.add(request);
       const finished = navigateEntry(
@@ -1600,25 +1644,22 @@ export async function createPageNavigationEngine(
         options.replace ? 'replace' : 'push',
         request,
       ).finished.then(
-        () => {
-          data?.resolve(result);
-          return result;
-        },
+        () => result,
         (error: unknown) => {
           // Only GET visits reach the browser visit handler.
           if (isAbortError(error) && abortedVisitResolvesUndefined(method, options)) {
-            data?.resolve(undefined);
             return undefined;
           }
-          data?.reject(error);
           throw error;
         },
       );
-      if (dataReady) {
-        void finished.catch(() => {});
-        return dataReady;
+      if (!resolvesOnData(options)) {
+        return finished;
       }
-      return finished;
+      // The precommit handler reports the page data once it has loaded.
+      const completion = dataCompletion(finished);
+      request.dataReady = completion.ready;
+      return completion.promise;
     },
 
     releaseRetiredResources(retainedIds) {
@@ -1877,13 +1918,14 @@ export async function createPageNavigationEngine(
           }
           return resource.shell;
         });
-        const applied = apply(
-          exposeResource(resource, shellAfterCommit, {
-            ...resource.options,
-            resolveOn: 'commit',
-            _resolveOnShell: false,
-          }),
-        );
+        // The browser finishes this navigation when the adapter reports its commit, so the
+        // adapter renders every such visit as one that resolves on commit.
+        const exposed = exposeResource(resource, shellAfterCommit, {
+          ...resource.options,
+          resolveOn: 'commit',
+          _resolveOnShell: false,
+        });
+        const applied = apply(exposed);
         void applied.catch(() => {});
         try {
           const shell = await resource.shell;
@@ -1903,7 +1945,7 @@ export async function createPageNavigationEngine(
             controller.redirect(finalUrl);
           }
           if (own) {
-            request.data?.resolve(shell.pageData);
+            request.dataReady?.(shell.pageData);
           }
           controller.addHandler(async () => {
             // An abort has already released the renderer through `cancel`.
@@ -1911,7 +1953,7 @@ export async function createPageNavigationEngine(
             context.entryKey = window.navigation.currentEntry?.key;
             entries.committed(context.entryKey, resource.id);
             release(true);
-            const result = await applyBrowserVisit(() => applied, resource);
+            const result = await applyBrowserVisit(() => applied, exposed);
             event.signal.throwIfAborted();
             if (!result) {
               throw abortError();

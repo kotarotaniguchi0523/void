@@ -14,6 +14,13 @@ export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeU
   const navigation = useNavigation();
   const abortTestCleanupRef = useRef<() => void>(() => {});
 
+  // Records the address at the moment the visit's promise resolves.
+  const visitRewriteOnData = () => {
+    void router.visit('/link-rewrite', { resolveOn: 'data', viewTransition: true }).then(() => {
+      document.body.setAttribute('data-visit-resolved-at', window.location.pathname);
+    });
+  };
+
   const runAbortNavigationTest = () => {
     const observedErrors: Array<string> = [];
     const recordError = (error: unknown) => {
@@ -96,6 +103,9 @@ export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeU
         <Link href="/api/health" data-testid="non-page-link">
           Not a page
         </Link>
+        <button data-testid="server-rewrite-data-visit" onClick={visitRewriteOnData}>
+          Server rewrite, resolved on data
+        </button>
       </p>
 
       <p>
