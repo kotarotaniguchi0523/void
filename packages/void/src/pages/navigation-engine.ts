@@ -356,6 +356,8 @@ export async function createPageNavigationEngine(
   const _prefetchCache = new PrefetchCache();
   const uncachedPayloads = new WeakSet<object>();
   let _nextNavigationId = 0;
+  /** The visit whose loader started a document navigation. */
+  let documentVisitId: number | undefined;
   let _pendingResource: PageNavigationResource | null = null;
   let _committedResource: PageNavigationResource | null = null;
   let _committedDeferredRegistry: DeferredRegistry | null = null;
@@ -826,6 +828,22 @@ export async function createPageNavigationEngine(
     _htmlDeferredRegistry?.resolve(group, undefined, error);
 
   /**
+   * The loader hands its visit to the document, and the shell resolves without a page.
+   * A document navigation that starts here is recorded, so that the visit is not also
+   * recovered as an entry that never rendered.
+   */
+  function loadDocument(id: number, url: string, context: NavigationContext): undefined {
+    // A traversal has moved the browser to the entry already, so the document to load
+    // is that entry: recovery reloads it. Assigning its URL here would start a second
+    // load, move only to a fragment, or put a redirect's URL over the entries after it.
+    if (context.kind !== 'traverse') {
+      documentVisitId = id;
+      window.location.href = url;
+    }
+    return undefined;
+  }
+
+  /**
    * Reload when the latest visit ends and the current entry's page was never rendered.
    * Another visit's failure, such as a rejected action, leaves the entry to the
    * visit that is rendering it. A visit the browser has cancelled recovers nothing:
@@ -834,6 +852,7 @@ export async function createPageNavigationEngine(
   function recoverUnrenderedEntry(resource: PageNavigationResource): void {
     const { id } = resource;
     if (
+      id !== documentVisitId &&
       !contextOf(resource).signal?.aborted &&
       id === _nextNavigationId &&
       entries.isUnrendered(id)
@@ -938,6 +957,7 @@ export async function createPageNavigationEngine(
     signal: AbortSignal,
     commitTarget: NavigationCommitTarget,
     deferredRegistry: DeferredRegistry,
+    context: NavigationContext,
   ): Promise<PageNavigationResult | undefined> {
     // Page data only comes from this origin. Other http(s) URLs get a full page
     // load. Capacitor's iOS WebView uses capacitor: for local pages.
@@ -951,8 +971,7 @@ export async function createPageNavigationEngine(
       if (method !== 'GET') {
         throw new Error('Void Router: non-GET visits must target the current origin.');
       }
-      window.location.href = url;
-      return undefined;
+      return loadDocument(id, url, context);
     }
 
     if (method !== 'GET') {
@@ -1013,8 +1032,7 @@ export async function createPageNavigationEngine(
       signal.throwIfAborted();
       _prefetchCache.consume(fetchUrl);
       if (cachedPageData === null) {
-        window.location.href = url;
-        return undefined;
+        return loadDocument(id, url, context);
       }
       if (isPrefetchRedirect(cachedPageData)) {
         const target = new URL(cachedPageData.destination, documentBaseUrl());
@@ -1063,15 +1081,13 @@ export async function createPageNavigationEngine(
 
       signal.throwIfAborted();
       if (pageData === undefined && !response) {
-        window.location.href = url;
-        return undefined;
+        return loadDocument(id, url, context);
       }
 
       if (response?.redirected) {
         const redirectUrl = new URL(response.url, documentBaseUrl());
         if (!isSameOrigin(redirectUrl, documentBaseUrl())) {
-          window.location.href = method === 'GET' ? url : response.url;
-          return undefined;
+          return loadDocument(id, method === 'GET' ? url : response.url, context);
         }
         // The browser already followed the redirect: treat the final response as the GET
         // result for the destination instead of fetching it a second time.
@@ -1100,12 +1116,10 @@ export async function createPageNavigationEngine(
             pageData = staticPageData.pageData;
             deferredRegistry.setup(pageData, staticPageData.resolvedDeferred);
           } else {
-            window.location.href = url;
-            return undefined;
+            return loadDocument(id, url, context);
           }
         } else {
-          window.location.href = url;
-          return undefined;
+          return loadDocument(id, url, context);
         }
       }
 
@@ -1216,8 +1230,7 @@ export async function createPageNavigationEngine(
     // Reuse the preload only if the response selects the matched page; redirects
     // or rewrites may select another. Cancellation stops waiting for the imports.
     if (!components[pageData.component]) {
-      window.location.href = url;
-      return undefined;
+      return loadDocument(id, url, context);
     }
     let component: unknown;
     let layouts: Array<unknown>;
@@ -1474,6 +1487,7 @@ export async function createPageNavigationEngine(
       controller.signal,
       commitTarget,
       deferredRegistry,
+      context,
     );
 
     let commitResource: () => Promise<boolean> = async () => false;

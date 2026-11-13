@@ -1428,6 +1428,59 @@ export function registerSharedClientTests({
     }
   });
 
+  it('reloads a fragment entry once when Back reaches it and its response is not a page', async ({
+    expect,
+  }) => {
+    const page = await newPage();
+    const documents: Array<string> = [];
+    try {
+      await page.goto(BASE + '/users');
+      await waitForHydration(page);
+      await page.evaluate(() => {
+        location.hash = 'details';
+      });
+      await page.click('a[href="/users/1"]');
+      await page.waitForFunction(() =>
+        document.querySelector('h1')?.textContent?.includes('Alice'),
+      );
+      await page.evaluate(() => {
+        (window as TestWindow).__SPA_MARKER = true;
+      });
+      page.on('request', (request) => {
+        if (request.isNavigationRequest()) {
+          documents.push(new URL(request.url()).pathname);
+        }
+      });
+      // Answer in the page: a routed request would hide a document request that the
+      // browser cancels.
+      await page.evaluate(() => {
+        const request = window.fetch;
+        window.fetch = (input, init) =>
+          input === '/users'
+            ? Promise.resolve(
+                new Response('not a page', { headers: { 'content-type': 'text/plain' } }),
+              )
+            : request(input, init);
+      });
+
+      await page.goBack({ waitUntil: 'commit' });
+      // Assigning the entry's URL would only move to its fragment and keep the old page.
+      await page.waitForFunction(
+        () =>
+          !(window as TestWindow).__SPA_MARKER &&
+          document.querySelector('h1')?.textContent?.includes('Users'),
+      );
+      await waitForHydration(page);
+      expect(page.url()).toBe(BASE + '/users#details');
+      expect(documents).toEqual(['/users']);
+      // The entry was reloaded in place: the entry after it is still there.
+      expect(await page.evaluate(() => navigation.entries().length)).toBe(3);
+      expect(await page.evaluate(() => navigation.canGoForward)).toBe(true);
+    } finally {
+      await page.context().close();
+    }
+  });
+
   it('Form preserves a draft and displays quota failures until retry is available', async () => {
     const page = await newPage();
     let submissions = 0;

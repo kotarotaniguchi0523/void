@@ -3492,6 +3492,80 @@ describe('browser navigate events', () => {
     });
   });
 
+  it.each([
+    ['is not a page', () => new Response('moved', { headers: { 'content-type': 'text/plain' } })],
+    ['names an unknown component', () => pageJson({ component: 'missing', url: '/', props: {} })],
+  ])(
+    'loads the document once when the response to a traversal %s',
+    async (_case, documentResponse) => {
+      stubClientGlobals();
+      const browser = stubNavigationHistory();
+      const reload = vi.fn();
+      Object.assign(window.location, { reload });
+      let traversing = false;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string) =>
+          traversing ? documentResponse() : pageJson({ component: 'home', url, props: {} }),
+        ),
+      );
+      const created = await createTestRouter();
+      created.start();
+      created.commitInitialRender();
+      await created.router.visit('/next');
+      expect(window.location.pathname).toBe('/next');
+
+      traversing = true;
+      await expect(browser.traverseTo('initial-entry').finished).rejects.toMatchObject({
+        name: 'AbortError',
+      });
+      // The browser is at the entry already: the document loads once, as a reload of it.
+      expect(reload).toHaveBeenCalledOnce();
+      expect(window.location.href).toBeUndefined();
+    },
+  );
+
+  it('does not reload an unrendered entry whose visit the loader handed to the document', async () => {
+    stubClientGlobals();
+    const browser = stubNavigationHistory();
+    const reload = vi.fn();
+    Object.assign(window.location, { reload });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url === '/document') {
+          return new Response('moved', { headers: { 'content-type': 'text/plain' } });
+        }
+        const page = pageJson({ component: 'home', url: '/done', props: {} });
+        return init?.method === 'POST'
+          ? Object.defineProperties(page, {
+              redirected: { value: true },
+              url: { value: 'http://localhost/done' },
+            })
+          : page;
+      }),
+    );
+    const created = await createTestRouter({
+      matchRoute: (path) => (path === '/document' ? null : 'home'),
+    });
+    created.start();
+    created.commitInitialRender();
+    // The action publishes /done, and app code leaves for a URL that is not a page
+    // before the action's page is recorded as rendered.
+    let left: Promise<unknown> | undefined;
+    browser.addEventListener('currententrychange', () => {
+      if (window.location.pathname === '/done') {
+        left ??= created.router.visit('/document');
+      }
+    });
+
+    await created.router.visit('/', { method: 'POST' }).catch(() => {});
+    await vi.waitFor(() => expect(left).toBeDefined());
+    await left;
+    expect(window.location.href).toBe('/document');
+    expect(reload).not.toHaveBeenCalled();
+  });
+
   it('reloads the committed browser URL when the adapter cannot apply it', async () => {
     stubClientGlobals();
     stubBrowserNavigation();
