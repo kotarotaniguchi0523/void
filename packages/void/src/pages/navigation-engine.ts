@@ -89,21 +89,33 @@ export type VisitOptions = {
   resolveOn?: 'data' | 'commit';
   /** @internal Used by React Actions to avoid waiting for a commit blocked by the action itself. */
   _resolveOnShell?: boolean;
-  /** @internal Saved position of the destination entry. */
-  _scrollPosition?: { x: number; y: number } | null;
-  /** @internal The browser has already committed this destination. */
-  _entryCommitted?: boolean;
-  _entryKey?: string;
-  /** @internal The browser owns this visit’s URL and cancellation. */
-  _navigationSignal?: AbortSignal;
-  /** @internal The view transition override of the anchor that started this visit. */
-  _linkViewTransition?: boolean;
-  /** @internal The browser has already animated this navigation, as a swipe gesture does. */
-  _visualTransitionDone?: boolean;
   /** @internal Used by router.refresh() to refetch the current URL even when it has a hash */
   _refresh?: boolean;
   /** @internal Used by actions: the page query they added to the URL, which redirects leave out */
   _preservedQuery?: string;
+};
+
+/**
+ * What the engine knows about the browser navigation a visit belongs to. The caller's
+ * wishes stay in `VisitOptions`; these facts come from the navigate event.
+ */
+type NavigationContext = {
+  /**
+   * `direct`: the engine renders first and then publishes the entry itself.
+   * `precommit`: the browser commits the entry once the page has loaded.
+   * `traverse`: the browser has already moved to the entry.
+   */
+  kind: 'direct' | 'precommit' | 'traverse';
+  /** The browser owns this visit’s URL and cancellation. */
+  signal?: AbortSignal;
+  /** Key of the visit's entry. A precommit visit learns it when the browser commits. */
+  entryKey?: string;
+  /** Saved position of the destination entry. */
+  scrollPosition?: { x: number; y: number } | null;
+  /** The view transition override of the anchor that started this visit. */
+  linkViewTransition?: boolean;
+  /** The browser has already animated this navigation, as a swipe gesture does. */
+  visualTransitionDone?: boolean;
 };
 
 export type PrefetchOptions = {
@@ -344,12 +356,18 @@ export async function createPageNavigationEngine(
    * option, then the link's attribute, then the app default. A navigation the browser
    * has already animated gets none: a second animation would replay it.
    */
-  function resolveViewTransition(options: VisitOptions): boolean {
-    if (options._visualTransitionDone) {
+  function resolveViewTransition(options: VisitOptions, context: NavigationContext): boolean {
+    if (context.visualTransitionDone) {
       return false;
     }
-    return options.viewTransition ?? options._linkViewTransition ?? config.viewTransitions;
+    return options.viewTransition ?? context.linkViewTransition ?? config.viewTransitions;
   }
+
+  // Keyed by the resource and by each copy handed to an adapter.
+  const navigationContexts = new WeakMap<PageNavigationResource, NavigationContext>();
+  const directNavigation: NavigationContext = { kind: 'direct' };
+  const contextOf = (resource: PageNavigationResource): NavigationContext =>
+    navigationContexts.get(resource) ?? directNavigation;
 
   function abortPendingResource(resource: PageNavigationResource): void {
     if (_pendingResource === resource) {
@@ -372,17 +390,20 @@ export async function createPageNavigationEngine(
     shell = resource.shell,
     options = resource.options,
   ): PageNavigationResource {
-    return {
+    const context = contextOf(resource);
+    const exposed = {
       ...resource,
       options,
       shell: shell.then((result) => {
-        resource.options._navigationSignal?.throwIfAborted();
+        context.signal?.throwIfAborted();
         if (result && _pendingResource === resource) {
           exposedResources.add(resource);
         }
         return result;
       }),
     };
+    navigationContexts.set(exposed, context);
+    return exposed;
   }
   let initialScrollPosition: { x: number; y: number } | null = null;
   const initialEntryKey = window.navigation.currentEntry?.key;
@@ -747,7 +768,7 @@ export async function createPageNavigationEngine(
   }
 
   function restoreScroll(
-    scrollPosition: VisitOptions['_scrollPosition'],
+    scrollPosition: NavigationContext['scrollPosition'],
     hash: string,
     resetIfMissing = true,
   ): void {
@@ -796,9 +817,10 @@ export async function createPageNavigationEngine(
    * visit that is rendering it. A visit the browser has cancelled recovers nothing:
    * the navigation that replaced it owns the entry.
    */
-  function recoverUnrenderedEntry({ id, options }: PageNavigationResource): void {
+  function recoverUnrenderedEntry(resource: PageNavigationResource): void {
+    const { id } = resource;
     if (
-      !options._navigationSignal?.aborted &&
+      !contextOf(resource).signal?.aborted &&
       id === _nextNavigationId &&
       (unrenderedEntryVisit === undefined || unrenderedEntryVisit === id) &&
       unrenderedEntry !== undefined &&
@@ -1224,6 +1246,7 @@ export async function createPageNavigationEngine(
   function makeCommit(
     commitTarget: NavigationCommitTarget,
     options: VisitOptions,
+    context: NavigationContext,
     shell: Promise<PageNavigationResult | undefined>,
     deferredRegistry: DeferredRegistry,
     resourceId: number,
@@ -1231,7 +1254,7 @@ export async function createPageNavigationEngine(
     getResource: () => PageNavigationResource,
   ): () => Promise<boolean> {
     const ownsCommit = () =>
-      _pendingResource?.id === resourceId && !signal.aborted && !options._navigationSignal?.aborted;
+      _pendingResource?.id === resourceId && !signal.aborted && !context.signal?.aborted;
     let committed = false;
     return async () => {
       if (committed) {
@@ -1255,8 +1278,8 @@ export async function createPageNavigationEngine(
       // Write history before anything else changes. Disposing the previous page and handing
       // over its Deferred values cannot be undone, so a failed write must find them untouched.
       // preserveState only controls component state; back/forward traversal already moved history.
-      let entryKey = options._entryKey;
-      if (!options._entryCommitted && !options._navigationSignal) {
+      let entryKey = context.entryKey;
+      if (context.kind === 'direct') {
         const historyUrl = commitTarget.fetchUrl + commitTarget.hash;
         const resource = getResource();
         const currentDocumentUrl = window.location.pathname + window.location.search;
@@ -1339,12 +1362,8 @@ export async function createPageNavigationEngine(
       scrollRestoration.commit(entryKey);
 
       requestAnimationFrame(() => {
-        if (
-          !preserveScroll &&
-          resourceId === _nextNavigationId &&
-          !options._navigationSignal?.aborted
-        ) {
-          restoreScroll(options._scrollPosition, commitTarget.hash);
+        if (!preserveScroll && resourceId === _nextNavigationId && !context.signal?.aborted) {
+          restoreScroll(context.scrollPosition, commitTarget.hash);
         }
       });
       return true;
@@ -1404,6 +1423,94 @@ export async function createPageNavigationEngine(
     return isSameOriginPageUrl(url) && !matchRoute(url.href);
   }
 
+  function prepareVisit(
+    url: string,
+    options: VisitOptions,
+    context: NavigationContext,
+  ): PageNavigationResource {
+    if (context.kind !== 'traverse') {
+      // Capture the departing page before an adapter replaces or shrinks its DOM.
+      scrollRestoration.save();
+    }
+    const hashIndex = url.indexOf('#');
+    const hash = hashIndex !== -1 ? url.slice(hashIndex) : '';
+    const fetchUrl = hashIndex !== -1 ? url.slice(0, hashIndex) : url;
+    const currentPath = window.location.pathname + window.location.search;
+    const effectiveFetchUrl = fetchUrl || currentPath;
+    const method = (options.method || 'GET').toUpperCase();
+    const id = ++_nextNavigationId;
+
+    if (_pendingResource) {
+      supersedeResource(_pendingResource);
+    }
+    _pendingResource = null;
+
+    if (context.kind === 'traverse') {
+      // The browser has already moved to this entry.
+      markUnrenderedEntry(context.entryKey ?? window.navigation.currentEntry?.key, id);
+    }
+
+    const controller = new AbortController();
+    const deferredRegistry = new DeferredRegistry();
+    const commitTarget = { fetchUrl: effectiveFetchUrl, hash, method };
+    const shell = loadNavigationShell(
+      id,
+      url,
+      effectiveFetchUrl,
+      method,
+      options,
+      controller.signal,
+      commitTarget,
+      deferredRegistry,
+    );
+
+    let commitResource: () => Promise<boolean> = async () => false;
+    const browserSignal = context.signal;
+    const abortPending = () => abortPendingResource(resource);
+    const stop = () => {
+      browserSignal?.removeEventListener('abort', abortPending);
+      controller.abort(abortError());
+      deferredRegistry.dispose();
+    };
+    const resource: PageNavigationResource = {
+      id,
+      url,
+      fetchUrl: effectiveFetchUrl,
+      hash,
+      method,
+      options,
+      viewTransition: resolveViewTransition(options, context),
+      shell,
+      destination: () => commitTarget.fetchUrl + commitTarget.hash,
+      abort: stop,
+      commit() {
+        return commitResource().finally(() =>
+          browserSignal?.removeEventListener('abort', abortPending),
+        );
+      },
+      dispose: stop,
+    };
+    _resourceDeferredRegistries.set(resource, deferredRegistry);
+    navigationContexts.set(resource, context);
+    commitResource = makeCommit(
+      commitTarget,
+      options,
+      context,
+      shell,
+      deferredRegistry,
+      id,
+      controller.signal,
+      () => resource,
+    );
+    _pendingResource = resource;
+    if (browserSignal?.aborted) {
+      abortPending();
+    } else {
+      browserSignal?.addEventListener('abort', abortPending, { once: true });
+    }
+    return resource;
+  }
+
   const engine: PageNavigationEngine = {
     _hoverDelay: PREFETCH_HOVER_DELAY,
     _prefetchDefaultStrategy: PREFETCH_DEFAULT_STRATEGY,
@@ -1411,87 +1518,7 @@ export async function createPageNavigationEngine(
     initialComponent,
     initialLayouts,
 
-    prepareVisit(url, options = {}) {
-      if (!options._entryCommitted) {
-        // Capture the departing page before an adapter replaces or shrinks its DOM.
-        scrollRestoration.save();
-      }
-      const hashIndex = url.indexOf('#');
-      const hash = hashIndex !== -1 ? url.slice(hashIndex) : '';
-      const fetchUrl = hashIndex !== -1 ? url.slice(0, hashIndex) : url;
-      const currentPath = window.location.pathname + window.location.search;
-      const effectiveFetchUrl = fetchUrl || currentPath;
-      const method = (options.method || 'GET').toUpperCase();
-      const id = ++_nextNavigationId;
-
-      if (_pendingResource) {
-        supersedeResource(_pendingResource);
-      }
-      _pendingResource = null;
-
-      if (options._entryCommitted) {
-        // The browser has already moved to this entry.
-        markUnrenderedEntry(options._entryKey ?? window.navigation.currentEntry?.key, id);
-      }
-
-      const controller = new AbortController();
-      const deferredRegistry = new DeferredRegistry();
-      const commitTarget = { fetchUrl: effectiveFetchUrl, hash, method };
-      const shell = loadNavigationShell(
-        id,
-        url,
-        effectiveFetchUrl,
-        method,
-        options,
-        controller.signal,
-        commitTarget,
-        deferredRegistry,
-      );
-
-      let commitResource: () => Promise<boolean> = async () => false;
-      const browserSignal = options._navigationSignal;
-      const abortPending = () => abortPendingResource(resource);
-      const stop = () => {
-        browserSignal?.removeEventListener('abort', abortPending);
-        controller.abort(abortError());
-        deferredRegistry.dispose();
-      };
-      const resource: PageNavigationResource = {
-        id,
-        url,
-        fetchUrl: effectiveFetchUrl,
-        hash,
-        method,
-        options,
-        viewTransition: resolveViewTransition(options),
-        shell,
-        destination: () => commitTarget.fetchUrl + commitTarget.hash,
-        abort: stop,
-        commit() {
-          return commitResource().finally(() =>
-            browserSignal?.removeEventListener('abort', abortPending),
-          );
-        },
-        dispose: stop,
-      };
-      _resourceDeferredRegistries.set(resource, deferredRegistry);
-      commitResource = makeCommit(
-        commitTarget,
-        options,
-        shell,
-        deferredRegistry,
-        id,
-        controller.signal,
-        () => resource,
-      );
-      _pendingResource = resource;
-      if (browserSignal?.aborted) {
-        abortPending();
-      } else {
-        browserSignal?.addEventListener('abort', abortPending, { once: true });
-      }
-      return resource;
-    },
+    prepareVisit: (url, options = {}) => prepareVisit(url, options, directNavigation),
 
     async visit(url, options, apply) {
       const target = new URL(url, documentBaseUrl());
@@ -1499,7 +1526,6 @@ export async function createPageNavigationEngine(
       if (
         get &&
         !options._refresh &&
-        !options._entryCommitted &&
         Boolean(target.hash) &&
         isRenderedPageUrl(target) &&
         target.pathname + target.search === window.location.pathname + window.location.search
@@ -1511,7 +1537,7 @@ export async function createPageNavigationEngine(
         await navigateEntry(target.href, options.replace ? 'replace' : 'auto', request).finished;
         return undefined;
       }
-      if (!browserVisitHandler || options._entryCommitted || !get || !isClientPage(target)) {
+      if (!browserVisitHandler || !get || !isClientPage(target)) {
         const resource = engine.prepareVisit(url, options);
         const returned = resource.method === 'GET' ? null : returnToRenderedEntry();
         return applyBrowserVisit(
@@ -1772,15 +1798,18 @@ export async function createPageNavigationEngine(
         handler: async () => {
           scrollRestoration.save();
           const key = event.destination.key;
-          const resource = engine.prepareVisit(url, {
-            preserveState: true,
-            _scrollPosition: scrollRestoration.read(key),
-            _entryCommitted: true,
-            _entryKey: key,
-            _navigationSignal: event.signal,
-            // Back and forward have no link or caller: only the app default applies.
-            _visualTransitionDone: event.hasUAVisualTransition,
-          });
+          // Back and forward have no link or caller: only the app default applies.
+          const resource = prepareVisit(
+            url,
+            { preserveState: true },
+            {
+              kind: 'traverse',
+              signal: event.signal,
+              entryKey: key,
+              scrollPosition: scrollRestoration.read(key),
+              visualTransitionDone: event.hasUAVisualTransition,
+            },
+          );
           const result = await applyBrowserVisit(apply, exposeResource(resource));
           event.signal.throwIfAborted();
           if (!result) {
@@ -1795,12 +1824,13 @@ export async function createPageNavigationEngine(
       scroll: 'manual',
       focusReset: event.navigationType === 'push' ? 'after-transition' : 'manual',
       async precommitHandler(controller) {
-        const resource = engine.prepareVisit(url, {
-          ...options,
-          _navigationSignal: event.signal,
-          _linkViewTransition: link ? linkViewTransition(anchor) : undefined,
-          _visualTransitionDone: event.hasUAVisualTransition,
-        });
+        const context: NavigationContext = {
+          kind: 'precommit',
+          signal: event.signal,
+          linkViewTransition: link ? linkViewTransition(anchor) : undefined,
+          visualTransitionDone: event.hasUAVisualTransition,
+        };
+        const resource = prepareVisit(url, options, context);
         let release!: (committed: boolean) => void;
         const urlReady = new Promise<boolean>((resolve) => {
           release = resolve;
@@ -1846,8 +1876,8 @@ export async function createPageNavigationEngine(
           controller.addHandler(async () => {
             // An abort has already released the renderer through `cancel`.
             event.signal.throwIfAborted();
-            resource.options._entryKey = window.navigation.currentEntry?.key;
-            markUnrenderedEntry(resource.options._entryKey, resource.id);
+            context.entryKey = window.navigation.currentEntry?.key;
+            markUnrenderedEntry(context.entryKey, resource.id);
             release(true);
             const result = await applyBrowserVisit(() => applied, resource);
             event.signal.throwIfAborted();
@@ -1881,8 +1911,8 @@ export async function createPageNavigationEngine(
       // A visit that loads its page before the browser commits owns this entry: any
       // other navigation would have aborted it. Its handler has yet to run, and a
       // navigation started from this event can supersede it first.
-      const signal = pending.options._navigationSignal;
-      if (signal && !signal.aborted && !pending.options._entryCommitted) {
+      const context = contextOf(pending);
+      if (context.kind === 'precommit' && !context.signal?.aborted) {
         markUnrenderedEntry(entry.key);
       }
       return;

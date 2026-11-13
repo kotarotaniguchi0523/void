@@ -286,6 +286,61 @@ function stubNavigationHistory() {
   return browser;
 }
 
+type NavigateInit = {
+  navigationType: NavigationType;
+  key?: string;
+  sourceElement?: unknown;
+  hashChange?: boolean;
+  hasUAVisualTransition?: boolean;
+};
+
+/** Deliver the event a browser fires before it commits `url`. */
+function dispatchNavigate(url: string, init: NavigateInit) {
+  const controller = new AbortController();
+  const result: { controller: AbortController; interception?: NavigationInterceptOptions } = {
+    controller,
+  };
+  const event = Object.assign(new Event('navigate', { cancelable: true }), {
+    canIntercept: true,
+    destination: {
+      url: new URL(url, window.location.origin).href,
+      key: init.key ?? '',
+      sameDocument: true,
+    },
+    downloadRequest: null,
+    formData: null,
+    hashChange: init.hashChange ?? false,
+    info: undefined,
+    navigationType: init.navigationType,
+    signal: controller.signal,
+    sourceElement: init.sourceElement ?? null,
+    hasUAVisualTransition: init.hasUAVisualTransition ?? false,
+    intercept(value: NavigationInterceptOptions) {
+      result.interception = value;
+    },
+  });
+  window.navigation.dispatchEvent(event);
+  return result;
+}
+
+/** Make `url` the current entry, as the browser does when a navigation commits. */
+function commitEntry(url: string, key: string, navigationType: NavigationType) {
+  const destination = new URL(url, window.location.origin);
+  const { pathname, search, hash } = destination;
+  Object.assign(window.location, { pathname, search, hash });
+  const from = window.navigation.currentEntry;
+  Object.assign(window.navigation, {
+    currentEntry: Object.assign(new EventTarget(), {
+      key,
+      url: destination.href,
+      getState: () => undefined,
+    }),
+  });
+  window.navigation.dispatchEvent(
+    Object.assign(new Event('currententrychange'), { from, navigationType }),
+  );
+}
+
 function createTestRouter({ adapter, ...config }: TestRouterConfig = {}) {
   return createVoidRouter({
     components: { home: loadComponent },
@@ -835,7 +890,7 @@ describe('createVoidRouter', () => {
     const unsafe = {
       method: 'POST',
       data: { secret: true },
-      _entryCommitted: true,
+      _resolveOnShell: true,
       preserveScroll: true,
     };
     await facade.visit('/users', unsafe);
@@ -2063,17 +2118,16 @@ describe('createVoidRouter', () => {
     );
     vi.stubGlobal('fetch', fetchMock);
 
-    const { router } = await createTestRouter({
+    const created = await createTestRouter({
       adapter: { applyUpdate },
       components: { docs: loadComponent, home: loadComponent },
       matchRoute: () => 'docs',
     });
+    created.start();
 
-    window.location.pathname = '/docs';
-    await router.visit('/docs#section', {
-      preserveState: true,
-      _entryCommitted: true,
-    });
+    const back = dispatchNavigate('/docs#section', { navigationType: 'traverse', key: 'docs' });
+    commitEntry('/docs#section', 'docs', 'traverse');
+    await back.interception!.handler!();
 
     expect(fetchMock).toHaveBeenCalledWith(
       '/docs',
@@ -2649,12 +2703,15 @@ describe('preserveState history updates (#506)', () => {
     return { applyUpdate };
   }
 
-  async function router(applyUpdate: ReturnType<typeof setup>['applyUpdate']) {
-    const { router } = await createTestRouter({
+  async function router(applyUpdate: ReturnType<typeof setup>['applyUpdate'], start = false) {
+    const { router, start: startRouter } = await createTestRouter({
       adapter: { applyUpdate },
       components: { home: loadComponent, settings: loadComponent },
       matchRoute: (url) => (url.startsWith('/settings') ? 'settings' : 'home'),
     });
+    if (start) {
+      startRouter();
+    }
     browserWrites.push.mockClear();
     browserWrites.replace.mockClear();
     return router;
@@ -2704,13 +2761,11 @@ describe('preserveState history updates (#506)', () => {
 
   it('does not write history for back/forward navigation', async () => {
     const { applyUpdate } = setup();
-    const r = await router(applyUpdate);
+    await router(applyUpdate, true);
 
-    await r.visit('/settings', {
-      preserveState: true,
-      _entryCommitted: true,
-      _scrollPosition: null,
-    });
+    const back = dispatchNavigate('/settings', { navigationType: 'traverse', key: 'settings' });
+    commitEntry('/settings', 'settings', 'traverse');
+    await back.interception!.handler!();
 
     expect(applyUpdate.mock.calls[0][3]).toEqual({ preserveState: true });
     expect(browserWrites.push).not.toHaveBeenCalled();
@@ -2763,7 +2818,11 @@ describe('superseded navigation commits (#507)', () => {
     return { documentStub, fetchGates, updateGates, rendered, applyUpdate, rejectDeferred };
   }
 
-  async function router(page: ReturnType<typeof setup>, config: TestRouterConfig = {}) {
+  async function router(
+    page: ReturnType<typeof setup>,
+    config: TestRouterConfig = {},
+    start = false,
+  ) {
     const created = await createTestRouter({
       ...config,
       adapter: {
@@ -2775,6 +2834,9 @@ describe('superseded navigation commits (#507)', () => {
       components: { a: loadComponent, b: loadComponent, home: loadComponent },
       matchRoute: (url) => (url.startsWith('/a') ? 'a' : url.startsWith('/b') ? 'b' : 'home'),
     });
+    if (start) {
+      created.start();
+    }
     browserWrites.push.mockClear();
     browserWrites.replace.mockClear();
     vi.mocked(window.scrollTo).mockClear();
@@ -2918,22 +2980,29 @@ describe('superseded navigation commits (#507)', () => {
 
   it('does not push an older URL after a back/forward visit', async () => {
     const page = setup();
+    const browser = stubNavigationHistory();
     const a = gate();
     const b = gate();
     page.updateGates.set('/a', a.promise);
+    const r = await router(page, {}, true);
+    await r.visit('/b');
+    const entryB = browser.currentEntry.key;
+    // Another page is on screen when the browser goes back to /b, so /b has to load.
+    await r.visit('/c');
     page.fetchGates.set('/b', b.promise);
-    const r = await router(page);
 
     const visitA = r.visit('/a');
     await entered(page, '/a');
-    // The browser has already moved to /b when traversal fires, before /b loads.
-    window.location.pathname = '/b';
-    const visitB = r.visit('/b', { _entryCommitted: true, _scrollPosition: null });
+    const navigate = vi.spyOn(browser, 'navigate');
+    // The browser has already moved to /b when its visit starts, before /b loads.
+    const visitB = browser.traverseTo(entryB).finished;
     a.release();
     await expect(visitA).resolves.toBeUndefined();
     b.release();
     await visitB;
 
+    expect(page.rendered.at(-1)).toBe('/b');
+    expect(navigate).not.toHaveBeenCalled();
     expect(browserWrites.push).not.toHaveBeenCalled();
     expect(window.location.pathname).toBe('/b');
   });
@@ -3214,61 +3283,6 @@ describe('superseded navigation commits (#507)', () => {
 });
 
 describe('browser navigate events', () => {
-  type NavigateInit = {
-    navigationType: NavigationType;
-    key?: string;
-    sourceElement?: unknown;
-    hashChange?: boolean;
-    hasUAVisualTransition?: boolean;
-  };
-
-  /** Deliver the event a browser fires before it commits `url`. */
-  function dispatchNavigate(url: string, init: NavigateInit) {
-    const controller = new AbortController();
-    const result: { controller: AbortController; interception?: NavigationInterceptOptions } = {
-      controller,
-    };
-    const event = Object.assign(new Event('navigate', { cancelable: true }), {
-      canIntercept: true,
-      destination: {
-        url: new URL(url, window.location.origin).href,
-        key: init.key ?? '',
-        sameDocument: true,
-      },
-      downloadRequest: null,
-      formData: null,
-      hashChange: init.hashChange ?? false,
-      info: undefined,
-      navigationType: init.navigationType,
-      signal: controller.signal,
-      sourceElement: init.sourceElement ?? null,
-      hasUAVisualTransition: init.hasUAVisualTransition ?? false,
-      intercept(value: NavigationInterceptOptions) {
-        result.interception = value;
-      },
-    });
-    window.navigation.dispatchEvent(event);
-    return result;
-  }
-
-  /** Make `url` the current entry, as the browser does when a navigation commits. */
-  function commitEntry(url: string, key: string, navigationType: NavigationType) {
-    const destination = new URL(url, window.location.origin);
-    const { pathname, search, hash } = destination;
-    Object.assign(window.location, { pathname, search, hash });
-    const from = window.navigation.currentEntry;
-    Object.assign(window.navigation, {
-      currentEntry: Object.assign(new EventTarget(), {
-        key,
-        url: destination.href,
-        getState: () => undefined,
-      }),
-    });
-    window.navigation.dispatchEvent(
-      Object.assign(new Event('currententrychange'), { from, navigationType }),
-    );
-  }
-
   function setup() {
     stubClientGlobals();
     const fetchPage = vi.fn(async (url: string) => pageJson({ component: 'home', url, props: {} }));
