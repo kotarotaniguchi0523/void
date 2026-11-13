@@ -16,7 +16,9 @@ import { createRoot, hydrateRoot } from 'react-dom/client';
 import {
   createRouterFacade,
   createPageNavigationEngine,
+  documentBaseUrl,
   idleNavigationState,
+  navigationStateFor,
   isAbortError,
   isCallSiteActionError,
   refreshPage,
@@ -176,7 +178,7 @@ function encodedPageUrl(url: string): string {
   if (!url) {
     return url;
   }
-  const parsed = new URL(url, window.location.origin);
+  const parsed = new URL(url, documentBaseUrl());
   return parsed.pathname + parsed.search;
 }
 
@@ -214,19 +216,6 @@ function prerenderedRouteUrl(pageData: ReactPageData): string | null {
   const pageUrl = encodedPageUrl(pageData.url);
   const query = staticVisitQuery(pageUrl, window.location.pathname + window.location.search);
   return query ? pageUrl + window.location.hash : null;
-}
-
-function navigationForResource(resource: PageNavigationResource): NavigationState {
-  const method = resource.method.toUpperCase();
-  const isSubmitting = method !== 'GET';
-  return {
-    state: isSubmitting ? 'submitting' : 'loading',
-    location: new URL(resource.fetchUrl + resource.hash, window.location.origin),
-    method:
-      method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE'
-        ? method
-        : 'GET',
-  };
 }
 
 function appReducer(state: AppState, action: AppAction): AppState {
@@ -291,7 +280,7 @@ function createRouter(
 ): RuntimeVoidRouter {
   const router: RuntimeVoidRouter = {
     get url() {
-      return new URL(currentUrl(), window.location.origin);
+      return new URL(currentUrl(), documentBaseUrl());
     },
     get path() {
       return this.url.pathname;
@@ -599,24 +588,22 @@ function App({
             pendingVisitSettlers.delete(resource.id);
             if (committed) {
               visitSettler.resolve(result.pageData);
-            } else if (resource.method.toUpperCase() === 'GET') {
+            } else if (resource.method === 'GET') {
               // A newer visit committed first. Settle like any abandoned visit.
               visitSettler.resolve(undefined);
             } else {
               visitSettler.reject(abortError());
             }
           }
-          if (!committed) {
-            if (activePendingNavigationId === resource.id) {
-              activePendingNavigationId = null;
-              dispatch({ type: 'abandon', resource, location: currentUrl() });
-            }
-            return;
-          }
-          if (activePendingNavigationId === resource.id) {
+          const active = activePendingNavigationId === resource.id;
+          if (active) {
             activePendingNavigationId = null;
           }
-          dispatch({ type: 'finish', resource, location: currentUrl() });
+          if (committed) {
+            dispatch({ type: 'finish', resource, location: currentUrl() });
+          } else if (active) {
+            dispatch({ type: 'abandon', resource, location: currentUrl() });
+          }
         })
         .catch((error) => {
           // The history write failed, so the address bar still shows the committed page.
@@ -679,9 +666,7 @@ function App({
           pendingVisitSettlers.delete(prepared.id);
           // Public data completion keeps the usual cancellation behavior for GETs.
           const abortingGetVisit =
-            prepared.method.toUpperCase() === 'GET' &&
-            !prepared.options._resolveOnShell &&
-            isAbortError(error);
+            prepared.method === 'GET' && !prepared.options._resolveOnShell && isAbortError(error);
           if (abortingGetVisit) {
             resolveVisit(undefined);
           } else {
@@ -722,7 +707,7 @@ function App({
             )
           : shell,
       };
-      const navigation = navigationForResource(next);
+      const navigation = navigationStateFor(next.fetchUrl + next.hash, next.method);
       navigationStore.set(navigation);
 
       terminalResource = next;

@@ -24,6 +24,7 @@ import {
 import { deserializePageData, ISLAND_FRONTMATTER_ID } from './serialize.ts';
 import { documentBaseUrl, isSameOriginPageUrl } from './url.ts';
 
+export { documentBaseUrl };
 export { getValidationErrors } from './adapter-helpers.ts';
 export {
   createLinkClickHandler,
@@ -176,7 +177,8 @@ function navigationMethod(method: string): NavigationMethod {
   return 'GET';
 }
 
-function navigationStateFor(url: string, method: string): NavigationState {
+/** The state of a visit that is loading `url`: submitting for any method but GET. */
+export function navigationStateFor(url: string, method: string): NavigationState {
   const normalized = navigationMethod(method);
   return {
     state: normalized === 'GET' ? 'loading' : 'submitting',
