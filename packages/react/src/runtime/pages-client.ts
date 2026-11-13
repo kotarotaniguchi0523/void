@@ -116,6 +116,10 @@ type AppAction =
 
 const deferredState = new WeakMap<DeferredResource, DeferredResourceState>();
 const viewTransitionWaiters = new Map<number, () => void>();
+// With a navigation fallback, React reads a shell that stays pending until the browser has
+// captured the screen the view transition animates from. The gate settles that shell: with the
+// destination once the capture is done, or with nothing when the visit ends first.
+const viewTransitionGates = new Map<number, (reveal: boolean) => void>();
 const pendingVisitSettlers = new Map<number, VisitSettler>();
 let committedResources = new WeakSet<ReactPageResource>();
 const EMPTY_PARAMS: Record<string, string> = {};
@@ -458,6 +462,27 @@ class RouteRenderBoundary extends React.Component<
   }
 }
 
+/**
+ * Ends a visit's part in a view transition. A destination still waiting for the browser's
+ * capture is dropped, and a transition waiting for React's commit continues.
+ */
+function releaseViewTransition(id: number): void {
+  settleViewTransitionGate(id, false);
+  const resolveViewTransition = viewTransitionWaiters.get(id);
+  if (resolveViewTransition) {
+    viewTransitionWaiters.delete(id);
+    resolveViewTransition();
+  }
+}
+
+function settleViewTransitionGate(id: number, reveal: boolean): void {
+  const settle = viewTransitionGates.get(id);
+  if (settle) {
+    viewTransitionGates.delete(id);
+    settle(reveal);
+  }
+}
+
 function startViewTransition(
   resource: ReactPageResource,
   reveal: () => void,
@@ -572,11 +597,7 @@ function App({
       resource
         .commit()
         .then((committed) => {
-          const resolveViewTransition = viewTransitionWaiters.get(resource.id);
-          if (resolveViewTransition) {
-            viewTransitionWaiters.delete(resource.id);
-            resolveViewTransition();
-          }
+          releaseViewTransition(resource.id);
           const visitSettler = pendingVisitSettlers.get(resource.id);
           if (visitSettler) {
             pendingVisitSettlers.delete(resource.id);
@@ -604,11 +625,7 @@ function App({
         .catch((error) => {
           // The history write failed, so the address bar still shows the committed page.
           // End this visit and show that page again; a newer visit keeps its own state.
-          const resolveViewTransition = viewTransitionWaiters.get(resource.id);
-          if (resolveViewTransition) {
-            viewTransitionWaiters.delete(resource.id);
-            resolveViewTransition();
-          }
+          releaseViewTransition(resource.id);
           const visitSettler = pendingVisitSettlers.get(resource.id);
           if (visitSettler) {
             pendingVisitSettlers.delete(resource.id);
@@ -631,8 +648,7 @@ function App({
       if (activePendingNavigationId !== null) {
         pendingVisitSettlers.get(activePendingNavigationId)?.abort();
         pendingVisitSettlers.delete(activePendingNavigationId);
-        viewTransitionWaiters.get(activePendingNavigationId)?.();
-        viewTransitionWaiters.delete(activePendingNavigationId);
+        releaseViewTransition(activePendingNavigationId);
       }
       const prepared = resource as ReactPageResource;
       const options = prepared.options;
@@ -645,62 +661,70 @@ function App({
         rejectVisit = reject;
       });
 
-      const next: ReactPageResource = {
-        ...prepared,
-        shell: prepared.shell.then(
-          (result) => {
-            if (!result) {
-              const resolveViewTransition = viewTransitionWaiters.get(prepared.id);
-              if (resolveViewTransition) {
-                viewTransitionWaiters.delete(prepared.id);
-                resolveViewTransition();
-              }
-              pendingVisitSettlers.delete(prepared.id);
-              if (activePendingNavigationId === prepared.id) {
-                activePendingNavigationId = null;
-              }
-              // The browser is leaving or downloading a file: keep the current page.
-              dispatch({ type: 'abandon', resource: prepared, location: currentUrl() });
-              resolveVisit(undefined);
-            } else if (resolveOnData) {
-              pendingVisitSettlers.delete(prepared.id);
-              resolveVisit(result.pageData);
-            }
-            return result;
-          },
-          (error) => {
-            const resolveViewTransition = viewTransitionWaiters.get(prepared.id);
-            if (resolveViewTransition) {
-              viewTransitionWaiters.delete(prepared.id);
-              resolveViewTransition();
-            }
+      const shell = prepared.shell.then(
+        (result) => {
+          if (!result) {
+            releaseViewTransition(prepared.id);
             pendingVisitSettlers.delete(prepared.id);
-            // Public data completion keeps the usual cancellation behavior for GETs.
-            const abortingGetVisit =
-              prepared.method.toUpperCase() === 'GET' &&
-              !prepared.options._resolveOnShell &&
-              isAbortError(error);
-            if (abortingGetVisit) {
-              resolveVisit(undefined);
-            } else {
-              rejectVisit(error);
-            }
             if (activePendingNavigationId === prepared.id) {
               activePendingNavigationId = null;
             }
-            if (
-              NavigationFallback ||
-              resolveOnData ||
-              isAbortError(error) ||
-              isCallSiteActionError(error)
-            ) {
-              dispatch({ type: 'abandon', resource: prepared, location: currentUrl() });
-              return undefined;
-            }
-            dispatch({ type: 'fail', resource: prepared, location: currentUrl() });
-            throw error;
-          },
-        ),
+            // The browser is leaving or downloading a file: keep the current page.
+            dispatch({ type: 'abandon', resource: prepared, location: currentUrl() });
+            resolveVisit(undefined);
+          } else if (resolveOnData) {
+            pendingVisitSettlers.delete(prepared.id);
+            resolveVisit(result.pageData);
+          }
+          return result;
+        },
+        (error) => {
+          releaseViewTransition(prepared.id);
+          pendingVisitSettlers.delete(prepared.id);
+          // Public data completion keeps the usual cancellation behavior for GETs.
+          const abortingGetVisit =
+            prepared.method.toUpperCase() === 'GET' &&
+            !prepared.options._resolveOnShell &&
+            isAbortError(error);
+          if (abortingGetVisit) {
+            resolveVisit(undefined);
+          } else {
+            rejectVisit(error);
+          }
+          if (activePendingNavigationId === prepared.id) {
+            activePendingNavigationId = null;
+          }
+          if (
+            NavigationFallback ||
+            resolveOnData ||
+            isAbortError(error) ||
+            isCallSiteActionError(error)
+          ) {
+            dispatch({ type: 'abandon', resource: prepared, location: currentUrl() });
+            return undefined;
+          }
+          dispatch({ type: 'fail', resource: prepared, location: currentUrl() });
+          throw error;
+        },
+      );
+      // The fallback is on screen while the shell loads, so a view transition has to capture it
+      // before React renders the destination. React reads a shell that waits for that capture.
+      const gated =
+        Boolean(NavigationFallback) &&
+        prepared.viewTransition &&
+        typeof document.startViewTransition === 'function';
+      const captured = gated
+        ? new Promise<boolean>((resolve) => {
+            viewTransitionGates.set(prepared.id, resolve);
+          })
+        : null;
+      const next: ReactPageResource = {
+        ...prepared,
+        shell: captured
+          ? shell.then(
+              (result) => result && captured.then((reveal) => (reveal ? result : undefined)),
+            )
+          : shell,
       };
       const navigation = navigationForResource(next);
       navigationStore.set(navigation);
@@ -734,10 +758,29 @@ function App({
             dispatch({ type: 'reveal', resource: next });
           }
         };
-        next.shell.then((result) => {
+        shell.then((result) => {
           shellSettled = true;
-          if (result) {
+          if (!result) {
+            return;
+          }
+          if (!gated) {
             reveal(true);
+            return;
+          }
+          if (activePendingNavigationId !== next.id) {
+            return;
+          }
+          // The browser captures the old page, or the fallback when it is already committed,
+          // before this callback runs. A visit superseded in between has been released.
+          const update = () => {
+            settleViewTransitionGate(next.id, true);
+            reveal(true);
+          };
+          try {
+            startViewTransition(next, update, true);
+          } catch {
+            update();
+            releaseViewTransition(next.id);
           }
         });
         // A cached shell settles before the next paint. Avoid committing the fallback
@@ -756,7 +799,7 @@ function App({
         });
       };
 
-      next.shell.then(
+      shell.then(
         (result) => {
           if (result && activePendingNavigationId === next.id) {
             startViewTransition(next, reveal, next.viewTransition);
@@ -838,8 +881,7 @@ function App({
                     return;
                   }
                   activePendingNavigationId = null;
-                  viewTransitionWaiters.get(resource.id)?.();
-                  viewTransitionWaiters.delete(resource.id);
+                  releaseViewTransition(resource.id);
                   const settler = pendingVisitSettlers.get(resource.id);
                   pendingVisitSettlers.delete(resource.id);
                   if (settler) {
@@ -860,6 +902,7 @@ function App({
 export async function startReactPages(config: ReactPagesConfig): Promise<ReactPagesClient> {
   terminalResource = null;
   viewTransitionWaiters.clear();
+  viewTransitionGates.clear();
   pendingVisitSettlers.clear();
   committedResources = new WeakSet();
   activePendingNavigationId = null;
@@ -933,10 +976,9 @@ export async function startReactPages(config: ReactPagesConfig): Promise<ReactPa
               settler.reject(error);
             }
             pendingVisitSettlers.clear();
-            for (const resolve of viewTransitionWaiters.values()) {
-              resolve();
+            for (const id of [...viewTransitionGates.keys(), ...viewTransitionWaiters.keys()]) {
+              releaseViewTransition(id);
             }
-            viewTransitionWaiters.clear();
             activePendingNavigationId = null;
             showTerminalPageError(resource ? resource.destination() : currentUrl());
           },

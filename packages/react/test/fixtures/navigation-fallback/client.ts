@@ -1,5 +1,5 @@
 import React from 'react';
-import type { NavigationState, VoidRouter } from 'void/pages-client';
+import type { NavigationState, VisitOptions, VoidRouter } from 'void/pages-client';
 import { action } from '../../../src/runtime/action.ts';
 import { startReactPages } from '../../../src/runtime/pages-client.ts';
 import { useNavigation } from '../../../src/runtime/use-navigation.ts';
@@ -11,6 +11,7 @@ declare global {
     >;
     __navigateInAction(destination: string, method: string): void;
     __finishAction?: () => void;
+    __visit(url: string, options?: VisitOptions): Promise<unknown>;
   }
 }
 
@@ -84,6 +85,10 @@ function Dashboard() {
   );
 }
 
+function About() {
+  return React.createElement('main', null, React.createElement('h1', null, 'About'));
+}
+
 function NavigationFallback() {
   useRecordNavigation();
   React.useLayoutEffect(() => {
@@ -99,11 +104,15 @@ void startReactPages({
     home: async () => ({ default: Home }),
     dashboard: async () => ({ default: Dashboard }),
     scroll: async () => ({ default: ScrollPage }),
+    about: async () => ({ default: About }),
   },
-  layoutTree: { home: ['layout'], dashboard: ['layout'] },
+  layoutTree: { home: ['layout'], dashboard: ['layout'], about: ['layout'] },
   routeMeta: {},
   matchRoute: (url) => {
     const path = new URL(url, location.origin).pathname;
+    if (path === '/about') {
+      return 'about';
+    }
     return path === '/dashboard' ? 'dashboard' : path === '/scroll.html' ? 'scroll' : 'home';
   },
   staticPageData: false,
@@ -115,6 +124,7 @@ void startReactPages({
   navigationFallback: location.search.includes('fallback=off') ? undefined : NavigationFallback,
 }).then((client) => {
   router = client.router;
+  window.__visit = (url, options) => router.visit(url, options);
   window.__navigateInAction = (destination, method) => {
     React.startTransition(async () => {
       // This fixture exercises the data-ready reveal. Hold its frame until the shell arrives,
