@@ -48,6 +48,8 @@ type LinkPrefetchStrategy = 'hover' | 'click' | 'mount' | 'visible';
 
 With an array such as `['visible', 'hover']`, the first strategy to happen loads the page, and later ones reuse it. `prefetch` works only on GET links, and links to other sites are never prefetched. No strategy prefetches while the browser reports data saver or a 2G connection, which only Chromium-based browsers report; calling `router.prefetch()` yourself still loads the page.
 
+`router.prefetch()` resolves once the request has ended. A request that the network fails does not reject the promise: nothing is cached, and the page loads when it is visited. An invalid `cacheFor` throws.
+
 `cacheFor` sets how long a prefetched page is reused, in milliseconds or as a duration such as `'5m'`. A pair such as `['30s', '5m']` treats the page as fresh for 30 seconds, then still shows it for up to 5 minutes while loading a fresh copy in the background.
 
 Each adapter plugin's `prefetch` option sets app-wide values:

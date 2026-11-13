@@ -82,6 +82,22 @@ function unwrapPrefetchedPageData(value: unknown): unknown {
   return isPrefetchRedirect(value) ? value.pageData : value;
 }
 
+/**
+ * The network failed a speculative request. Its cache entry rejects, so the cache drops
+ * it and a later visit requests the page; the caller of prefetch() has nothing to handle.
+ */
+class PrefetchRequestError extends Error {}
+
+/** What prefetch() resolves with: a request the network failed prefetched nothing. */
+function prefetchedPageData(response: Promise<unknown>): Promise<unknown> {
+  return response.then(unwrapPrefetchedPageData, (error: unknown) => {
+    if (error instanceof PrefetchRequestError) {
+      return undefined;
+    }
+    throw error;
+  });
+}
+
 type NavigationCommitTarget = { fetchUrl: string; hash: string; method: string };
 
 export type VisitOptions = {
@@ -737,7 +753,7 @@ export async function createPageNavigationEngine(
       return fetchPageResponse(url, { method: 'GET', headers }).then(async (r) => {
         if (!r) {
           // Transient network errors must not turn a later visit into a hard navigation.
-          throw new Error('pages: Prefetch request failed.');
+          throw new PrefetchRequestError('pages: Prefetch request failed.');
         }
         let destination: string | undefined;
         if (r.redirected) {
@@ -1647,7 +1663,7 @@ export async function createPageNavigationEngine(
 
       const existing = _prefetchCache.get(prefetchUrl);
       if (existing) {
-        return existing.response.then(unwrapPrefetchedPageData);
+        return prefetchedPageData(existing.response);
       }
       const ttl =
         options.cacheFor !== undefined
@@ -1665,7 +1681,7 @@ export async function createPageNavigationEngine(
         return data;
       });
       _prefetchCache.set(prefetchUrl, fetchPromise, ttl);
-      return fetchPromise.then(unwrapPrefetchedPageData);
+      return prefetchedPageData(fetchPromise);
     },
 
     flush(url) {

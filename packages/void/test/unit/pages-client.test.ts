@@ -1243,10 +1243,39 @@ describe('createVoidRouter', () => {
       matchRoute: (url) => (url === '/users' ? 'users' : 'home'),
     });
 
-    await expect(router.prefetch('/users')).rejects.toThrow('Prefetch request failed');
+    await expect(router.prefetch('/users')).resolves.toBeUndefined();
     await expect(router.prefetch('/users')).resolves.toEqual(pageData);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(window.location.href).toBeUndefined();
+    router.flushAll();
+  });
+
+  it('resolves the public prefetch when the request fails, and the visit then requests the page', async () => {
+    stubClientGlobals();
+    const pageData = { component: 'users', props: { users: [] } };
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError('Network unavailable'))
+      .mockResolvedValueOnce(pageJson(pageData));
+    vi.stubGlobal('fetch', fetchMock);
+    const { router: raw } = await createTestRouter({
+      components: { home: loadComponent, users: loadComponent },
+      matchRoute: (url) => (url === '/users' ? 'users' : 'home'),
+    });
+    const router = createRouterFacade(raw, () => '/');
+
+    const first = router.prefetch('/users');
+    // A second caller shares the request that is still in flight.
+    const second = router.prefetch('/users');
+    await expect(first).resolves.toBeUndefined();
+    await expect(second).resolves.toBeUndefined();
+
+    await expect(raw.visit('/users')).resolves.toMatchObject(pageData);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(window.location.href).toBeUndefined();
+    expect(() => router.prefetch('/other', { cacheFor: '30 sec' })).toThrow(
+      "prefetch: Invalid cacheFor value '30 sec'",
+    );
     router.flushAll();
   });
 
@@ -1268,7 +1297,7 @@ describe('createVoidRouter', () => {
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const visit = router.visit('/users');
     delayed.reject(new TypeError('Offline during prefetch'));
-    await expect(speculative).rejects.toThrow('Prefetch request failed');
+    await expect(speculative).resolves.toBeUndefined();
     await expect(visit).resolves.toMatchObject(pageData);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     router.flushAll();
