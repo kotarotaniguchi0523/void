@@ -19,6 +19,7 @@ type TestWindow = Window & {
   __SPA_MARKER?: boolean;
   __linkOnClick?: boolean;
   __preventedClick?: boolean;
+  __viewTransitions?: number;
 };
 
 /**
@@ -1791,6 +1792,49 @@ export function registerSharedClientTests({
       );
 
       expect(await page.evaluate(() => (window as TestWindow).__linkOnClick)).toBe(true);
+      expect(await page.evaluate(() => (window as TestWindow).__SPA_MARKER)).toBe(true);
+      expect(page.url()).toBe(BASE + '/users');
+    } finally {
+      await page.context().close();
+    }
+  });
+
+  it.each([
+    ['a Link with viewTransition', 'view-transition-link', 1],
+    ['a plain anchor with data-void-view-transition', 'view-transition-anchor', 1],
+    ['a Link without it, while the app default is off', 'onclick-link', 0],
+  ])('view transition: %s', async (_name, testId, transitions) => {
+    const page = await newPage();
+    try {
+      // The server renders the attribute, so the first click after hydration has it.
+      const html = await (await fetch(BASE + '/link-behavior')).text();
+      const anchors = html.match(/<a\b[^>]*>/g) ?? [];
+      const rendered = anchors.find((anchor) => anchor.includes(`data-testid="${testId}"`));
+      expect(rendered?.includes('data-void-view-transition="true"')).toBe(transitions === 1);
+
+      await page.goto(BASE + '/link-behavior');
+      await waitForHydration(page);
+      const selector = `[data-testid="${testId}"]`;
+      expect(await page.getAttribute(selector, 'data-void-view-transition')).toBe(
+        transitions === 1 ? 'true' : null,
+      );
+      await page.evaluate(() => {
+        const testWindow = window as TestWindow;
+        testWindow.__SPA_MARKER = true;
+        testWindow.__viewTransitions = 0;
+        const start = document.startViewTransition.bind(document);
+        document.startViewTransition = ((...args: Parameters<typeof start>) => {
+          testWindow.__viewTransitions!++;
+          return start(...args);
+        }) as typeof document.startViewTransition;
+      });
+
+      await page.click(selector);
+      await page.waitForFunction(() =>
+        document.querySelector('h1')?.textContent?.includes('Users'),
+      );
+
+      expect(await page.evaluate(() => (window as TestWindow).__viewTransitions)).toBe(transitions);
       expect(await page.evaluate(() => (window as TestWindow).__SPA_MARKER)).toBe(true);
       expect(page.url()).toBe(BASE + '/users');
     } finally {

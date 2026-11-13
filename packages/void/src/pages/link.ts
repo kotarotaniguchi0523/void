@@ -27,6 +27,8 @@ export type BaseLinkProps = {
   prefetch?: Exclude<LinkPrefetchValue, true>;
   cacheFor?: CacheForInput;
   activeMatch?: LinkActiveMatch;
+  /** Use a view transition for this link, or not, whatever the app default is. */
+  viewTransition?: boolean;
 };
 
 type LinkClickEvent = Pick<
@@ -75,26 +77,53 @@ export function linkPrefetchStrategies(
 export const LINK_MARKER_ATTRIBUTE = 'data-void-link';
 
 /**
+ * The attribute that turns a view transition on (`true`) or off (`false`) for visits
+ * that start from its anchor. Link renders it from `viewTransition`; an authored anchor
+ * can carry it too.
+ */
+export const LINK_VIEW_TRANSITION_ATTRIBUTE = 'data-void-view-transition';
+
+/** The anchor's view transition override. Any value but `true` and `false` is none. */
+export function linkViewTransition(anchor: Pick<Element, 'getAttribute'>): boolean | undefined {
+  const value = anchor.getAttribute(LINK_VIEW_TRANSITION_ATTRIBUTE);
+  return value === 'true' ? true : value === 'false' ? false : undefined;
+}
+
+/**
  * Attributes every Link renders on its anchor, on the server and the client: the Link
- * marker, and the same delegated prefetching that authored anchors use.
+ * marker, the same delegated prefetching that authored anchors use, and the view
+ * transition override. The router reads them all from the anchor when it is followed.
  */
 export function linkPrefetchAttributes(
   router: VoidRouter | null | undefined,
-  props: Pick<BaseLinkProps, 'prefetch' | 'cacheFor'> & { reloadDocument?: boolean },
-): { 'data-void-link'?: ''; 'data-void-prefetch'?: string; 'data-void-cache-for'?: string } {
+  props: Pick<BaseLinkProps, 'prefetch' | 'cacheFor' | 'viewTransition'> & {
+    reloadDocument?: boolean;
+  },
+): {
+  'data-void-link'?: '';
+  'data-void-prefetch'?: string;
+  'data-void-cache-for'?: string;
+  'data-void-view-transition'?: 'true' | 'false';
+} {
   if (!router) {
     return {};
   }
+  const { cacheFor, viewTransition } = props;
+  const marker = {
+    [LINK_MARKER_ATTRIBUTE]: '' as const,
+    ...(typeof viewTransition === 'boolean' && {
+      [LINK_VIEW_TRANSITION_ATTRIBUTE]: viewTransition ? ('true' as const) : ('false' as const),
+    }),
+  };
   // The app default is a client setting. Render the same marker during SSR.
   const strategies = linkPrefetchStrategies(props);
   const strategy =
     !props.reloadDocument && props.prefetch === undefined ? 'default' : strategies.join(' ');
   if (!strategy) {
-    return { [LINK_MARKER_ATTRIBUTE]: '' };
+    return marker;
   }
-  const { cacheFor } = props;
   return {
-    [LINK_MARKER_ATTRIBUTE]: '',
+    ...marker,
     'data-void-prefetch': strategy,
     ...(cacheFor !== undefined && { 'data-void-cache-for': String(cacheFor) }),
   };

@@ -12,6 +12,7 @@ import {
   linkPendingAttributes,
   linkPrefetchAttributes,
   linkPrefetchStrategies,
+  linkViewTransition,
   observeLinkVisible,
   prefetchResolvedLink,
   resolveSameOrigin,
@@ -89,6 +90,45 @@ describe('Link prefetch strategies and attributes', () => {
       expect(linkPrefetchAttributes(router, { reloadDocument: true })).toEqual(marker);
     }
     expect(linkPrefetchAttributes(null, {})).toEqual({});
+  });
+
+  it('renders the view transition override, on the server and the client', () => {
+    const attribute = 'data-void-view-transition';
+    for (const router of [createSsrRouter('/'), createRouter()]) {
+      expect(linkPrefetchAttributes(router, { viewTransition: true })).toEqual({
+        'data-void-link': '',
+        'data-void-prefetch': 'default',
+        [attribute]: 'true',
+      });
+      expect(linkPrefetchAttributes(router, { viewTransition: false })).toMatchObject({
+        [attribute]: 'false',
+      });
+      // Independent of prefetching and of a document reload.
+      expect(linkPrefetchAttributes(router, { prefetch: false, viewTransition: true })).toEqual({
+        'data-void-link': '',
+        [attribute]: 'true',
+      });
+      expect(linkPrefetchAttributes(router, {})).not.toHaveProperty(attribute);
+      expect(linkPrefetchAttributes(router, { viewTransition: undefined })).not.toHaveProperty(
+        attribute,
+      );
+    }
+  });
+});
+
+describe('linkViewTransition', () => {
+  const anchor = (value: string | null) =>
+    ({
+      getAttribute: (name: string) => (name === 'data-void-view-transition' ? value : null),
+    }) as Element;
+
+  it('reads true and false', () => {
+    expect(linkViewTransition(anchor('true'))).toBe(true);
+    expect(linkViewTransition(anchor('false'))).toBe(false);
+  });
+
+  it.each([null, '', 'TRUE', 'yes', '1', '0', ' true'])('ignores %j', (value) => {
+    expect(linkViewTransition(anchor(value))).toBeUndefined();
   });
 });
 

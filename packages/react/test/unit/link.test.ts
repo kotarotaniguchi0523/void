@@ -44,6 +44,18 @@ describe('GET-only Link', () => {
     );
   });
 
+  it('renders the view transition override only when the prop is set', () => {
+    expect(renderAt('/', { href: '/users', viewTransition: true })).toContain(
+      'data-void-view-transition="true"',
+    );
+    expect(renderAt('/', { href: '/users', viewTransition: false })).toContain(
+      'data-void-view-transition="false"',
+    );
+    const unset = renderAt('/', { href: '/users' });
+    expect(unset).not.toContain('data-void-view-transition');
+    expect(unset).not.toContain('viewTransition');
+  });
+
   it('marks the active link and its parent', () => {
     const active = renderAt('/users', { href: '/users' });
     expect(active).toContain('aria-current="page"');

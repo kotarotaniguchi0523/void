@@ -13,7 +13,7 @@ import {
 import type { BoundaryManifest } from './boundary-plans.ts';
 import { initClientHead, applyClientHead } from './head-client.ts';
 import type { HeadDescriptor } from './head.ts';
-import { LINK_MARKER_ATTRIBUTE } from './link.ts';
+import { LINK_MARKER_ATTRIBUTE, linkViewTransition } from './link.ts';
 import { PrefetchCache, parseCacheFor } from './prefetch.ts';
 import type { CacheForInput, CacheForResult, LinkPrefetchValue } from './prefetch.ts';
 import type { PageObject } from './protocol.ts';
@@ -90,6 +90,10 @@ export type VisitOptions = {
   _entryKey?: string;
   /** @internal The browser owns this visit’s URL and cancellation. */
   _navigationSignal?: AbortSignal;
+  /** @internal The view transition override of the anchor that started this visit. */
+  _linkViewTransition?: boolean;
+  /** @internal The browser has already animated this navigation, as a swipe gesture does. */
+  _visualTransitionDone?: boolean;
   /** @internal Used by router.refresh() to refetch the current URL even when it has a hash */
   _refresh?: boolean;
   /** @internal Used by actions: the page query they added to the URL, which redirects leave out */
@@ -141,6 +145,11 @@ export type PageNavigationResource = {
   hash: string;
   method: string;
   options: VisitOptions;
+  /**
+   * Whether to render this visit in a view transition. The engine decides once per
+   * visit; adapters only run the transition where they know the page has rendered.
+   */
+  viewTransition: boolean;
   shell: Promise<PageNavigationResult | undefined>;
   /** Destination after redirects, including its query and hash. */
   destination(): string;
@@ -323,6 +332,18 @@ export async function createPageNavigationEngine(
   let started = false;
   const exposedResources = new Set<PageNavigationResource>();
   const retiredResources = new Set<PageNavigationResource>();
+
+  /**
+   * The one place that decides whether a visit uses a view transition: the caller's
+   * option, then the link's attribute, then the app default. A navigation the browser
+   * has already animated gets none: a second animation would replay it.
+   */
+  function resolveViewTransition(options: VisitOptions): boolean {
+    if (options._visualTransitionDone) {
+      return false;
+    }
+    return options.viewTransition ?? options._linkViewTransition ?? config.viewTransitions;
+  }
 
   function abortPendingResource(resource: PageNavigationResource): void {
     if (_pendingResource === resource) {
@@ -1422,6 +1443,7 @@ export async function createPageNavigationEngine(
         hash,
         method,
         options,
+        viewTransition: resolveViewTransition(options),
         shell,
         destination: () => commitTarget.fetchUrl + commitTarget.hash,
         abort: stop,
@@ -1749,6 +1771,8 @@ export async function createPageNavigationEngine(
             _entryCommitted: true,
             _entryKey: key,
             _navigationSignal: event.signal,
+            // Back and forward have no link or caller: only the app default applies.
+            _visualTransitionDone: event.hasUAVisualTransition,
           });
           const result = await applyBrowserVisit(apply, exposeResource(resource));
           event.signal.throwIfAborted();
@@ -1770,6 +1794,8 @@ export async function createPageNavigationEngine(
         const resource = engine.prepareVisit(url, {
           ...options,
           _navigationSignal: event.signal,
+          _linkViewTransition: link ? linkViewTransition(anchor) : undefined,
+          _visualTransitionDone: event.hasUAVisualTransition,
         });
         let release!: (committed: boolean) => void;
         const urlReady = new Promise<boolean>((resolve) => {

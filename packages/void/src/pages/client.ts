@@ -485,8 +485,7 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
         }
       };
 
-      const useTransition = resource.options.viewTransition ?? config.viewTransitions;
-      if (useTransition && document.startViewTransition) {
+      if (resource.viewTransition && document.startViewTransition) {
         // The callback runs on a later frame. A newer visit started by then renders instead.
         const transition = document.startViewTransition(applyUpdate);
         // A rejected callback rejects these too; the visit reports the error once, below.

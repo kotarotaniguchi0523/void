@@ -134,6 +134,15 @@ export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeU
       </p>
 
       <p>
+        <Link href="/users" data-testid="view-transition-link" viewTransition>
+          Users with a view transition
+        </Link>
+        <a href="/users" data-testid="view-transition-anchor" data-void-view-transition="true">
+          Users with a view transition (plain anchor)
+        </a>
+      </p>
+
+      <p>
         <Link href="/users" data-testid="blank-link" target="_blank">
           Open users in a new tab
         </Link>

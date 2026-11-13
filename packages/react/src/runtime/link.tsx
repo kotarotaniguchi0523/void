@@ -11,6 +11,7 @@ export function Link({
   prefetch,
   cacheFor,
   activeMatch,
+  viewTransition,
   children,
   ...rest
 }: LinkProps): JSX.Element {
@@ -27,6 +28,7 @@ export function Link({
       {...linkPrefetchAttributes(router, {
         prefetch,
         cacheFor,
+        viewTransition,
         reloadDocument: Object.hasOwn(rest, 'data-void-reload'),
       })}
       {...state}

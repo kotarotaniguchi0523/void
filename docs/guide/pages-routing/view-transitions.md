@@ -45,6 +45,8 @@ export default defineConfig({
 
 This enables view transitions for all navigations, including `Link` clicks, programmatic `router.visit()` calls, and browser back or forward.
 
+Void skips its transition when the browser has already animated the navigation, such as a swipe gesture to go back.
+
 ## Per-Link Override
 
 Override the global setting on individual links:
@@ -101,12 +103,21 @@ Override the global setting on individual links:
 
 :::
 
+A standard anchor takes the same override as an attribute, set to `true` or `false`:
+
+```html
+<a href="/about" data-void-view-transition="true">About</a>
+<a href="/settings" data-void-view-transition="false">Settings</a>
+```
+
 Or programmatically:
 
 ```ts
 router.visit('/about', { viewTransition: true });
 router.visit('/settings', { viewTransition: false });
 ```
+
+An option passed to `router.visit()` or `createLinkClickHandler()` takes precedence over the link's own setting, which takes precedence over the plugin option. Browser back and forward always use the plugin option.
 
 ## Customizing with CSS
 

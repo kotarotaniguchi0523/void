@@ -13,6 +13,7 @@ export function checkLinkPassThroughAttributes(): void {
     onClick: track,
     onMouseenter: () => {},
     activeMatch: 'prefix',
+    viewTransition: false,
   };
   void h(Link, props);
   // @ts-expect-error href is required
@@ -27,5 +28,15 @@ export function checkLinkPassThroughAttributes(): void {
   const queryData: LinkProps = { href: '/users', data: { page: 2 } };
   // @ts-expect-error use a named strategy
   const booleanPrefetch: LinkProps = { href: '/users', prefetch: true };
-  void [missingHref, badPrefetch, badActiveMatch, mutation, queryData, booleanPrefetch];
+  // @ts-expect-error viewTransition is a boolean
+  const badViewTransition: LinkProps = { href: '/users', viewTransition: 'fade' };
+  void [
+    missingHref,
+    badPrefetch,
+    badActiveMatch,
+    mutation,
+    queryData,
+    booleanPrefetch,
+    badViewTransition,
+  ];
 }

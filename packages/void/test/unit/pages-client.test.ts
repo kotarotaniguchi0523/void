@@ -3219,6 +3219,7 @@ describe('browser navigate events', () => {
     key?: string;
     sourceElement?: unknown;
     hashChange?: boolean;
+    hasUAVisualTransition?: boolean;
   };
 
   /** Deliver the event a browser fires before it commits `url`. */
@@ -3241,6 +3242,7 @@ describe('browser navigate events', () => {
       navigationType: init.navigationType,
       signal: controller.signal,
       sourceElement: init.sourceElement ?? null,
+      hasUAVisualTransition: init.hasUAVisualTransition ?? false,
       intercept(value: NavigationInterceptOptions) {
         result.interception = value;
       },
@@ -3280,7 +3282,7 @@ describe('browser navigate events', () => {
     const created = await createTestRouter({ adapter: { applyUpdate } });
     created.start();
     const navigate = vi.spyOn(window.navigation, 'navigate');
-    const anchor = { hasAttribute: () => false };
+    const anchor = { hasAttribute: () => false, getAttribute: () => null };
 
     const click = dispatchNavigate('/docs#install', {
       navigationType: 'replace',
@@ -3466,6 +3468,263 @@ describe('browser navigate events', () => {
     expect(reload).toHaveBeenCalledOnce();
   });
 
+  describe('view transition decision', () => {
+    const ATTRIBUTE = 'data-void-view-transition';
+
+    /** The browser's navigation stub must be in place before the engine listens to it. */
+    async function setupTransitions(viewTransitions: boolean, browser = false) {
+      stubClientGlobals();
+      if (browser) {
+        stubBrowserNavigation();
+      }
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string) => pageJson({ component: 'home', url, props: {}, errors: null })),
+      );
+      const startViewTransition = vi.fn((callback: () => unknown) => {
+        const updateCallbackDone = Promise.resolve()
+          .then(callback)
+          .then(() => {});
+        return { updateCallbackDone, ready: updateCallbackDone, finished: updateCallbackDone };
+      });
+      Object.assign(document, { startViewTransition });
+      const applyUpdate = vi.fn();
+      const created = await createTestRouter({ viewTransitions, adapter: { applyUpdate } });
+      return { ...created, applyUpdate, startViewTransition };
+    }
+
+    function anchorWith(value?: string) {
+      const anchor = {
+        hasAttribute: (name: string) => name === ATTRIBUTE && value !== undefined,
+        getAttribute: (name: string) => (name === ATTRIBUTE ? (value ?? null) : null),
+      };
+      return { closest: () => anchor };
+    }
+
+    /** Click an anchor to `url`, then commit and render it as the browser does. */
+    async function click(url: string, attribute?: string, hasUAVisualTransition = false) {
+      const { interception } = dispatchNavigate(url, {
+        navigationType: 'push',
+        sourceElement: anchorWith(attribute),
+        hasUAVisualTransition,
+      });
+      const handlers: Array<() => unknown> = [];
+      await interception!.precommitHandler!({
+        redirect: vi.fn(),
+        addHandler: (handler) => {
+          handlers.push(handler);
+        },
+      });
+      commitEntry(url, `${url}-entry`, 'push');
+      await handlers[0]!();
+    }
+
+    async function traverse(url: string, init: Partial<NavigateInit> = {}) {
+      const back = dispatchNavigate(url, { navigationType: 'traverse', key: 'back', ...init });
+      commitEntry(url, 'back', 'traverse');
+      await back.interception!.handler!();
+    }
+
+    /** Add fields to every navigate event the browser stub dispatches. */
+    function decorateNavigateEvents(fields: Record<string, unknown>) {
+      const dispatch = window.navigation.dispatchEvent.bind(window.navigation);
+      window.navigation.dispatchEvent = (event) => dispatch(Object.assign(event, fields));
+    }
+
+    it.each([true, false])(
+      'uses the plugin default %j for a link without the attribute',
+      async (on) => {
+        const page = await setupTransitions(on);
+        page.start();
+
+        await click('/a');
+
+        expect(page.startViewTransition).toHaveBeenCalledTimes(on ? 1 : 0);
+        expect(page.applyUpdate).toHaveBeenCalledOnce();
+      },
+    );
+
+    it.each([
+      [false, 'true', 1],
+      [true, 'false', 0],
+    ])('lets a link attribute override the default %j with %j', async (on, attribute, count) => {
+      const page = await setupTransitions(on);
+      page.start();
+
+      await click('/a', attribute);
+
+      expect(page.startViewTransition).toHaveBeenCalledTimes(count);
+      expect(page.applyUpdate).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      [true, '', 1],
+      [true, 'no', 1],
+      [true, 'FALSE', 1],
+      [false, 'TRUE', 0],
+      [false, '1', 0],
+    ])('keeps the default %j for the invalid attribute value %j', async (on, attribute, count) => {
+      const page = await setupTransitions(on);
+      page.start();
+
+      await click('/a', attribute);
+
+      expect(page.startViewTransition).toHaveBeenCalledTimes(count);
+    });
+
+    it.each([
+      [false, true, 1],
+      [true, false, 0],
+    ])('lets a visit option override the default %j with %j', async (on, viewTransition, count) => {
+      const page = await setupTransitions(on, true);
+      page.start();
+
+      await page.router.visit('/a', { viewTransition });
+
+      expect(page.startViewTransition).toHaveBeenCalledTimes(count);
+      expect(page.applyUpdate).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      [true, 'false', 1],
+      [false, 'true', 0],
+    ])(
+      'lets the visit option %j override the link attribute %j',
+      async (viewTransition, attribute, count) => {
+        // The default disagrees with the option too, so only the option explains the result.
+        const page = await setupTransitions(!viewTransition, true);
+        page.start();
+        decorateNavigateEvents({ sourceElement: anchorWith(attribute) });
+
+        await page.router.visit('/a', { viewTransition });
+
+        expect(page.startViewTransition).toHaveBeenCalledTimes(count);
+      },
+    );
+
+    it('skips the transition when the browser has already animated the navigation', async () => {
+      const page = await setupTransitions(true);
+      page.start();
+
+      await click('/a', undefined, true);
+      await click('/b', 'true', true);
+      await traverse('/c', { hasUAVisualTransition: true });
+
+      expect(page.startViewTransition).not.toHaveBeenCalled();
+      expect(page.applyUpdate).toHaveBeenCalledTimes(3);
+    });
+
+    it('skips a visit option too when the browser has already animated', async () => {
+      const page = await setupTransitions(true, true);
+      page.start();
+      decorateNavigateEvents({ hasUAVisualTransition: true });
+
+      await page.router.visit('/a', { viewTransition: true });
+
+      expect(page.startViewTransition).not.toHaveBeenCalled();
+      expect(page.applyUpdate).toHaveBeenCalledOnce();
+    });
+
+    it.each([true, false])('uses only the plugin default %j for a traversal', async (on) => {
+      const page = await setupTransitions(on);
+      page.start();
+
+      // A traversal has no link; an attribute on its source element does not apply.
+      await traverse('/a', { sourceElement: anchorWith(on ? 'false' : 'true') });
+
+      expect(page.startViewTransition).toHaveBeenCalledTimes(on ? 1 : 0);
+      expect(page.applyUpdate).toHaveBeenCalledOnce();
+    });
+
+    it.each([true, false])('uses the plugin default %j for an action', async (on) => {
+      const page = await setupTransitions(on, true);
+      page.start();
+
+      await submitAction(page.router, '/?save', { method: 'POST' });
+
+      expect(page.startViewTransition).toHaveBeenCalledTimes(on ? 1 : 0);
+      expect(page.applyUpdate).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      [false, true, 1],
+      [true, false, 0],
+    ])(
+      'lets an action option override the default %j with %j',
+      async (on, viewTransition, count) => {
+        const page = await setupTransitions(on, true);
+        page.start();
+
+        await page.router.visit('/?save', { method: 'POST', viewTransition });
+
+        expect(page.startViewTransition).toHaveBeenCalledTimes(count);
+      },
+    );
+
+    it('updates without a transition in a browser that has no view transitions', async () => {
+      const page = await setupTransitions(true);
+      Object.assign(document, { startViewTransition: undefined });
+      page.start();
+
+      await click('/a', 'true');
+
+      expect(page.applyUpdate).toHaveBeenCalledOnce();
+    });
+
+    it('hands the adapter one resolved value with each resource', async () => {
+      const engineWith = async (viewTransitions: boolean) => {
+        stubClientGlobals();
+        vi.stubGlobal(
+          'fetch',
+          vi.fn(async (url: string) => pageJson({ component: 'home', url, props: {} })),
+        );
+        return createPageNavigationEngine({
+          adapter: {
+            createDeferred: () => ({}),
+            isLoading: () => false,
+            resolveDeferred: (_ref, value) => value,
+            rejectDeferred: (_ref, error) => error,
+          },
+          components: { home: loadComponent },
+          layoutTree: {},
+          routeMeta: {},
+          matchRoute: () => 'home',
+          viewTransitions,
+          prefetchHoverDelay: 75,
+          prefetchDefaultCacheFor: parseCacheFor('30s'),
+        });
+      };
+
+      /** A visit prepared without a navigate event, as actions are. */
+      const prepared = (
+        engine: Awaited<ReturnType<typeof engineWith>>,
+        options?: { viewTransition: boolean },
+      ) => {
+        const resource = engine.prepareVisit('/a', options);
+        // The next visit supersedes this one before it loads.
+        void resource.shell.catch(() => {});
+        return resource.viewTransition;
+      };
+
+      const off = await engineWith(false);
+      expect(prepared(off)).toBe(false);
+      expect(prepared(off, { viewTransition: true })).toBe(true);
+      const on = await engineWith(true);
+      expect(prepared(on)).toBe(true);
+      expect(prepared(on, { viewTransition: false })).toBe(false);
+
+      // The adapter's browser visit handler receives the same value.
+      const resources: Array<{ viewTransition: boolean }> = [];
+      on.setBrowserVisitHandler(async (resource) => {
+        resources.push(resource);
+        return (await resource.shell)?.pageData;
+      });
+      await traverse('/b');
+      await click('/c', 'false');
+      expect(resources.map((resource) => resource.viewTransition)).toEqual([true, false]);
+    });
+  });
+
   describe('URLs outside the route table', () => {
     /** `/dashboard` and `/api/health` are not pages: only the server knows what they serve. */
     async function setupUnmatched(respond: (url: string) => Response) {
@@ -3482,7 +3741,10 @@ describe('browser navigate events', () => {
     }
 
     function clickAnchor(url: string, attributes: Array<string>) {
-      const anchor = { hasAttribute: (name: string) => attributes.includes(name) };
+      const anchor = {
+        hasAttribute: (name: string) => attributes.includes(name),
+        getAttribute: (name: string) => (attributes.includes(name) ? '' : null),
+      };
       return dispatchNavigate(url, {
         navigationType: 'push',
         sourceElement: { closest: () => anchor },

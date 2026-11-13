@@ -13,6 +13,7 @@
     prefetch = undefined,
     cacheFor = undefined,
     activeMatch = undefined,
+    viewTransition = undefined,
     children,
     ...rest
   }: LinkProps = $props();
@@ -21,7 +22,7 @@
   const navigation = getContext<{ value: NavigationState } | undefined>("__void_navigation");
   const state = $derived(linkStateAttributes(router, navigation?.value, href, activeMatch));
   const prefetchAttrs = $derived(linkPrefetchAttributes(router, {
-    prefetch, cacheFor,
+    prefetch, cacheFor, viewTransition,
     reloadDocument: Object.hasOwn(rest, "data-void-reload"),
   }));
 </script>

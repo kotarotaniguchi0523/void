@@ -31,6 +31,8 @@ const linkPropOptions = {
     default: undefined,
   },
   activeMatch: { type: String as PropType<LinkActiveMatch>, default: undefined },
+  // The explicit default keeps an absent prop undefined: Vue would cast it to false.
+  viewTransition: { type: Boolean, default: undefined },
 } as const;
 
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
@@ -58,6 +60,7 @@ const LinkComponent = defineComponent({
           ...linkPrefetchAttributes(router, {
             prefetch: props.prefetch,
             cacheFor: props.cacheFor,
+            viewTransition: props.viewTransition,
             reloadDocument: Object.hasOwn(attrs, 'data-void-reload'),
           }),
           ...state.value,

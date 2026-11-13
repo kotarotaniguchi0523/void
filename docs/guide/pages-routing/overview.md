@@ -355,6 +355,8 @@ Opt in to Void page-data prefetching with `data-void-prefetch`. Supported strate
 <a href="/users" data-void-prefetch="hover visible" data-void-cache-for="30s">Users</a>
 ```
 
+Set `data-void-view-transition` to `true` or `false` to turn the [view transition](./view-transitions.md#per-link-override) on or off for that anchor.
+
 Use `useLinkState(href, { activeMatch: "prefix" })` from your Pages adapter to read the current and pending attributes for an anchor. Read `state.attributes` in the render or template and pass it to the anchor. Use a function such as `() => props.href` for a reactive destination. All anchors using the attributes for the same pending destination show the pending state.
 
 Call these APIs inside your component or component setup, where the Pages router context is available. For explicit visit options, attach `createLinkClickHandler(router, options)` to the anchor.

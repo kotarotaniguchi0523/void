@@ -13,6 +13,7 @@ export function Link(props: LinkProps): JSX.Element {
     'prefetch',
     'cacheFor',
     'activeMatch',
+    'viewTransition',
     'children',
   ]);
   const router = useContext(RouterContext);
@@ -24,6 +25,7 @@ export function Link(props: LinkProps): JSX.Element {
     linkPrefetchAttributes(router, {
       prefetch: local.prefetch,
       cacheFor: local.cacheFor,
+      viewTransition: local.viewTransition,
       reloadDocument: Object.hasOwn(rest, 'data-void-reload'),
     }),
   );

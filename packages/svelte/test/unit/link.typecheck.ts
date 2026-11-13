@@ -5,6 +5,7 @@ export function checkSvelteLinkProps(): void {
     href: '/users',
     prefetch: 'hover',
     target: '_blank',
+    viewTransition: true,
     'data-testid': 'users-link',
   };
   const empty: LinkProps = { href: '/users' };
@@ -16,5 +17,7 @@ export function checkSvelteLinkProps(): void {
   const queryData: LinkProps = { href: '/users', data: { page: 2 } };
   // @ts-expect-error the prefetch shorthand was removed
   const oldPrefetch: LinkProps = { href: '/users', prefetch: true };
-  void [mutation, queryData, oldPrefetch];
+  // @ts-expect-error viewTransition is a boolean
+  const badViewTransition: LinkProps = { href: '/users', viewTransition: 'fade' };
+  void [mutation, queryData, oldPrefetch, badViewTransition];
 }

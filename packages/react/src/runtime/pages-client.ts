@@ -483,13 +483,11 @@ function App({
   config,
   engine,
   router,
-  viewTransitions,
   navigationFallback: NavigationFallback,
 }: {
   config: ReactPagesConfig;
   engine: Awaited<ReturnType<typeof createPageNavigationEngine>>;
   router: RuntimeVoidRouter;
-  viewTransitions: boolean;
   navigationFallback?: ComponentType<{ initialPageData: PageObject }>;
 }): React.ReactNode {
   const initialPageData = engine.initialPageData as ReactPageData;
@@ -502,6 +500,7 @@ function App({
       hash: window.location.hash,
       method: 'GET',
       options: {},
+      viewTransition: false,
       shell: Promise.resolve({
         pageData: initialPageData,
         component: engine.initialComponent,
@@ -760,14 +759,14 @@ function App({
       next.shell.then(
         (result) => {
           if (result && activePendingNavigationId === next.id) {
-            startViewTransition(next, reveal, options.viewTransition ?? viewTransitions);
+            startViewTransition(next, reveal, next.viewTransition);
           }
         },
         () => {},
       );
       return pagePromise;
     },
-    [NavigationFallback, navigationStore, startTransition, viewTransitions],
+    [NavigationFallback, navigationStore, startTransition],
   );
 
   useInsertionEffect(() => {
@@ -908,7 +907,6 @@ export async function startReactPages(config: ReactPagesConfig): Promise<ReactPa
     config,
     engine,
     router,
-    viewTransitions: config.viewTransitions,
     navigationFallback: config.navigationFallback,
   });
   const hasDeferred = Boolean((engine.initialPageData as ReactPageData).deferredKeys);
