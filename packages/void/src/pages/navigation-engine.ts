@@ -2,7 +2,12 @@
 
 import { PAGES_PROTOCOL_VERSION } from '@void/edge';
 import { PRESERVED_QUERY_HEADER, searchWithoutActionKey } from './action-key.ts';
-import { abortError, createActionErrorFromResponse, isAbortError } from './action-result.ts';
+import {
+  abortError,
+  abortedVisitResolvesUndefined,
+  createActionErrorFromResponse,
+  isAbortError,
+} from './action-result.ts';
 import { startAnchorPrefetch } from './anchor-prefetch.ts';
 import {
   clientPageError,
@@ -1513,7 +1518,8 @@ export async function createPageNavigationEngine(
 
     async visit(url, options, apply) {
       const target = new URL(url, documentBaseUrl());
-      const get = !options.data && (options.method ?? 'GET').toUpperCase() === 'GET';
+      const method = (options.method ?? 'GET').toUpperCase();
+      const get = !options.data && method === 'GET';
       if (
         get &&
         !options._refresh &&
@@ -1569,7 +1575,8 @@ export async function createPageNavigationEngine(
           return result;
         },
         (error: unknown) => {
-          if (isAbortError(error) && !options._resolveOnShell) {
+          // Only GET visits reach the browser visit handler.
+          if (isAbortError(error) && abortedVisitResolvesUndefined(method, options)) {
             data?.resolve(undefined);
             return undefined;
           }

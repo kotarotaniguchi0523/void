@@ -102,6 +102,18 @@ export function isAbortError(error: unknown): boolean {
   );
 }
 
+/**
+ * Whether a visit that is aborted resolves `undefined` instead of rejecting with the
+ * AbortError. GET visits do, except the visits React Actions make (`_resolveOnShell`).
+ * `method` is the upper-cased method of the visit's resource.
+ */
+export function abortedVisitResolvesUndefined(
+  method: string,
+  options: { _resolveOnShell?: boolean },
+): boolean {
+  return method === 'GET' && !options._resolveOnShell;
+}
+
 async function readActionErrorBody(response: Response): Promise<unknown> {
   const contentType = response.headers.get('content-type') || '';
   try {

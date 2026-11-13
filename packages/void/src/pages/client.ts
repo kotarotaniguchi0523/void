@@ -7,6 +7,7 @@ import { withPageQuery } from './action-key.ts';
 import {
   VoidActionError,
   abortError,
+  abortedVisitResolvesUndefined,
   isAbortError,
   isCallSiteActionError,
   isVoidActionError,
@@ -41,6 +42,7 @@ export {
 export {
   VoidActionError,
   abortError,
+  abortedVisitResolvesUndefined,
   categorizeActionError,
   isAbortError,
   isCallSiteActionError,
@@ -522,11 +524,7 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
       }
       return result.pageData;
     } catch (error) {
-      if (
-        resource.method.toUpperCase() === 'GET' &&
-        !resource.options._resolveOnShell &&
-        isAbortError(error)
-      ) {
+      if (isAbortError(error) && abortedVisitResolvesUndefined(resource.method, resource.options)) {
         return undefined;
       }
       throw error;

@@ -24,6 +24,7 @@ import {
   refreshPage,
   normalizePageUrl,
   abortError,
+  abortedVisitResolvesUndefined,
   hasPageBoundaries,
   pageBoundarySlots,
   showTerminalPageError,
@@ -660,7 +661,8 @@ function App({
             if (committed) {
               visitSettler.resolve(result.pageData);
             } else if (resource.method === 'GET') {
-              // A newer visit committed first. Settle like any abandoned visit.
+              // A newer visit committed first. Settle like any abandoned visit. The method alone
+              // decides: a visit that resolves on its shell has dropped its settler by now.
               visitSettler.resolve(undefined);
             } else {
               visitSettler.reject(abortError());
@@ -729,7 +731,7 @@ function App({
           activeVisit.takeSettler(prepared.id);
           // Public data completion keeps the usual cancellation behavior for GETs.
           const abortingGetVisit =
-            prepared.method === 'GET' && !prepared.options._resolveOnShell && isAbortError(error);
+            isAbortError(error) && abortedVisitResolvesUndefined(prepared.method, prepared.options);
           if (abortingGetVisit) {
             resolveVisit(undefined);
           } else {
@@ -778,7 +780,7 @@ function App({
           resolve: resolveVisit,
           reject: rejectVisit,
           abort() {
-            if (next.method === 'GET' && !options._resolveOnShell) {
+            if (abortedVisitResolvesUndefined(next.method, options)) {
               resolveVisit(undefined);
             } else {
               rejectVisit(abortError());
