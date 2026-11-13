@@ -4,7 +4,7 @@
  * page: one that app code creates with `history.pushState` does not.
  */
 export function createEntryTracker(): {
-  /** Observe entries, and report the key of each one the browser disposes. */
+  /** Observe entries, and report each key that has left the history. */
   start(onDispose: (key: string) => void): void;
   /**
    * The browser moved to entry `key`, whose page `visit` renders. Without a visit the
@@ -41,6 +41,12 @@ export function createEntryTracker(): {
         entry.addEventListener(
           'dispose',
           () => {
+            // A replacement disposes the entry object and keeps its key for the entry
+            // that takes its place, as history.replaceState() does for the page on
+            // screen. Only a key that has left the history is gone.
+            if (window.navigation.entries().some((other) => other.key === entry.key)) {
+              return;
+            }
             if (renderedKey === entry.key) {
               renderedKey = null;
             }
@@ -60,6 +66,11 @@ export function createEntryTracker(): {
       });
     },
     committed(key, visit): void {
+      if (key !== undefined && key === renderedKey) {
+        // A visit replaced the entry of the page on screen, which now has none. The
+        // key stays in the history, and so does its position, for a reload.
+        renderedKey = null;
+      }
       unrenderedKey = key;
       unrenderedVisit = visit;
     },

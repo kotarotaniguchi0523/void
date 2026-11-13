@@ -1248,6 +1248,36 @@ export function registerSharedClientTests({
     }
   });
 
+  it('restores scroll on Back to a page whose entry app code replaced', async ({ expect }) => {
+    const page = await newPage();
+    try {
+      await page.goto(BASE + '/scroll-restoration');
+      await waitForHydration(page);
+      await page.mouse.move(400, 400);
+      await page.mouse.wheel(0, 3500);
+      await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(3500);
+      // As analytics or state-syncing code does: the entry is replaced and keeps its key.
+      const key = await page.evaluate(() => {
+        history.replaceState(history.state, '');
+        return navigation.currentEntry!.key;
+      });
+      await page.mouse.wheel(0, 100);
+      await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(3600);
+      await page.getByTestId('scroll-row-31').getByRole('link', { name: 'Visit Users' }).click();
+      await page.waitForFunction(() =>
+        document.querySelector('h1')?.textContent?.includes('Users'),
+      );
+      expect(await page.evaluate((key) => sessionStorage.getItem('void:scroll:' + key), key)).toBe(
+        '{"x":0,"y":3600}',
+      );
+      await page.goBack();
+      await page.getByRole('heading', { name: 'Scroll restoration' }).waitFor();
+      await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(3600);
+    } finally {
+      await page.context().close();
+    }
+  });
+
   it('hard-reloads a legacy navigation and resumes current-client navigation', async () => {
     const page = await newPage();
     let legacyRequests = 0;

@@ -196,6 +196,8 @@ describe('Pages scroll restoration', () => {
     entries.rendered(forward.key);
     page.window.scrollY = 640;
     scroll.save();
+    // A new visit discards the forward entry: its key has left the history.
+    page.navigation.entries = () => [initial] as Array<typeof initial>;
     forward.dispatchEvent(new Event('dispose'));
     scroll.save(); // pagehide must not recreate the disposed rendered entry.
     expect(scroll.read(forward.key)).toBeNull();
@@ -205,9 +207,22 @@ describe('Pages scroll restoration', () => {
 
     page.changeEntry({ key: 'new-entry', url: 'http://localhost/new' }, 'push');
     const current = page.navigation.currentEntry;
+    page.navigation.entries = () => [initial, current];
     entries.rendered(current.key);
     scroll.save();
+    // history.replaceState: the browser disposes the entry object, and the entry that
+    // replaces it keeps the key.
+    page.changeEntry({ key: current.key, url: 'http://localhost/new?tab=open' }, 'replace');
+    page.navigation.entries = () => [initial, page.navigation.currentEntry];
     current.dispatchEvent(new Event('dispose'));
+    expect(scroll.read(current.key)).toEqual({ x: 0, y: 640 });
+    page.window.scrollY = 700;
+    scroll.save();
+    expect(scroll.read(current.key)).toEqual({ x: 0, y: 700 });
+
+    // The key leaves the history with its last entry object.
+    page.navigation.entries = () => [initial];
+    page.navigation.currentEntry.dispatchEvent(new Event('dispose'));
     expect(scroll.read(current.key)).toBeNull();
   });
 

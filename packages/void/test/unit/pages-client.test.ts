@@ -190,7 +190,9 @@ function stubBrowserNavigation() {
 
 /**
  * A session history with real entries: push, replace and traversal move through it.
- * As in a browser, `history: 'auto'` replaces the entry when the URL is the current one.
+ * As in a browser, `history: 'auto'` replaces the entry when the URL is the current one,
+ * a replacement keeps the key of the entry it replaces, and an entry that leaves the
+ * history is disposed after `currententrychange`.
  */
 function stubNavigationHistory() {
   type Entry = EventTarget & { key: string; url: string; getState(): unknown };
@@ -215,7 +217,11 @@ function stubNavigationHistory() {
           destination,
           navigationType === 'replace' ? browser.currentEntry.key : undefined,
         );
-        entries.splice(navigationType === 'replace' ? index : index + 1, Infinity, entry);
+        disposed = entries.splice(
+          navigationType === 'replace' ? index : index + 1,
+          Infinity,
+          entry,
+        );
         return entry;
       });
     },
@@ -225,6 +231,7 @@ function stubNavigationHistory() {
     },
   });
   let active: AbortController | undefined;
+  let disposed: Array<Entry> = [];
   function run(
     destination: URL,
     key: string,
@@ -272,6 +279,9 @@ function stubNavigationHistory() {
       browser.dispatchEvent(
         Object.assign(new Event('currententrychange'), { from, navigationType }),
       );
+      for (const entry of disposed.splice(0)) {
+        entry.dispatchEvent(new Event('dispose'));
+      }
       return browser.currentEntry;
     });
     const finished = committed.then(async () => {
@@ -3564,6 +3574,60 @@ describe('browser navigate events', () => {
     await left;
     expect(window.location.href).toBe('/document');
     expect(reload).not.toHaveBeenCalled();
+  });
+
+  describe('scroll records of an entry that is replaced', () => {
+    async function setup() {
+      stubClientGlobals();
+      const browser = stubNavigationHistory();
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string) => pageJson({ component: 'home', url, props: {} })),
+      );
+      const created = await createTestRouter();
+      created.start();
+      created.commitInitialRender();
+      const scrollTo = vi.mocked(window.scrollTo);
+      const scroll = (scrollY: number) => Object.assign(window, { scrollY });
+      return { browser, created, scroll, scrollTo };
+    }
+
+    it.each([
+      ['history.replaceState', '/'],
+      ['history.replaceState with a new query', '/?tab=open'],
+    ])('restores the page on Back after %s', async (_case, url) => {
+      const { browser, created, scroll, scrollTo } = await setup();
+      scroll(3500);
+      // App or analytics code replaces the entry: a new entry object with the same key.
+      await browser.navigate(url, { history: 'replace' }).finished;
+      expect(browser.currentEntry.key).toBe('initial-entry');
+      scroll(3600);
+
+      await created.router.visit('/next');
+      scroll(0);
+      scrollTo.mockClear();
+      await browser.traverseTo('initial-entry').finished;
+      expect(scrollTo).toHaveBeenLastCalledWith(0, 3600);
+    });
+
+    it.each(['visit', 'refresh'] as const)(
+      'restores the page a replace %s rendered, not the page it replaced',
+      async (operation) => {
+        const { browser, created, scroll, scrollTo } = await setup();
+        scroll(3500);
+        await (operation === 'visit'
+          ? created.router.visit('/other', { replace: true })
+          : created.router.refresh());
+        expect(browser.currentEntry.key).toBe('initial-entry');
+        scroll(1200);
+
+        await created.router.visit('/next');
+        scroll(0);
+        scrollTo.mockClear();
+        await browser.traverseTo('initial-entry').finished;
+        expect(scrollTo).toHaveBeenLastCalledWith(0, 1200);
+      },
+    );
   });
 
   it('reloads the committed browser URL when the adapter cannot apply it', async () => {
