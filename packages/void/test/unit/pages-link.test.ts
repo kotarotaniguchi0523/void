@@ -428,6 +428,35 @@ describe('explicit GET anchor clicks', () => {
     expect(router.visit).toHaveBeenCalledWith('/users/42', { replace: true });
   });
 
+  it('passes the anchor view transition setting unless the handler sets its own', () => {
+    const router = createRouter();
+    const on = click({}, { 'data-void-view-transition': 'true' });
+    handleLinkClick(on.event, router, '/users/42', { replace: true });
+    expect(router.visit).toHaveBeenLastCalledWith('/users/42', {
+      replace: true,
+      viewTransition: true,
+    });
+
+    const off = click({}, { 'data-void-view-transition': 'false' });
+    handleLinkClick(off.event, router, '/users/42', { preserveScroll: true });
+    expect(router.visit).toHaveBeenLastCalledWith('/users/42', {
+      preserveScroll: true,
+      viewTransition: false,
+    });
+
+    // The handler's own option wins over the attribute.
+    handleLinkClick(on.event, router, '/users/42', { replace: true, viewTransition: false });
+    expect(router.visit).toHaveBeenLastCalledWith('/users/42', {
+      replace: true,
+      viewTransition: false,
+    });
+
+    // Without an attribute, or with an unknown value, the plugin default still decides.
+    const unknown = click({}, { 'data-void-view-transition': 'yes' });
+    handleLinkClick(unknown.event, router, '/users/42', { replace: true });
+    expect(router.visit).toHaveBeenLastCalledWith('/users/42', { replace: true });
+  });
+
   it('keeps reloads, downloads, target and modified clicks native', () => {
     const router = createRouter();
     const variants = [

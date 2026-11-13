@@ -380,7 +380,8 @@ export function handleLinkClick(
   if (!router || event.defaultPrevented || isModifiedEvent(event)) {
     return;
   }
-  if (!isRouterLink(event.currentTarget as HTMLElement)) {
+  const anchor = event.currentTarget as HTMLElement;
+  if (!isRouterLink(anchor)) {
     return;
   }
   if (
@@ -395,7 +396,10 @@ export function handleLinkClick(
     return;
   }
   event.preventDefault();
-  void router.visit(href, options).catch((error: unknown) => {
+  // This visit has no source element for the router to read: pass the anchor's setting.
+  const viewTransition = options.viewTransition ?? linkViewTransition(anchor);
+  const visitOptions = viewTransition === undefined ? options : { ...options, viewTransition };
+  void router.visit(href, visitOptions).catch((error: unknown) => {
     if (!isAbortError(error)) {
       reportError(error);
     }
