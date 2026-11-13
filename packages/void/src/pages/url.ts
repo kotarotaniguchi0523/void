@@ -24,6 +24,11 @@ export function isSameOrigin(url: URL, origin: string | URL): boolean {
   return url.origin === (origin instanceof URL ? origin.origin : origin);
 }
 
+/** A URL the router can load page data for: a page scheme, on the document's origin. */
+export function isSameOriginPageUrl(url: URL, base: URL = documentBaseUrl()): boolean {
+  return isPageUrlProtocol(url) && isSameOrigin(url, base);
+}
+
 function isHexDigit(char: string | undefined): boolean {
   return (
     char !== undefined &&

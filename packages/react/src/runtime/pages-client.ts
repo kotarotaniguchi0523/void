@@ -483,12 +483,8 @@ function settleViewTransitionGate(id: number, reveal: boolean): void {
   }
 }
 
-function startViewTransition(
-  resource: ReactPageResource,
-  reveal: () => void,
-  enabled: boolean,
-): void {
-  if (!enabled || typeof document.startViewTransition !== 'function') {
+function startViewTransition(resource: ReactPageResource, reveal: () => void): void {
+  if (!resource.viewTransition || typeof document.startViewTransition !== 'function') {
     reveal();
     return;
   }
@@ -777,7 +773,7 @@ function App({
             reveal(true);
           };
           try {
-            startViewTransition(next, update, true);
+            startViewTransition(next, update);
           } catch {
             update();
             releaseViewTransition(next.id);
@@ -802,7 +798,7 @@ function App({
       shell.then(
         (result) => {
           if (result && activePendingNavigationId === next.id) {
-            startViewTransition(next, reveal, next.viewTransition);
+            startViewTransition(next, reveal);
           }
         },
         () => {},

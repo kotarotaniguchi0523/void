@@ -22,7 +22,7 @@ import {
   type PrefetchOptions as InternalPrefetchOptions,
 } from './navigation-engine.ts';
 import { deserializePageData, ISLAND_FRONTMATTER_ID } from './serialize.ts';
-import { documentBaseUrl, isPageUrlProtocol, isSameOrigin } from './url.ts';
+import { documentBaseUrl, isSameOriginPageUrl } from './url.ts';
 
 export { getValidationErrors } from './adapter-helpers.ts';
 export {
@@ -160,9 +160,7 @@ export function normalizePageUrl(value: RouteUrlInput): string {
     return urlString;
   }
   const url = toUrl(urlString);
-  return isPageUrlProtocol(url) && isSameOrigin(url, documentBaseUrl())
-    ? url.pathname + url.search + url.hash
-    : url.href;
+  return isSameOriginPageUrl(url) ? url.pathname + url.search + url.hash : url.href;
 }
 
 function navigationMethod(method: string): NavigationMethod {

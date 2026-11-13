@@ -335,7 +335,7 @@ describe('resolveSameOrigin', () => {
 describe('prefetchResolvedLink', () => {
   /** Prefetch `href` as the delegated anchor listener does once it has resolved the anchor. */
   function prefetch(router: ReturnType<typeof createRouter>, href: string, cacheFor?: string) {
-    prefetchResolvedLink(router, new URL(href, window.location.href), href, cacheFor);
+    prefetchResolvedLink(router, href, cacheFor);
   }
 
   it('prefetches other destinations with cacheFor only when given', () => {

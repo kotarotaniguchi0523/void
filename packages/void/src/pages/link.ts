@@ -5,7 +5,7 @@ import { isModifiedEvent } from './adapter-helpers.ts';
 import type { NavigationState, VoidRouter } from './client.ts';
 import type { PrefetchOptions } from './navigation-engine.ts';
 import type { CacheForInput, LinkPrefetchValue, LinkPrefetchStrategy } from './prefetch.ts';
-import { decodePagePath, documentBaseUrl, isPageUrlProtocol, isSameOrigin } from './url.ts';
+import { decodePagePath, documentBaseUrl, isSameOriginPageUrl } from './url.ts';
 
 export type { LinkPrefetchValue, LinkPrefetchStrategy };
 export type LinkActiveMatch = 'exact' | 'prefix';
@@ -83,6 +83,20 @@ export const LINK_MARKER_ATTRIBUTE = 'data-void-link';
  */
 export const LINK_VIEW_TRANSITION_ATTRIBUTE = 'data-void-view-transition';
 
+/** The attribute that leaves an anchor to the browser: following it loads the document. */
+export const LINK_RELOAD_ATTRIBUTE = 'data-void-reload';
+
+/** Whether the router may handle the anchor: it neither downloads nor reloads the document. */
+export function isRouterLink(anchor: Pick<Element, 'hasAttribute'>): boolean {
+  return !anchor.hasAttribute('download') && !anchor.hasAttribute(LINK_RELOAD_ATTRIBUTE);
+}
+
+/** The attribute that lists the events that prefetch an anchor's destination. */
+export const LINK_PREFETCH_ATTRIBUTE = 'data-void-prefetch';
+
+/** The attribute that sets how long an anchor's prefetched page data is cached. */
+export const LINK_CACHE_FOR_ATTRIBUTE = 'data-void-cache-for';
+
 /** The anchor's view transition override. Any value but `true` and `false` is none. */
 export function linkViewTransition(anchor: Pick<Element, 'getAttribute'>): boolean | undefined {
   const value = anchor.getAttribute(LINK_VIEW_TRANSITION_ATTRIBUTE);
@@ -130,6 +144,29 @@ export function linkPrefetchAttributes(
 }
 
 /**
+ * The events that prefetch an anchor, read from the attribute `linkPrefetchAttributes`
+ * renders. `default` stands for the app's default strategies.
+ */
+export function linkPrefetchModes(
+  anchor: Pick<Element, 'getAttribute'>,
+  defaults: ReadonlyArray<string>,
+): ReadonlyArray<string> {
+  const value = anchor.getAttribute(LINK_PREFETCH_ATTRIBUTE) || 'hover';
+  return value === 'default' ? defaults : value.trim().split(/[\s,]+/);
+}
+
+/** The anchor's `cacheFor`, not validated: a number, a duration, or a pair of durations. */
+export function linkCacheFor(anchor: Pick<Element, 'getAttribute'>): CacheForInput | undefined {
+  const value = anchor.getAttribute(LINK_CACHE_FOR_ATTRIBUTE)?.trim();
+  const intervals = value?.split(',').map((part) => part.trim());
+  return intervals?.length === 2
+    ? [intervals[0]!, intervals[1]!]
+    : value && Number.isFinite(Number(value))
+      ? Number(value)
+      : value || undefined;
+}
+
+/**
  * Marks a link to the current page. Pathnames compare the way the server
  * matches pages: case-sensitive, trailing slash significant, decoded like Hono's
  * getPath. A link with a query also needs each of its params, with the same value,
@@ -145,9 +182,15 @@ export function linkActiveAttributes(
   if (!router) {
     return {};
   }
-
   const current = router.url;
-  const target = resolveSameOrigin(href, current);
+  return activeAttributes(current, resolveSameOrigin(href, current), match);
+}
+
+function activeAttributes(
+  current: URL,
+  target: URL | null,
+  match: LinkActiveMatch = 'exact',
+): LinkActiveAttributes {
   if (!target) {
     return {};
   }
@@ -183,17 +226,20 @@ export function linkPendingAttributes(
   navigation: NavigationState | null | undefined,
   href: Href,
 ): LinkPendingAttributes {
-  if (
-    !router ||
-    !navigation?.location ||
-    navigation.state === 'idle' ||
-    navigation.method !== 'GET'
-  ) {
+  return router ? pendingAttributes(navigation, () => resolveSameOrigin(href, router.url)) : {};
+}
+
+/** `resolveTarget` runs only while a GET visit is loading. */
+function pendingAttributes(
+  navigation: NavigationState | null | undefined,
+  resolveTarget: () => URL | null,
+): LinkPendingAttributes {
+  if (!navigation?.location || navigation.state === 'idle' || navigation.method !== 'GET') {
     return {};
   }
 
   const destination = navigation.location;
-  const target = resolveSameOrigin(href, router.url);
+  const target = resolveTarget();
   if (
     target &&
     target.host === destination.host &&
@@ -214,9 +260,14 @@ export function linkStateAttributes(
   href: Href,
   activeMatch?: LinkActiveMatch,
 ): LinkActiveAttributes & LinkPendingAttributes {
+  if (!router) {
+    return {};
+  }
+  const current = router.url;
+  const target = resolveSameOrigin(href, current);
   return {
-    ...linkActiveAttributes(router, href, activeMatch),
-    ...linkPendingAttributes(router, navigation, href),
+    ...activeAttributes(current, target, activeMatch),
+    ...pendingAttributes(navigation, () => target),
   };
 }
 
@@ -277,10 +328,7 @@ export function resolveSameOrigin(href: string, base: URL): URL | null {
     // A malformed href still renders; it just never matches.
     return null;
   }
-  if (!isPageUrlProtocol(target) || !isSameOrigin(target, base)) {
-    return null;
-  }
-  return target;
+  return isSameOriginPageUrl(target, base) ? target : null;
 }
 
 /** The Network Information API fields Link reads. Only Chromium implements them. */
@@ -296,32 +344,19 @@ function isConstrainedConnection(): boolean {
   );
 }
 
+type PrefetchRouter = { prefetch(href: Href, options?: PrefetchOptions): Promise<unknown> };
+
 /**
  * Link's automatic prefetch, for a destination the caller has already resolved as
- * same-origin. `router.prefetch()` called directly is not limited by the connection.
+ * same-origin: `href` is its path and query. `router.prefetch()` called directly is not
+ * limited by the connection.
  */
 export function prefetchResolvedLink(
   router: PrefetchRouter,
-  target: PrefetchTarget,
   href: Href,
   cacheFor: CacheForInput | undefined,
 ): void {
-  if (!isConstrainedConnection()) {
-    prefetchTarget(router, target, href, cacheFor);
-  }
-}
-
-type PrefetchRouter = { prefetch(href: Href, options?: PrefetchOptions): Promise<unknown> };
-type PrefetchTarget = Pick<URL, 'pathname' | 'search'>;
-
-function prefetchTarget(
-  router: PrefetchRouter,
-  target: PrefetchTarget,
-  href: Href,
-  cacheFor: CacheForInput | undefined,
-): void {
-  const current = window.location.pathname + window.location.search;
-  if (target.pathname + target.search === current) {
+  if (isConstrainedConnection() || href === window.location.pathname + window.location.search) {
     return;
   }
 
@@ -345,8 +380,7 @@ export function handleLinkClick(
   if (!router || event.defaultPrevented || isModifiedEvent(event)) {
     return;
   }
-  const element = event.currentTarget as HTMLElement;
-  if (element.hasAttribute('download') || element.hasAttribute('data-void-reload')) {
+  if (!isRouterLink(event.currentTarget as HTMLElement)) {
     return;
   }
   if (

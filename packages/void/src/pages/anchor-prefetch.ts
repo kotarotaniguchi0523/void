@@ -1,12 +1,18 @@
 import type { Href } from 'void/routes';
 import {
+  LINK_CACHE_FOR_ATTRIBUTE,
+  LINK_PREFETCH_ATTRIBUTE,
+  LINK_RELOAD_ATTRIBUTE,
+  isRouterLink,
+  linkCacheFor,
+  linkPrefetchModes,
   linkPrefetchStrategies,
   observeLinkVisible,
   prefetchResolvedLink,
   resolveSameOrigin,
 } from './link.ts';
 import type { PrefetchOptions } from './navigation-engine.ts';
-import { parseCacheFor, type CacheForInput, type LinkPrefetchValue } from './prefetch.ts';
+import { parseCacheFor, type LinkPrefetchValue } from './prefetch.ts';
 import { documentBaseUrl } from './url.ts';
 
 export function startAnchorPrefetch(router: {
@@ -20,19 +26,14 @@ export function startAnchorPrefetch(router: {
   }
   const defaults = linkPrefetchStrategies({}, router._prefetchDefaultStrategy);
   const selector = defaults.length
-    ? 'a[href][data-void-prefetch]'
-    : 'a[href][data-void-prefetch]:not([data-void-prefetch="default"])';
+    ? `a[href][${LINK_PREFETCH_ATTRIBUTE}]`
+    : `a[href][${LINK_PREFETCH_ATTRIBUTE}]:not([${LINK_PREFETCH_ATTRIBUTE}="default"])`;
 
   const registered = new Map<HTMLAnchorElement, () => void>();
   const hover = new WeakMap<HTMLAnchorElement, ReturnType<typeof setTimeout>>();
-  function strategies(anchor: HTMLAnchorElement) {
-    const value = anchor.getAttribute('data-void-prefetch') || 'hover';
-    return value === 'default' ? defaults : value.trim().split(/[\s,]+/);
-  }
   const eligible = (anchor: HTMLAnchorElement) =>
     anchor.matches(selector) &&
-    !anchor.hasAttribute('data-void-reload') &&
-    !anchor.hasAttribute('download') &&
+    isRouterLink(anchor) &&
     ['', '_self'].includes(anchor.target.toLowerCase());
 
   function prefetch(anchor: HTMLAnchorElement) {
@@ -45,14 +46,7 @@ export function startAnchorPrefetch(router: {
       return;
     }
     const href = anchor.pathname + anchor.search;
-    const value = anchor.getAttribute('data-void-cache-for')?.trim();
-    const intervals = value?.split(',').map((part) => part.trim());
-    const cacheFor: CacheForInput | undefined =
-      intervals?.length === 2
-        ? [intervals[0]!, intervals[1]!]
-        : value && Number.isFinite(Number(value))
-          ? Number(value)
-          : value || undefined;
+    const cacheFor = linkCacheFor(anchor);
     if (cacheFor !== undefined) {
       try {
         parseCacheFor(cacheFor);
@@ -60,7 +54,7 @@ export function startAnchorPrefetch(router: {
         return;
       }
     }
-    prefetchResolvedLink(router, anchor, href as Href, cacheFor);
+    prefetchResolvedLink(router, href as Href, cacheFor);
   }
 
   function stopHover(anchor: HTMLAnchorElement) {
@@ -68,14 +62,18 @@ export function startAnchorPrefetch(router: {
     hover.delete(anchor);
   }
 
-  function register(anchor: HTMLAnchorElement) {
+  function unregister(anchor: HTMLAnchorElement) {
     registered.get(anchor)?.();
     registered.delete(anchor);
     stopHover(anchor);
+  }
+
+  function register(anchor: HTMLAnchorElement) {
+    unregister(anchor);
     if (!anchor.isConnected || !eligible(anchor)) {
       return;
     }
-    const modes = strategies(anchor);
+    const modes = linkPrefetchModes(anchor, defaults);
     if (modes.includes('mount')) {
       prefetch(anchor);
     }
@@ -102,6 +100,7 @@ export function startAnchorPrefetch(router: {
   visitAnchors(root, register);
   const observer = new MutationObserver((records) => {
     const changed = new Set<HTMLAnchorElement>();
+    let removed = false;
     for (const record of records) {
       if (record.type === 'attributes' && record.target instanceof HTMLAnchorElement) {
         if (record.target.matches(selector) || registered.has(record.target)) {
@@ -109,15 +108,16 @@ export function startAnchorPrefetch(router: {
         }
       }
       record.addedNodes.forEach((node) => visitAnchors(node, (anchor) => changed.add(anchor)));
-      record.removedNodes.forEach((node) =>
-        visitAnchors(node, (anchor) => {
-          if (!anchor.isConnected) {
-            registered.get(anchor)?.();
-            registered.delete(anchor);
-            stopHover(anchor);
-          }
-        }),
-      );
+      removed ||= record.removedNodes.length > 0;
+    }
+    // Only registered anchors hold an observer. A hover timer left on a removed anchor
+    // prefetches nothing once it fires, and inserting the anchor again stops it.
+    if (removed) {
+      for (const anchor of registered.keys()) {
+        if (!anchor.isConnected) {
+          unregister(anchor);
+        }
+      }
     }
     for (const anchor of changed) {
       register(anchor);
@@ -131,9 +131,9 @@ export function startAnchorPrefetch(router: {
       'href',
       'target',
       'download',
-      'data-void-prefetch',
-      'data-void-cache-for',
-      'data-void-reload',
+      LINK_PREFETCH_ATTRIBUTE,
+      LINK_CACHE_FOR_ATTRIBUTE,
+      LINK_RELOAD_ATTRIBUTE,
     ],
   });
 
@@ -143,7 +143,7 @@ export function startAnchorPrefetch(router: {
     if (!anchor || !eligible(anchor)) {
       return;
     }
-    const modes = strategies(anchor);
+    const modes = linkPrefetchModes(anchor, defaults);
     if (event instanceof MouseEvent && (event.type === 'mouseover' || event.type === 'mouseout')) {
       if (event.relatedTarget instanceof Node && anchor.contains(event.relatedTarget)) {
         return;

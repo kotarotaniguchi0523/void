@@ -13,13 +13,19 @@ import {
 import type { BoundaryManifest } from './boundary-plans.ts';
 import { initClientHead, applyClientHead } from './head-client.ts';
 import type { HeadDescriptor } from './head.ts';
-import { LINK_MARKER_ATTRIBUTE, linkViewTransition } from './link.ts';
+import { LINK_MARKER_ATTRIBUTE, isRouterLink, linkViewTransition } from './link.ts';
 import { PrefetchCache, parseCacheFor } from './prefetch.ts';
 import type { CacheForInput, CacheForResult, LinkPrefetchValue } from './prefetch.ts';
 import type { PageObject } from './protocol.ts';
 import { createScrollRestoration } from './scroll-restoration.ts';
 import { decodePageData, deserializePageData, serializePageData } from './serialize.ts';
-import { decodePagePath, documentBaseUrl, isPageUrlProtocol, isSameOrigin } from './url.ts';
+import {
+  decodePagePath,
+  documentBaseUrl,
+  isPageUrlProtocol,
+  isSameOrigin,
+  isSameOriginPageUrl,
+} from './url.ts';
 
 /**
  * The server leaves a named action's key out of the page URL. When the page URL
@@ -713,7 +719,7 @@ export async function createPageNavigationEngine(
         if (r.redirected) {
           const current = documentBaseUrl();
           const redirect = new URL(r.url, current);
-          if (!isPageUrlProtocol(redirect) || !isSameOrigin(redirect, current)) {
+          if (!isSameOriginPageUrl(redirect, current)) {
             return null;
           }
           destination = redirect.pathname + redirect.search + redirect.hash;
@@ -787,10 +793,12 @@ export async function createPageNavigationEngine(
   /**
    * Reload when the latest visit ends and the current entry's page was never rendered.
    * Another visit's failure, such as a rejected action, leaves the entry to the
-   * visit that is rendering it.
+   * visit that is rendering it. A visit the browser has cancelled recovers nothing:
+   * the navigation that replaced it owns the entry.
    */
-  function recoverUnrenderedEntry(id: number): void {
+  function recoverUnrenderedEntry({ id, options }: PageNavigationResource): void {
     if (
+      !options._navigationSignal?.aborted &&
       id === _nextNavigationId &&
       (unrenderedEntryVisit === undefined || unrenderedEntryVisit === id) &&
       unrenderedEntry !== undefined &&
@@ -807,14 +815,12 @@ export async function createPageNavigationEngine(
   ): Promise<PageData | undefined> {
     try {
       const result = await apply(resource);
-      if (!result && !resource.options._navigationSignal?.aborted) {
-        recoverUnrenderedEntry(resource.id);
+      if (!result) {
+        recoverUnrenderedEntry(resource);
       }
       return result;
     } catch (error) {
-      if (!resource.options._navigationSignal?.aborted) {
-        recoverUnrenderedEntry(resource.id);
-      }
+      recoverUnrenderedEntry(resource);
       if (_pendingResource?.id === resource.id) {
         abortPendingResource(_pendingResource);
       }
@@ -822,12 +828,28 @@ export async function createPageNavigationEngine(
     }
   }
 
-  function navigateEntry(url: string, history: 'push' | 'replace' | 'auto', info: unknown) {
-    return window.navigation.navigate(url, {
+  /**
+   * Starts a browser navigation. A caller awaits one of the two promises: a rejection
+   * of the other is not reported as unhandled, and a promise the browser did not
+   * return rejects.
+   */
+  function navigateEntry(
+    url: string,
+    history: 'push' | 'replace' | 'auto',
+    info: unknown,
+  ): Record<'committed' | 'finished', Promise<NavigationHistoryEntry>> {
+    const navigation = window.navigation.navigate(url, {
       history,
       ...(history === 'replace' && { state: window.navigation.currentEntry?.getState() }),
       info,
     });
+    const guard = (promise: Promise<NavigationHistoryEntry> | undefined) => {
+      const guarded =
+        promise ?? Promise.reject(new Error('Void Router: browser did not start the navigation.'));
+      void guarded.catch(() => {});
+      return guarded;
+    };
+    return { committed: guard(navigation.committed), finished: guard(navigation.finished) };
   }
 
   /** Whether the URL is the rendered page's, apart from its fragment. */
@@ -836,12 +858,8 @@ export async function createPageNavigationEngine(
   }
 
   async function publishEntry(url: string, replace: boolean): Promise<string | undefined> {
-    const navigation = navigateEntry(url, replace ? 'replace' : 'push', renderedPageNavigation);
-    void navigation.finished?.catch(() => {});
-    if (!navigation.committed) {
-      throw new Error('Void Router: browser did not start the navigation.');
-    }
-    const { key } = await navigation.committed;
+    const { committed } = navigateEntry(url, replace ? 'replace' : 'push', renderedPageNavigation);
+    const { key } = await committed;
     // The entry is current, and its visit can still lose the commit to a navigation
     // that a currententrychange listener started. The visit clears this when it commits.
     markUnrenderedEntry(key);
@@ -1259,6 +1277,8 @@ export async function createPageNavigationEngine(
           if (_pendingResource?.id === resourceId) {
             _pendingResource = null;
           }
+          // No later visit supersedes this one: release its payload here.
+          exposedResources.delete(resource);
           resource.dispose();
           throw error;
         }
@@ -1372,7 +1392,7 @@ export async function createPageNavigationEngine(
   _htmlDeferredRegistry = initialDeferredRegistry;
 
   function isClientPage(url: URL): boolean {
-    if (!isPageUrlProtocol(url) || !isSameOrigin(url, documentBaseUrl())) {
+    if (!isSameOriginPageUrl(url)) {
       return false;
     }
     const id = matchRoute(url.href);
@@ -1381,7 +1401,7 @@ export async function createPageNavigationEngine(
 
   /** Outside the route table: the server may rewrite or redirect this URL to a page. */
   function isServerRoutedUrl(url: URL): boolean {
-    return isPageUrlProtocol(url) && isSameOrigin(url, documentBaseUrl()) && !matchRoute(url.href);
+    return isSameOriginPageUrl(url) && !matchRoute(url.href);
   }
 
   const engine: PageNavigationEngine = {
@@ -1488,16 +1508,7 @@ export async function createPageNavigationEngine(
         // Without `replace` it adds an entry, unless the URL is already the current one.
         const request: BrowserVisit = { options, apply };
         browserVisits.add(request);
-        const navigation = navigateEntry(
-          target.href,
-          options.replace ? 'replace' : 'auto',
-          request,
-        );
-        void navigation.committed?.catch(() => {});
-        if (!navigation.finished) {
-          throw new Error('Void Router: browser did not start the navigation.');
-        }
-        await navigation.finished;
+        await navigateEntry(target.href, options.replace ? 'replace' : 'auto', request).finished;
         return undefined;
       }
       if (!browserVisitHandler || options._entryCommitted || !get || !isClientPage(target)) {
@@ -1531,16 +1542,11 @@ export async function createPageNavigationEngine(
         ...(data ? { data } : {}),
       };
       browserVisits.add(request);
-      const navigationResult = navigateEntry(
+      const finished = navigateEntry(
         target.href,
         options.replace ? 'replace' : 'push',
         request,
-      );
-      void navigationResult.committed?.catch(() => {});
-      const completion =
-        navigationResult.finished ??
-        Promise.reject(new Error('Void Router: browser did not start the navigation.'));
-      const finished = completion.then(
+      ).finished.then(
         () => {
           data?.resolve(result);
           return result;
@@ -1700,28 +1706,36 @@ export async function createPageNavigationEngine(
     const own = !!request && browserVisits.has(request);
     const apply = own ? request.apply : browserVisitHandler;
     const options = own ? request.options : {};
-    const target = new URL(event.destination.url);
     const traversal = event.navigationType === 'traverse';
     if (!event.canIntercept || event.downloadRequest !== null || event.formData !== null) {
       return;
     }
+    // A traversal to another document is the browser's.
+    if (traversal && !event.destination.sameDocument) {
+      return;
+    }
     const anchor = event.sourceElement?.closest('a[href],area[href]');
-    const link =
-      !!anchor && !anchor.hasAttribute('download') && !anchor.hasAttribute('data-void-reload');
+    const link = !!anchor && isRouterLink(anchor);
+    // A classic history write also emits navigate. Only claim a link, a traversal,
+    // a visit initiated by this router, or a fragment of a URL whose page has yet
+    // to render. Decide before the URL is parsed and matched against the routes.
+    if (!own && !traversal && !link && !event.hashChange) {
+      return;
+    }
+    const target = new URL(event.destination.url);
     // The browser owns a navigation to another fragment of the rendered page, or between
     // two entries of that page: it commits the entry and scrolls to the fragment, and
     // currententrychange updates the route. A link or a visit to the current URL and
     // fragment is such a navigation too, though the browser reports hashChange as false.
     if (
       isRenderedPageUrl(target) &&
-      (traversal
-        ? event.destination.sameDocument
-        : !options._refresh &&
+      (traversal ||
+        (!options._refresh &&
           (event.hashChange ||
             ((own || link) &&
               Boolean(target.hash) &&
               event.destination.sameDocument &&
-              target.href === documentBaseUrl().href)))
+              target.href === documentBaseUrl().href))))
     ) {
       if (_pendingResource) {
         abortPendingResource(_pendingResource);
@@ -1738,24 +1752,17 @@ export async function createPageNavigationEngine(
     // request the document twice. A same-document entry with such a URL is one that
     // the router rendered, so a traversal renders it again.
     const serverRouted =
-      (traversal
-        ? event.destination.sameDocument
-        : link && anchor.hasAttribute(LINK_MARKER_ATTRIBUTE)) && isServerRoutedUrl(target);
+      (traversal || (link && anchor.hasAttribute(LINK_MARKER_ATTRIBUTE))) &&
+      isServerRoutedUrl(target);
     if (!serverRouted && !isClientPage(target)) {
       return;
     }
 
     const url = target.pathname + target.search + target.hash;
-    // A classic history write also emits navigate. Only claim a link, a traversal,
-    // a visit initiated by this router, or a fragment of a URL whose page has yet
-    // to render.
-    if (!own && !traversal && !link && !event.hashChange) {
+    if (!traversal && !event.cancelable) {
       return;
     }
-    if (traversal && !event.destination.sameDocument) {
-      return;
-    }
-    if ((traversal || event.cancelable) && _pendingResource) {
+    if (_pendingResource) {
       abortPendingResource(_pendingResource);
     }
     if (traversal) {
@@ -1784,9 +1791,6 @@ export async function createPageNavigationEngine(
       return;
     }
 
-    if (!event.cancelable) {
-      return;
-    }
     event.intercept({
       scroll: 'manual',
       focusReset: event.navigationType === 'push' ? 'after-transition' : 'manual',
@@ -1824,7 +1828,6 @@ export async function createPageNavigationEngine(
           if (!shell) {
             // The loader has handed this visit to a document navigation.
             // Release the renderer without reporting a synthetic AbortError.
-            event.signal.removeEventListener('abort', cancel);
             cancel();
             abortPendingResource(resource);
             return;
@@ -1841,11 +1844,8 @@ export async function createPageNavigationEngine(
             request.data?.resolve(shell.pageData);
           }
           controller.addHandler(async () => {
-            event.signal.removeEventListener('abort', cancel);
-            if (event.signal.aborted) {
-              cancel();
-              event.signal.throwIfAborted();
-            }
+            // An abort has already released the renderer through `cancel`.
+            event.signal.throwIfAborted();
             resource.options._entryKey = window.navigation.currentEntry?.key;
             markUnrenderedEntry(resource.options._entryKey, resource.id);
             release(true);
@@ -1856,7 +1856,6 @@ export async function createPageNavigationEngine(
             }
           });
         } catch (error) {
-          event.signal.removeEventListener('abort', cancel);
           cancel();
           abortPendingResource(resource);
           if (!own && !event.signal.aborted && !isAbortError(error)) {
@@ -1864,9 +1863,7 @@ export async function createPageNavigationEngine(
             window.location.href = resource.destination();
             return;
           }
-          if (!event.signal.aborted) {
-            recoverUnrenderedEntry(resource.id);
-          }
+          recoverUnrenderedEntry(resource);
           throw error;
         }
       },
