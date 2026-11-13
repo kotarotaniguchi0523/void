@@ -4122,6 +4122,142 @@ describe('actions that supersede a navigation with a committed URL', () => {
   });
 });
 
+describe('history writes from app code on the rendered page', () => {
+  async function setup({ committed = true, adapter = {} as TestRouterConfig['adapter'] } = {}) {
+    stubClientGlobals();
+    window.location.pathname = '/issues';
+    const browser = stubNavigationHistory();
+    const reload = vi.fn();
+    Object.assign(window.location, { reload });
+    const fetchPage = vi.fn(async (url: string) => pageJson({ component: 'home', url, props: {} }));
+    vi.stubGlobal('fetch', fetchPage);
+    const applyUpdate = vi.fn();
+    const created = await createTestRouter({ adapter: { applyUpdate, ...adapter } });
+    created.start();
+    if (committed) {
+      created.commitInitialRender();
+    }
+    /** history.pushState() or replaceState(): a navigation that no router code started. */
+    const write = (url: string, history: 'push' | 'replace') =>
+      browser.navigate(url, { history }).finished;
+    /** A plain anchor to a fragment: the browser reports a hash change. */
+    const followFragment = (url: string) => browser.navigate(url, { history: 'push' }).finished;
+    const scroll = (scrollY: number) => Object.assign(window, { scrollY });
+    const requests = () => fetchPage.mock.calls.map(([url]) => url);
+    return { browser, created, reload, applyUpdate, write, followFragment, scroll, requests };
+  }
+
+  it('leaves a fragment to the browser after replaceState changed the query', async () => {
+    const { created, applyUpdate, write, followFragment, requests } = await setup();
+
+    await write('/issues?tab=open', 'replace');
+    expect(created.router.url.search).toBe('?tab=open');
+
+    await followFragment('/issues?tab=open#comments');
+    expect(created.router.url.href).toBe('http://localhost/issues?tab=open#comments');
+    await created.router.visit('#activity');
+    expect(created.router.url.hash).toBe('#activity');
+
+    expect(requests()).toEqual([]);
+    expect(applyUpdate).not.toHaveBeenCalled();
+    expect(window.scrollTo).not.toHaveBeenCalled();
+  });
+
+  it('loads the page of the entry that Back or Forward reaches after pushState', async () => {
+    const { browser, created, applyUpdate, write, scroll, requests } = await setup();
+
+    scroll(500);
+    await write('/issues?tab=closed', 'push');
+    const pushed = browser.currentEntry.key;
+    expect(created.router.url.search).toBe('?tab=closed');
+    expect(requests()).toEqual([]);
+
+    // The position of the page belongs to the entry that app code moved it to.
+    scroll(900);
+    await browser.traverseTo('initial-entry').finished;
+    expect(requests()).toEqual(['/issues']);
+    expect(applyUpdate).toHaveBeenCalledOnce();
+    expect(created.router.url.search).toBe('');
+    expect(window.scrollTo).toHaveBeenLastCalledWith(0, 500);
+
+    scroll(40);
+    await browser.traverseTo(pushed).finished;
+    expect(requests()).toEqual(['/issues', '/issues?tab=closed']);
+    expect(created.router.url.search).toBe('?tab=closed');
+    expect(window.scrollTo).toHaveBeenLastCalledWith(0, 900);
+  });
+
+  it.each(['replace', 'push'] as const)(
+    'follows a %sState that runs before the initial render commits',
+    async (history) => {
+      const { browser, created, write, scroll, requests } = await setup({ committed: false });
+
+      // As an effect of the page does while the app mounts.
+      await write('/issues?tab=open', history);
+      const key = browser.currentEntry.key;
+      created.commitInitialRender();
+      expect(created.router.url.search).toBe('?tab=open');
+      await created.router.visit('#comments', { replace: true });
+      expect(requests()).toEqual([]);
+
+      // The page's position is recorded for the entry that shows it.
+      scroll(700);
+      await created.router.visit('/next');
+      scroll(0);
+      await browser.traverseTo(key).finished;
+      expect(requests()).toEqual(['/next', '/issues?tab=open']);
+      expect(window.scrollTo).toHaveBeenLastCalledWith(0, 700);
+    },
+  );
+
+  it.each(['replace', 'push'] as const)(
+    'follows a %sState that cancels a visit before its URL commits',
+    async (history) => {
+      const { created, reload, applyUpdate, write, followFragment, requests } = await setup();
+      const response = controlledPromise<Response>();
+      vi.mocked(fetch).mockImplementationOnce(() => response.promise);
+
+      const visit = created.router.visit('/next');
+      await vi.waitFor(() => expect(requests()).toEqual(['/next']));
+      // The browser aborts the pending navigation before it commits the write.
+      await write('/issues?tab=open', history);
+      response.resolve(pageJson({ component: 'home', url: '/next', props: {} }));
+      await expect(visit).resolves.toBeUndefined();
+
+      expect(created.router.url.href).toBe('http://localhost/issues?tab=open');
+      await followFragment('/issues?tab=open#comments');
+      expect(requests()).toEqual(['/next']);
+      expect(applyUpdate).not.toHaveBeenCalled();
+      expect(reload).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['replace', 'push'] as const)(
+    'does not take a %sState on an entry whose page has yet to render for the rendered page',
+    async (history) => {
+      const rendering = controlledPromise<void>();
+      const applyUpdate = vi.fn(() => rendering.promise);
+      const { created, reload, write, followFragment, requests } = await setup({
+        adapter: { applyUpdate },
+      });
+
+      // The browser has committed /next, and its page is still rendering.
+      const visit = created.router.visit('/next');
+      void visit.catch(() => {});
+      await vi.waitFor(() => expect(applyUpdate).toHaveBeenCalledOnce());
+      expect(window.location.pathname).toBe('/next');
+      await write('/next?step=2', history);
+      rendering.resolve();
+
+      // The page on screen is still the one at /issues: this address is not its URL,
+      // so a fragment of it is a visit that loads the page.
+      await followFragment('/next?step=2#details');
+      expect(requests()).toEqual(['/next', '/next?step=2']);
+      expect(reload).not.toHaveBeenCalled();
+    },
+  );
+});
+
 describe('visits to the current URL and fragment', () => {
   function setup() {
     stubClientGlobals();

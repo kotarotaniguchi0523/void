@@ -1711,7 +1711,8 @@ export async function createPageNavigationEngine(
       const saved = initialScrollPosition;
       initialScrollPosition = null;
       if (_nextNavigationId === 0) {
-        entries.rendered(initialEntryKey);
+        // App code may have moved the page to an entry of its own while it mounted.
+        entries.rendered(entries.renderedKey() ?? initialEntryKey);
       }
       if (saved && _nextNavigationId === 0) {
         window.scrollTo(saved.x, saved.y);
@@ -1932,6 +1933,7 @@ export async function createPageNavigationEngine(
   });
   // The browser has committed an entry. Its visit, if it has one, started from the
   // navigate event: this listener only records what the entry means for the page on screen.
+  // The router's idea of that page's URL changes here and when a visit commits.
   window.navigation.addEventListener('currententrychange', (event) => {
     const entry = window.navigation.currentEntry;
     if (!entry?.url || entry === event.from) {
@@ -1949,13 +1951,27 @@ export async function createPageNavigationEngine(
       return;
     }
     const target = new URL(entry.url);
+    // No visit is pending, so no router code pushed or replaced this entry: app code
+    // did, with history.pushState() or replaceState(). When it started from the entry of
+    // the page on screen, that page is now under this address. Until the initial render
+    // commits, the page on screen is the one of the initial entry.
+    const pageKey = entries.renderedKey() ?? (_nextNavigationId === 0 ? initialEntryKey : null);
+    if (
+      (event.navigationType === 'push' || event.navigationType === 'replace') &&
+      pageKey &&
+      event.from?.key === pageKey &&
+      isSameOrigin(target, documentBaseUrl())
+    ) {
+      _currentFetchUrl = target.pathname + target.search;
+    }
     if (
       !isRenderedPageUrl(target) ||
       (entry.key === event.from?.key && entry.url === event.from.url)
     ) {
       return;
     }
-    // The rendered page under another fragment. The browser has not scrolled yet.
+    // The rendered page under another address: a fragment that the browser moved to
+    // and has yet to scroll to, or the URL that app code gave it.
     scrollRestoration.save();
     entries.moved(entry.key);
     if (event.navigationType === 'traverse') {

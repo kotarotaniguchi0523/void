@@ -1278,6 +1278,52 @@ export function registerSharedClientTests({
     }
   });
 
+  it('follows a URL that app code writes for the page with the History API', async ({ expect }) => {
+    const page = await newPage();
+    const pageData: Array<string> = [];
+    try {
+      await page.goto(BASE + '/scroll-restoration');
+      await waitForHydration(page);
+      page.on('request', (request) => {
+        if (request.headers()['x-voidpages'] === 'true') {
+          const { pathname, search } = new URL(request.url());
+          pageData.push(pathname + search);
+        }
+      });
+      const rendered = await page.getByTestId('scroll-request').textContent();
+
+      // The page keeps a filter in its address, then the user follows a fragment link.
+      await page.evaluate(() => {
+        history.replaceState(history.state, '', '?tab=open');
+        document.querySelector('[data-testid="scroll-row-40"]')!.id = 'row-40';
+        const anchor = document.createElement('a');
+        anchor.href = '#row-40';
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+      });
+      await page.waitForURL(BASE + '/scroll-restoration?tab=open#row-40');
+      await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(4000);
+      const fragmentScroll = await page.evaluate(() => window.scrollY);
+      // The browser scrolled: the router did not load the page again.
+      expect(pageData).toEqual([]);
+      expect(await page.getByTestId('scroll-request').textContent()).toBe(rendered);
+
+      // Back from an entry that app code pushed loads the page of the entry it reaches.
+      await page.evaluate(() => {
+        history.pushState(history.state, '', '?tab=closed');
+        window.scrollTo(0, 600);
+      });
+      await page.goBack();
+      await page.waitForURL(BASE + '/scroll-restoration?tab=open#row-40');
+      await expect.poll(() => pageData).toEqual(['/scroll-restoration?tab=open']);
+      await expect.poll(() => page.getByTestId('scroll-request').textContent()).not.toBe(rendered);
+      await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(fragmentScroll);
+    } finally {
+      await page.context().close();
+    }
+  });
+
   it('hard-reloads a legacy navigation and resumes current-client navigation', async () => {
     const page = await newPage();
     let legacyRequests = 0;
