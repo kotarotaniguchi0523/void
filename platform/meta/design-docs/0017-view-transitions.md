@@ -11,6 +11,8 @@ The shared [navigation engine](../../../packages/void/src/pages/navigation-engin
 
 Running the transition belongs to whichever side knows when the framework has committed the new page. The engine prepares page data and components before the transition starts. For Vue, Svelte and Solid, the shared [Pages client](../../../packages/void/src/pages/client.ts) wraps the page update, which those adapters apply synchronously or on the next tick. React renders a navigation as a React transition that can suspend, so the [React adapter](../../../packages/react/src/runtime/pages-client.ts) keeps the browser's update callback open until React commits. React's own `<ViewTransition>` component is not used: the feature is one option with the same behavior in all four adapters.
 
-Known limits: a React app configured with a navigation fallback does not run view transitions. A Vue page whose async `setup` suspends under `<Suspense>` is outside the supported page model, and its transition captures the page before its content appears.
+With a React navigation fallback, a visit whose page is ready before the next frame animates from the previous page to the new one. Otherwise the fallback appears at once, without a transition, and the transition runs from the fallback to the new page: React is given the page only after the browser has captured the fallback.
+
+Known limit: a Vue page whose async `setup` suspends under `<Suspense>` is outside the supported page model, and its transition captures the page before its content appears.
 
 See the [view transitions guide](../../../docs/guide/pages-routing/view-transitions.md) and [navigation on the Navigation API](./0094-pages-navigation-api.md).
