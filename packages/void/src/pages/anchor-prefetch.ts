@@ -31,6 +31,8 @@ export function startAnchorPrefetch(router: {
 
   const registered = new Map<HTMLAnchorElement, () => void>();
   const hover = new WeakMap<HTMLAnchorElement, ReturnType<typeof setTimeout>>();
+  // The invalid cache lifetime already reported for an anchor.
+  const reportedCacheFor = new WeakMap<HTMLAnchorElement, string | null>();
   const eligible = (anchor: HTMLAnchorElement) =>
     anchor.matches(selector) &&
     isRouterLink(anchor) &&
@@ -50,7 +52,14 @@ export function startAnchorPrefetch(router: {
     if (cacheFor !== undefined) {
       try {
         parseCacheFor(cacheFor);
-      } catch {
+      } catch (error) {
+        // A mistake in one anchor must not stop the listener, and every hover would
+        // repeat it: report each invalid value once and prefetch nothing.
+        const value = anchor.getAttribute(LINK_CACHE_FOR_ATTRIBUTE);
+        if (reportedCacheFor.get(anchor) !== value) {
+          reportedCacheFor.set(anchor, value);
+          reportError(error);
+        }
         return;
       }
     }

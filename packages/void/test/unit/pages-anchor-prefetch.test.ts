@@ -8,6 +8,7 @@ let stopPrefetch: (() => void) | undefined;
 afterEach(() => {
   stopPrefetch?.();
   document.body.replaceChildren();
+  vi.unstubAllGlobals();
 });
 
 function addAnchor(href: string, strategy: string): HTMLAnchorElement {
@@ -98,6 +99,36 @@ describe('delegated anchor prefetch', () => {
     anchor.dataset.voidPrefetch = 'hover';
     anchor.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
     expect(prefetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports an invalid cache lifetime once per anchor and keeps other anchors prefetching', async () => {
+    const reporter = vi.fn();
+    vi.stubGlobal('reportError', reporter);
+    const prefetch = vi.fn(async () => {});
+    const invalid = addAnchor('/invalid', 'hover');
+    invalid.setAttribute('data-void-cache-for', '30 sec');
+    const valid = addAnchor('/valid', 'hover');
+    valid.setAttribute('data-void-cache-for', '30s');
+    stopPrefetch = startAnchorPrefetch({ prefetch, _hoverDelay: 75 });
+
+    invalid.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+    invalid.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+    valid.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+
+    expect(reporter).toHaveBeenCalledOnce();
+    expect(reporter.mock.calls[0]![0]).toEqual(
+      new Error("prefetch: Invalid cacheFor value '30 sec'. Use a number with ms, s, m, h, or d."),
+    );
+    expect(prefetch.mock.calls).toEqual([['/valid', { cacheFor: '30s' }]]);
+
+    // Another invalid value is another mistake; a valid one prefetches.
+    invalid.setAttribute('data-void-cache-for', '1 minute');
+    invalid.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+    expect(reporter).toHaveBeenCalledTimes(2);
+    invalid.setAttribute('data-void-cache-for', '1m');
+    invalid.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+    expect(reporter).toHaveBeenCalledTimes(2);
+    expect(prefetch).toHaveBeenLastCalledWith('/invalid', { cacheFor: '1m' });
   });
 
   it('ignores default markers when the app has no prefetch strategy', () => {
