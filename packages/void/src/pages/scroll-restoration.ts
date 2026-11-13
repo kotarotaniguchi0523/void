@@ -12,40 +12,18 @@ function readPosition(value: unknown): ScrollPosition | null {
     : null;
 }
 
-/** Positions belong to the rendered entry, even after the browser starts a traversal. */
-export function createScrollRestoration(): {
+/**
+ * Positions belong to the rendered entry, even after the browser starts a traversal.
+ * `renderedKey` gives the key of that entry, while it exists.
+ */
+export function createScrollRestoration(renderedKey: () => string | null): {
   start(): void;
   read(key: string | undefined): ScrollPosition | null;
   save(): void;
-  commit(key: string | undefined): void;
-  /** Key of the entry whose page is on screen, while that entry exists. */
-  rendered(): string | null;
+  /** Drop the position of an entry the browser has disposed. */
+  forget(key: string): void;
 } {
   const positions = new Map<string, ScrollPosition>();
-  let renderedKey: string | null = null;
-  const observedEntries = new WeakSet<NavigationHistoryEntry>();
-
-  function observeEntry(entry: NavigationHistoryEntry): void {
-    if (observedEntries.has(entry)) {
-      return;
-    }
-    observedEntries.add(entry);
-    entry.addEventListener(
-      'dispose',
-      () => {
-        positions.delete(entry.key);
-        if (renderedKey === entry.key) {
-          renderedKey = null;
-        }
-        try {
-          sessionStorage.removeItem(STORAGE_PREFIX + entry.key);
-        } catch {
-          // Storage can be unavailable, but the in-memory position is still released.
-        }
-      },
-      { once: true },
-    );
-  }
 
   function read(key: string | undefined): ScrollPosition | null {
     if (!key) {
@@ -63,13 +41,14 @@ export function createScrollRestoration(): {
   }
 
   function save(): void {
-    if (!renderedKey) {
+    const key = renderedKey();
+    if (!key) {
       return;
     }
     const position = { x: window.scrollX, y: window.scrollY };
-    positions.set(renderedKey, position);
+    positions.set(key, position);
     try {
-      sessionStorage.setItem(STORAGE_PREFIX + renderedKey, JSON.stringify(position));
+      sessionStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(position));
     } catch {
       // Keep the in-memory position for the lifetime of this document.
     }
@@ -79,22 +58,17 @@ export function createScrollRestoration(): {
     start(): void {
       // Also covers reloads and traversals outside our intercept() handlers.
       history.scrollRestoration = 'manual';
-      for (const entry of window.navigation.entries()) {
-        observeEntry(entry);
-      }
-      window.navigation.addEventListener('currententrychange', () => {
-        const entry = window.navigation.currentEntry;
-        if (entry) {
-          observeEntry(entry);
-        }
-      });
       window.addEventListener('pagehide', save);
     },
     read,
     save,
-    commit(key: string | undefined): void {
-      renderedKey = key ?? null;
+    forget(key: string): void {
+      positions.delete(key);
+      try {
+        sessionStorage.removeItem(STORAGE_PREFIX + key);
+      } catch {
+        // Storage can be unavailable, but the in-memory position is still released.
+      }
     },
-    rendered: () => renderedKey,
   };
 }

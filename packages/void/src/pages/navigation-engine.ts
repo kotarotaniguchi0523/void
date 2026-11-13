@@ -11,6 +11,7 @@ import {
   showTerminalPageError,
 } from './boundary-client.ts';
 import type { BoundaryManifest } from './boundary-plans.ts';
+import { createEntryTracker } from './entry-tracker.ts';
 import { initClientHead, applyClientHead } from './head-client.ts';
 import type { HeadDescriptor } from './head.ts';
 import { LINK_MARKER_ATTRIBUTE, isRouterLink, linkViewTransition } from './link.ts';
@@ -334,10 +335,6 @@ export async function createPageNavigationEngine(
   const _prefetchCache = new PrefetchCache();
   const uncachedPayloads = new WeakSet<object>();
   let _nextNavigationId = 0;
-  let unrenderedEntry: string | undefined;
-  // The visit that renders that entry. Unset while the entry has no such visit:
-  // the one that published it lost its commit, or its handler has yet to run.
-  let unrenderedEntryVisit: number | undefined;
   let _pendingResource: PageNavigationResource | null = null;
   let _committedResource: PageNavigationResource | null = null;
   let _committedDeferredRegistry: DeferredRegistry | null = null;
@@ -407,7 +404,8 @@ export async function createPageNavigationEngine(
   }
   let initialScrollPosition: { x: number; y: number } | null = null;
   const initialEntryKey = window.navigation.currentEntry?.key;
-  const scrollRestoration = createScrollRestoration();
+  const entries = createEntryTracker();
+  const scrollRestoration = createScrollRestoration(entries.renderedKey);
 
   async function resolveComponent(id: string): Promise<unknown> {
     const loader = components[id];
@@ -806,11 +804,6 @@ export async function createPageNavigationEngine(
   deferredWindow.__rejectDeferred = (group: string, error: unknown) =>
     _htmlDeferredRegistry?.resolve(group, undefined, error);
 
-  function markUnrenderedEntry(key: string | undefined, visitId?: number): void {
-    unrenderedEntry = key;
-    unrenderedEntryVisit = visitId;
-  }
-
   /**
    * Reload when the latest visit ends and the current entry's page was never rendered.
    * Another visit's failure, such as a rejected action, leaves the entry to the
@@ -822,11 +815,9 @@ export async function createPageNavigationEngine(
     if (
       !contextOf(resource).signal?.aborted &&
       id === _nextNavigationId &&
-      (unrenderedEntryVisit === undefined || unrenderedEntryVisit === id) &&
-      unrenderedEntry !== undefined &&
-      window.navigation.currentEntry?.key === unrenderedEntry
+      entries.isUnrendered(id)
     ) {
-      markUnrenderedEntry(undefined);
+      entries.settled();
       window.location.reload();
     }
   }
@@ -884,7 +875,7 @@ export async function createPageNavigationEngine(
     const { key } = await committed;
     // The entry is current, and its visit can still lose the commit to a navigation
     // that a currententrychange listener started. The visit clears this when it commits.
-    markUnrenderedEntry(key);
+    entries.committed(key);
     return key;
   }
 
@@ -897,10 +888,10 @@ export async function createPageNavigationEngine(
    */
   function returnToRenderedEntry(): Promise<void> | null {
     const current = window.navigation.currentEntry;
-    if (unrenderedEntry === undefined || current?.key !== unrenderedEntry) {
+    if (!current || !entries.isUnrendered()) {
       return null;
     }
-    const key = scrollRestoration.rendered();
+    const key = entries.renderedKey();
     let returned: Promise<unknown>;
     if (key && key !== current.key && window.navigation.entries().some((e) => e.key === key)) {
       const traversal = window.navigation.traverseTo(key, { info: renderedPageNavigation });
@@ -911,7 +902,7 @@ export async function createPageNavigationEngine(
       returned = publishEntry(_currentFetchUrl, true);
     }
     return returned.then(
-      () => markUnrenderedEntry(undefined),
+      () => entries.settled(),
       // A newer navigation took over; the action still runs.
       () => {},
     );
@@ -1306,7 +1297,8 @@ export async function createPageNavigationEngine(
           throw error;
         }
       }
-      markUnrenderedEntry(undefined);
+      // The adapter has applied this page: it is the one on screen.
+      entries.rendered(entryKey);
       // ownsCommit() just confirmed that this visit is the pending one.
       _pendingResource = null;
       const previousResource = _committedResource;
@@ -1359,7 +1351,6 @@ export async function createPageNavigationEngine(
       }
       applyClientHead(result.pageData.head as HeadDescriptor | undefined);
       _currentFetchUrl = commitTarget.fetchUrl;
-      scrollRestoration.commit(entryKey);
 
       requestAnimationFrame(() => {
         if (!preserveScroll && resourceId === _nextNavigationId && !context.signal?.aborted) {
@@ -1447,7 +1438,7 @@ export async function createPageNavigationEngine(
 
     if (context.kind === 'traverse') {
       // The browser has already moved to this entry.
-      markUnrenderedEntry(context.entryKey ?? window.navigation.currentEntry?.key, id);
+      entries.committed(context.entryKey ?? window.navigation.currentEntry?.key, id);
     }
 
     const controller = new AbortController();
@@ -1683,7 +1674,7 @@ export async function createPageNavigationEngine(
       const saved = initialScrollPosition;
       initialScrollPosition = null;
       if (_nextNavigationId === 0) {
-        scrollRestoration.commit(initialEntryKey);
+        entries.rendered(initialEntryKey);
       }
       if (saved && _nextNavigationId === 0) {
         window.scrollTo(saved.x, saved.y);
@@ -1697,6 +1688,7 @@ export async function createPageNavigationEngine(
       started = true;
       startAnchorPrefetch(engine);
       scrollRestoration.start();
+      entries.start(scrollRestoration.forget);
       initialScrollPosition = scrollRestoration.read(initialEntryKey);
 
       initClientHead(initialPageData.head as HeadDescriptor | undefined);
@@ -1766,7 +1758,9 @@ export async function createPageNavigationEngine(
       if (_pendingResource) {
         abortPendingResource(_pendingResource);
       }
-      // A visit that has just committed must not scroll after the browser does.
+      // A visit that has just committed must not scroll after the browser does. The
+      // navigation also retires the latest visit: it recovers no entry, a shell that
+      // was still loading is dropped, and the initial render restores no position.
       _nextNavigationId++;
       return;
     }
@@ -1877,7 +1871,7 @@ export async function createPageNavigationEngine(
             // An abort has already released the renderer through `cancel`.
             event.signal.throwIfAborted();
             context.entryKey = window.navigation.currentEntry?.key;
-            markUnrenderedEntry(context.entryKey, resource.id);
+            entries.committed(context.entryKey, resource.id);
             release(true);
             const result = await applyBrowserVisit(() => applied, resource);
             event.signal.throwIfAborted();
@@ -1913,7 +1907,7 @@ export async function createPageNavigationEngine(
       // navigation started from this event can supersede it first.
       const context = contextOf(pending);
       if (context.kind === 'precommit' && !context.signal?.aborted) {
-        markUnrenderedEntry(entry.key);
+        entries.committed(entry.key);
       }
       return;
     }
@@ -1926,7 +1920,7 @@ export async function createPageNavigationEngine(
     }
     // The rendered page under another fragment. The browser has not scrolled yet.
     scrollRestoration.save();
-    scrollRestoration.commit(entry.key);
+    entries.moved(entry.key);
     if (event.navigationType === 'traverse') {
       // Entries keep their own positions: the browser restores none of them.
       restoreScroll(scrollRestoration.read(entry.key), target.hash, false);

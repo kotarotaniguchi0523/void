@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
+import { createEntryTracker } from '../../src/pages/entry-tracker.ts';
 import { createPageNavigationEngine } from '../../src/pages/navigation-engine.ts';
 import { parseCacheFor } from '../../src/pages/prefetch.ts';
 import { createScrollRestoration } from '../../src/pages/scroll-restoration.ts';
@@ -185,12 +186,14 @@ describe('Pages scroll restoration', () => {
     const hidden = 'void:scroll:cross-origin-gap';
     page.storage.set(hidden, '{"x":0,"y":30}');
     page.navigation.entries = () => [initial, forward] as Array<typeof initial>;
-    const scroll = createScrollRestoration();
+    const entries = createEntryTracker();
+    const scroll = createScrollRestoration(entries.renderedKey);
     scroll.start();
-    scroll.commit(initial.key);
+    entries.start(scroll.forget);
+    entries.rendered(initial.key);
     page.window.scrollY = 120;
     scroll.save();
-    scroll.commit(forward.key);
+    entries.rendered(forward.key);
     page.window.scrollY = 640;
     scroll.save();
     forward.dispatchEvent(new Event('dispose'));
@@ -202,7 +205,7 @@ describe('Pages scroll restoration', () => {
 
     page.changeEntry({ key: 'new-entry', url: 'http://localhost/new' }, 'push');
     const current = page.navigation.currentEntry;
-    scroll.commit(current.key);
+    entries.rendered(current.key);
     scroll.save();
     current.dispatchEvent(new Event('dispose'));
     expect(scroll.read(current.key)).toBeNull();
