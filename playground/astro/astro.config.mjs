@@ -18,7 +18,10 @@ function vite8AstroDevToolbarCompat() {
 }
 
 export default defineConfig({
-  adapter: cloudflare({ configPath: './.void-wrangler.jsonc' }),
+  adapter: cloudflare({
+    configPath: './.void-wrangler.jsonc',
+    ...(process.env.VOID_INSPECTOR_PORT === 'false' ? { inspectorPort: false } : {}),
+  }),
   session: {
     driver: sessionDrivers.lruCache(),
   },
