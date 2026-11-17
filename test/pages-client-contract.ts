@@ -6,6 +6,7 @@ import {
   deserializePageData,
   serializePageData,
 } from '../packages/void/src/pages/serialize.ts';
+import { linkClickNavigatesSynchronously } from './pages-browser.ts';
 
 function gate() {
   let release!: () => void;
@@ -2259,7 +2260,7 @@ export function registerSharedClientTests({
 
     // `before`: the newer link starts before the older page is handed to the renderer.
     // `after`: it starts once the adapter has been given the older page, before it is on screen.
-    it.each(['before', 'after'] as const)(
+    it.skipIf(!linkClickNavigatesSynchronously).each(['before', 'after'] as const)(
       'does not render a superseded page when a link starts in its view transition update callback, %s the update',
       async (when) => {
         const page = await newPage();
@@ -2421,13 +2422,21 @@ export function registerSharedClientTests({
         });
         await page.getByRole('button', { name: 'Redirect action' }).click({ noWaitAfter: true });
         await actionRequested;
+        // Firefox cancels the page's requests once the document navigation starts.
+        const actionSettled = new Promise<void>((resolve) => {
+          const settle = (request: Request) => {
+            if (
+              request.method() === 'POST' &&
+              new URL(request.url()).pathname === '/scroll-restoration'
+            ) {
+              resolve();
+            }
+          };
+          page.on('requestfinished', settle);
+          page.on('requestfailed', settle);
+        });
         await page.getByRole('link', { name: 'Blog document' }).click({ noWaitAfter: true });
         await documentRequested;
-        const actionResponse = page.waitForResponse(
-          (response) =>
-            response.request().method() === 'POST' &&
-            new URL(response.url()).pathname === '/scroll-restoration',
-        );
         const urls: Array<string> = [];
         page.on('framenavigated', (frame) => {
           if (frame === page.mainFrame()) {
@@ -2435,7 +2444,7 @@ export function registerSharedClientTests({
           }
         });
         releaseAction();
-        await actionResponse;
+        await actionSettled;
         // Script in the page can stall while its document is being replaced: wait from here.
         await page.waitForTimeout(500);
         // The user has left this page: the older action does not move the address.
@@ -2507,55 +2516,60 @@ export function registerSharedClientTests({
       }
     });
 
-    it('does not scroll for a visit after a navigatesuccess listener starts a newer one', async () => {
-      const page = await newPage();
-      const { ready: requested, release: markRequested } = gate();
-      const { ready: canLoad, release: releaseLoader } = gate();
-      try {
-        await page.route('**/users/2?success-b=1', async (route) => {
-          markRequested();
-          await canLoad;
-          await route.continue().catch(() => {});
-        });
-        await page.goto(BASE + '/scroll-restoration');
-        await waitForHydration(page);
-        await addLinks(page, [
-          ['/scroll-restoration?success-a=1', 'Older link'],
-          ['/users/2?success-b=1', 'Newer link'],
-        ]);
-        await page.evaluate(() => window.scrollTo(0, 600));
-        await page.waitForFunction(() => window.scrollY === 600);
-        await page.evaluate(() => {
-          navigation.addEventListener('navigatesuccess', function startNewer() {
-            if (location.search === '?success-a=1') {
-              navigation.removeEventListener('navigatesuccess', startNewer);
-              document.body.dataset.successScroll = String(window.scrollY);
-              document.querySelector<HTMLAnchorElement>('a[href="/users/2?success-b=1"]')!.click();
-            }
+    it.skipIf(!linkClickNavigatesSynchronously)(
+      'does not scroll for a visit after a navigatesuccess listener starts a newer one',
+      async () => {
+        const page = await newPage();
+        const { ready: requested, release: markRequested } = gate();
+        const { ready: canLoad, release: releaseLoader } = gate();
+        try {
+          await page.route('**/users/2?success-b=1', async (route) => {
+            markRequested();
+            await canLoad;
+            await route.continue().catch(() => {});
           });
-          document
-            .querySelector<HTMLAnchorElement>('a[href="/scroll-restoration?success-a=1"]')!
-            .click();
-        });
-        await requested;
-        await page.evaluate(
-          () =>
-            new Promise((resolve) =>
-              requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 100))),
-            ),
-        );
-        const scrollAtSuccess = await page.locator('body').getAttribute('data-success-scroll');
-        expect(scrollAtSuccess).not.toBeNull();
-        // The older visit's scroll would have run on the next frame; the newer visit owns it now.
-        expect(String(await page.evaluate(() => window.scrollY))).toBe(scrollAtSuccess);
-        releaseLoader();
-        await page.getByText('bob@example.com').waitFor();
-        expect(page.url()).toBe(BASE + '/users/2?success-b=1');
-      } finally {
-        releaseLoader();
-        await page.context().close();
-      }
-    });
+          await page.goto(BASE + '/scroll-restoration');
+          await waitForHydration(page);
+          await addLinks(page, [
+            ['/scroll-restoration?success-a=1', 'Older link'],
+            ['/users/2?success-b=1', 'Newer link'],
+          ]);
+          await page.evaluate(() => window.scrollTo(0, 600));
+          await page.waitForFunction(() => window.scrollY === 600);
+          await page.evaluate(() => {
+            navigation.addEventListener('navigatesuccess', function startNewer() {
+              if (location.search === '?success-a=1') {
+                navigation.removeEventListener('navigatesuccess', startNewer);
+                document.body.dataset.successScroll = String(window.scrollY);
+                document
+                  .querySelector<HTMLAnchorElement>('a[href="/users/2?success-b=1"]')!
+                  .click();
+              }
+            });
+            document
+              .querySelector<HTMLAnchorElement>('a[href="/scroll-restoration?success-a=1"]')!
+              .click();
+          });
+          await requested;
+          await page.evaluate(
+            () =>
+              new Promise((resolve) =>
+                requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 100))),
+              ),
+          );
+          const scrollAtSuccess = await page.locator('body').getAttribute('data-success-scroll');
+          expect(scrollAtSuccess).not.toBeNull();
+          // The older visit's scroll would have run on the next frame; the newer visit owns it now.
+          expect(String(await page.evaluate(() => window.scrollY))).toBe(scrollAtSuccess);
+          releaseLoader();
+          await page.getByText('bob@example.com').waitFor();
+          expect(page.url()).toBe(BASE + '/users/2?success-b=1');
+        } finally {
+          releaseLoader();
+          await page.context().close();
+        }
+      },
+    );
   });
 
   /**
@@ -2727,31 +2741,32 @@ export function registerSharedClientTests({
       }
     });
 
-    it('policy: a link that app code follows when a pushed entry becomes current takes its place', async ({
-      expect,
-    }) => {
-      const page = await open('/');
-      try {
-        await addLink(page, 'next-page', '/link-behavior');
-        await page.evaluate(() => {
-          navigation.addEventListener('currententrychange', function follow() {
-            if (location.search === '?history=reentry') {
-              navigation.removeEventListener('currententrychange', follow);
-              document.querySelector<HTMLAnchorElement>('[data-testid="next-page"]')!.click();
-            }
+    it.skipIf(!linkClickNavigatesSynchronously)(
+      'policy: a link that app code follows when a pushed entry becomes current takes its place',
+      async ({ expect }) => {
+        const page = await open('/');
+        try {
+          await addLink(page, 'next-page', '/link-behavior');
+          await page.evaluate(() => {
+            navigation.addEventListener('currententrychange', function follow() {
+              if (location.search === '?history=reentry') {
+                navigation.removeEventListener('currententrychange', follow);
+                document.querySelector<HTMLAnchorElement>('[data-testid="next-page"]')!.click();
+              }
+            });
           });
-        });
-        await addLink(page, 'reentry-page', '/users?history=reentry');
-        await page.getByTestId('reentry-page').click({ noWaitAfter: true });
-        await heading(page, 'Link Behavior');
-        await settled(page);
+          await addLink(page, 'reentry-page', '/users?history=reentry');
+          await page.getByTestId('reentry-page').click({ noWaitAfter: true });
+          await heading(page, 'Link Behavior');
+          await settled(page);
 
-        // Today: ['/', '/users?history=reentry', '/link-behavior'].
-        expect(await history(page)).toMatchObject({ urls: ['/', '/link-behavior'], index: 1 });
-      } finally {
-        await page.context().close();
-      }
-    });
+          // Today: ['/', '/users?history=reentry', '/link-behavior'].
+          expect(await history(page)).toMatchObject({ urls: ['/', '/link-behavior'], index: 1 });
+        } finally {
+          await page.context().close();
+        }
+      },
+    );
 
     it('pinned: a replace visit that app code starts when a pushed entry becomes current replaces it', async ({
       expect,
