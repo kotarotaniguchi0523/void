@@ -158,7 +158,20 @@ Export `ssr` and `prerender` directly from `.server.ts` as `true` or `false`. Co
 
 ### Typed navigation
 
-Use the `Link` component for SPA navigation between pages. Build dynamic URLs with [`routeUrl()`](../type-safety.md#typed-urls-and-navigation) to check the route pattern and its parameters:
+A standard anchor such as `<a href="/users">Users</a>` navigates between Void Pages without reloading the document. Use `data-void-reload` on a plain anchor to request a full page load. Links to other origins and island pages use document navigation.
+
+Client navigation requires the browser's Navigation API with precommit support. **Safari
+27.2 and earlier are not supported**; Safari 27.3 or later must expose the precommit
+handler to use Void Pages navigation. Void does not add a legacy History API fallback.
+
+For a new page, the address updates after Void has loaded its page data and components.
+The destination can still be rendering after the address changes.
+
+If a native link cannot prepare its page data or component, Void loads the destination as a document. Handle preparation errors from programmatic `router.visit()` calls with `try/catch`.
+
+A plain anchor navigates on the client only when its URL matches a page file. For a URL that middleware or a route handler [rewrites](../edge/rewrites.md) or redirects to a page, such as `/dashboard` or `/logout`, use `Link`: it asks the server for the page and navigates without reloading the document. If the response is not a page, the browser loads the URL as a document.
+
+Use the `Link` component for checked `href` values, prefetching, active and pending styles, or other link options. Build dynamic URLs with [`routeUrl()`](../type-safety.md#typed-urls-and-navigation) to check the route pattern and its parameters:
 
 ::: code-group
 
@@ -204,109 +217,57 @@ import { routeUrl } from 'void/routes';
 
 Enable [`routing.typedRoutes`](../type-safety.md#checked-url-strings) to catch misspelled URLs in links and router calls. Apps created with `void init` already have it enabled.
 
-`Link` also supports query data, history replacement, full-page navigation, and cancellation:
+A Void `Link` always renders a native GET anchor. It never submits a mutation.
+Pass a complete URL using `routeUrl()`; it does not merge a `data` prop.
 
 ::: code-group
 
 ```tsx [React]
-import { Link } from '@void/react';
+import { Link, createLinkClickHandler, useRouter } from '@void/react';
+import { routeUrl } from 'void/routes';
 
-<Link href="/users" data={{ page: 2, tag: ['active', 'new'] }}>
-  Filtered users
-</Link>
-
-<Link href="/users" replace>
-  Users
-</Link>
-
-<Link href="/logout" reloadDocument>
-  Sign out
-</Link>
-
-<Link
-  href="/settings"
-  onNavigate={(event) => {
-    if (!confirm('Leave this page?')) {
-      event.preventDefault();
-    }
-  }}
->
-  Settings
-</Link>
+<Link href={routeUrl('/users', { query: { page: 2 } })}>Filtered users</Link>
+<Link href="/users" prefetch="hover">Prefetch users</Link>
+<a href="/users" onClick={createLinkClickHandler(useRouter(), { replace: true })}>Replace entry</a>
+<a href="/legacy" data-void-reload>Reload document</a>
 ```
 
 ```vue [Vue]
 <script setup lang="ts">
-import { Link } from '@void/vue';
-
-function onNavigate(event: { preventDefault(): void }) {
-  if (!confirm('Leave this page?')) {
-    event.preventDefault();
-  }
-}
+import { Link, createLinkClickHandler, useRouter } from '@void/vue';
+import { routeUrl } from 'void/routes';
+const replaceUsers = createLinkClickHandler(useRouter(), { replace: true });
 </script>
-
 <template>
-  <Link href="/users" :data="{ page: 2, tag: ['active', 'new'] }">Filtered users</Link>
-  <Link href="/users" replace>Users</Link>
-  <Link href="/logout" reload-document>Sign out</Link>
-  <Link href="/settings" :on-navigate="onNavigate">Settings</Link>
+  <Link :href="routeUrl('/users', { query: { page: 2 } })">Filtered users</Link>
+  <a href="/users" @click="replaceUsers">Replace entry</a>
+  <a href="/legacy" data-void-reload>Reload document</a>
 </template>
 ```
 
 ```svelte [Svelte]
 <script lang="ts">
-  import { Link } from '@void/svelte';
+  import { Link, createLinkClickHandler, useRouter } from '@void/svelte';
+  import { routeUrl } from 'void/routes';
+  const replaceUsers = createLinkClickHandler(useRouter(), { replace: true });
 </script>
-
-<Link href="/users" data={{ page: 2, tag: ['active', 'new'] }}>Filtered users</Link>
-
-<Link href="/users" replace>Users</Link>
-
-<Link href="/logout" reloadDocument>Sign out</Link>
-
-<Link
-  href="/settings"
-  onNavigate={(event) => {
-    if (!confirm('Leave this page?')) {
-      event.preventDefault();
-    }
-  }}
->
-  Settings
-</Link>
+<Link href={routeUrl('/users', { query: { page: 2 } })}>Filtered users</Link>
+<a href="/users" onclick={replaceUsers}>Replace entry</a>
+<a href="/legacy" data-void-reload>Reload document</a>
 ```
 
 ```tsx [Solid]
-import { Link } from '@void/solid';
-
-<Link href="/users" data={{ page: 2, tag: ['active', 'new'] }}>
-  Filtered users
-</Link>
-
-<Link href="/users" replace>
-  Users
-</Link>
-
-<Link href="/logout" reloadDocument>
-  Sign out
-</Link>
-
-<Link
-  href="/settings"
-  onNavigate={(event) => {
-    if (!confirm('Leave this page?')) {
-      event.preventDefault();
-    }
-  }}
->
-  Settings
-</Link>
+import { Link, createLinkClickHandler, useRouter } from '@void/solid';
+import { routeUrl } from 'void/routes';
+<Link href={routeUrl('/users', { query: { page: 2 } })}>Filtered users</Link>
+<a href="/users" onClick={createLinkClickHandler(useRouter(), { replace: true })}>Replace entry</a>
+<a href="/legacy" data-void-reload>Reload document</a>
 ```
 
 :::
 
-`prefetch` and `reloadDocument` work only with GET links. GET `data` becomes query parameters; use scalar values or arrays.
+Use `action()` or `useForm()` for POST, PUT, PATCH, and DELETE. To cancel
+navigation, use a native click handler and call `event.preventDefault()`.
 
 After an update that changes the page-data format, open tabs reload on their next navigation.
 
@@ -327,7 +288,7 @@ await router.prefetch(profile);
 await router.visit(profile);
 router.flush(profile); // clear its prefetched data
 router.refresh(); // re-fetch current page props, keeping the same history entry
-router.visit('/logout', { method: 'POST' }); // non-GET navigation
+// For mutations, use action('/logout', { method: 'POST' }) instead.
 ```
 
 You can also pass URL strings or `URL` instances to these router methods. See [Typed URLs and Navigation](../type-safety.md#typed-urls-and-navigation) for query values, fragments, and catch-all routes.
@@ -386,6 +347,78 @@ export default function PostPage() {
 
 See [Page params](../type-safety.md#page-params) for how patterns are checked.
 
+### Prefetch and state on a standard anchor
+
+Opt in to Void page-data prefetching with `data-void-prefetch`. Supported strategies are `hover` (including focus and touch), `click` (pointer down), `mount`, and `visible`. Separate multiple strategies with spaces. Set `data-void-cache-for` to a duration such as `30s`, a number of milliseconds, or a pair such as `5s, 1m` for the stale and expiration times.
+
+```html
+<a href="/users" data-void-prefetch="hover visible" data-void-cache-for="30s">Users</a>
+```
+
+Set `data-void-view-transition` to `true` or `false` to turn the [view transition](./view-transitions.md#per-link-override) on or off for that anchor.
+
+Use `useLinkState(href, { activeMatch: "prefix" })` from your Pages adapter to read the current and pending attributes for an anchor. Read `state.attributes` in the render or template and pass it to the anchor. Use a function such as `() => props.href` for a reactive destination. All anchors using the attributes for the same pending destination show the pending state.
+
+Call these APIs inside your component or component setup, where the Pages router context is available. For explicit visit options, attach `createLinkClickHandler(router, options)` to the anchor.
+
+::: code-group
+
+```tsx [React]
+import { createLinkClickHandler, useLinkState, useRouter } from '@void/react';
+
+export function UsersLink() {
+  const users = useLinkState('/users');
+  const click = createLinkClickHandler(useRouter(), { replace: true, preserveScroll: true });
+  return (
+    <a href="/users" {...users.attributes} onClick={click}>
+      Users
+    </a>
+  );
+}
+```
+
+```vue [Vue]
+<script setup lang="ts">
+import { createLinkClickHandler, useLinkState, useRouter } from '@void/vue';
+
+const users = useLinkState('/users');
+const click = createLinkClickHandler(useRouter(), { replace: true, preserveScroll: true });
+</script>
+
+<template>
+  <a href="/users" v-bind="users.attributes" @click="click">Users</a>
+</template>
+```
+
+```svelte [Svelte]
+<script lang="ts">
+  import { createLinkClickHandler, useLinkState, useRouter } from '@void/svelte';
+
+  const users = useLinkState('/users');
+  const click = createLinkClickHandler(useRouter(), { replace: true, preserveScroll: true });
+</script>
+
+<a href="/users" {...users.attributes} onclick={click}>Users</a>
+```
+
+```tsx [Solid]
+import { createLinkClickHandler, useLinkState, useRouter } from '@void/solid';
+
+export function UsersLink() {
+  const users = useLinkState('/users');
+  const click = createLinkClickHandler(useRouter(), { replace: true, preserveScroll: true });
+  return (
+    <a href="/users" {...users.attributes} onClick={click}>
+      Users
+    </a>
+  );
+}
+```
+
+:::
+
+For data mutations, use a form or an action button.
+
 ### Active links
 
 `Link` marks the link to the current page with `aria-current="page"` and `data-void-active`. Use them to style navigation:
@@ -443,7 +476,7 @@ A link is active only on its own path by default. Set `activeMatch="prefix"` to 
 
 `aria-current="page"` marks only the exact page, so select `[aria-current="page"]` to style it differently from its section. A link to `/` is active only on the home page.
 
-Query parameters let you distinguish pagination links from filter tabs. A link is active when the current URL contains all of its query parameters with the same values. Extra parameters and their order don't matter, and a GET link's `data` counts as part of its query:
+Query parameters let you distinguish pagination links from filter tabs. A link is active when the current URL contains all of its query parameters with the same values. Extra parameters and their order don't matter. The link's full query is written in its `href`:
 
 | Current URL                  | Link                           | Active          |
 | ---------------------------- | ------------------------------ | --------------- |
@@ -454,7 +487,7 @@ Query parameters let you distinguish pagination links from filter tabs. A link i
 
 On nested pages, `activeMatch="prefix"` compares only the path, so `href="/reports?range=30d"` has `data-void-active` on `/reports/42`.
 
-Paths are case-sensitive and respect trailing slashes; hashes are ignored. External and non-GET links are never active.
+Paths are case-sensitive and respect trailing slashes; hashes are ignored. External links are never active.
 
 To mark a default filter such as an "All" tab, set `aria-current` or `data-void-active` yourself. Your value overrides the computed one.
 
@@ -470,19 +503,19 @@ a[data-void-pending] {
 }
 ```
 
-A pending link matches the destination's path, query, and hash. A link to `/users?page=2` won't show as pending while page 3 loads. Non-GET links also match the request method. During `router.refresh()`, links to the current page are pending.
+A pending link matches the destination's path, query, and hash. A link to `/users?page=2` won't show as pending while page 3 loads. During `router.refresh()`, links to the current page are pending.
 
 A `data-void-pending` you pass to `Link` replaces the computed value. For a loading indicator that covers the whole page, use [`useNavigation()`](../../reference/api/pages.md).
 
 ### Prefetching
 
-Add `prefetch` to a `Link` to load its page before the user clicks. This markup works in all four adapters:
+Set a named prefetch strategy on a `Link` to load its page before the user clicks. This markup works in all four adapters:
 
 ```html
-<Link href="/dashboard" prefetch>Dashboard</Link>
+<Link href="/dashboard" prefetch="hover">Dashboard</Link>
 ```
 
-The page loads on hover, keyboard focus, or touch. The next visit can use the cached data. Use `cacheFor` to choose how long to reuse it.
+`prefetch="hover"` loads the page on hover, keyboard focus, or touch. The next visit can use the cached data. Use `cacheFor` to choose how long to reuse it.
 
 For an app-wide default, set `prefetch.defaultStrategy` in your [adapter plugin](../../reference/api/pages.md#prefetching). A link's own `prefetch` value overrides it. Prefer `'hover'` or `'click'`; `'mount'` and `'visible'` can load many pages in a long list.
 
@@ -505,28 +538,6 @@ To keep the current scroll position, pass `preserveScroll: true`:
 router.visit('/users', { preserveScroll: true });
 ```
 
-`Link` also accepts `preserveScroll`:
-
-::: code-group
-
-```tsx [React]
-<Link href="/users" preserveScroll>
-  Users
-</Link>
-```
-
-```vue [Vue]
-<Link href="/users" preserve-scroll>Users</Link>
-```
-
-```svelte [Svelte]
-<Link href="/users" preserveScroll>Users</Link>
-```
-
-```tsx [Solid]
-<Link href="/users" preserveScroll>
-  Users
-</Link>
-```
-
-:::
+To preserve scroll on a custom anchor, attach
+`createLinkClickHandler(useRouter(), { preserveScroll: true })` as its click
+handler. Ordinary `Link` elements leave GET navigation to the browser.
