@@ -1,5 +1,4 @@
-import { Link, useRouter } from '@void/solid';
-import { ErrorBoundary, createSignal } from 'solid-js';
+import { Link, createLinkClickHandler, useRouter } from '@void/solid';
 import type { Props } from './link-behavior.server.ts';
 
 type LinkBehaviorWindow = Window & {
@@ -7,13 +6,17 @@ type LinkBehaviorWindow = Window & {
   __boundClickEventType?: string;
   __linkOnClick?: boolean;
   __preventedClick?: boolean;
-  __preventedNavigate?: boolean;
 };
 
 export default function LinkBehaviorPage(props: Props) {
   const router = useRouter();
-  const [prefetchMethod, setPrefetchMethod] = createSignal<'GET' | 'POST'>('GET');
-  const [reloadMethod, setReloadMethod] = createSignal<'GET' | 'POST'>('GET');
+
+  // Records the address at the moment the visit's promise resolves.
+  function visitRewriteOnData() {
+    void router.visit('/link-rewrite', { resolveOn: 'data', viewTransition: true }).then(() => {
+      document.body.setAttribute('data-visit-resolved-at', window.location.pathname);
+    });
+  }
 
   function setBoundClicked(label: string, event: MouseEvent) {
     event.preventDefault();
@@ -54,6 +57,21 @@ export default function LinkBehaviorPage(props: Props) {
       </p>
 
       <p>
+        <Link href="/link-redirect" data-testid="server-redirect-link">
+          Server redirect
+        </Link>
+        <Link href="/link-rewrite" data-testid="server-rewrite-link">
+          Server rewrite
+        </Link>
+        <Link href="/api/health" data-testid="non-page-link">
+          Not a page
+        </Link>
+        <button data-testid="server-rewrite-data-visit" onClick={visitRewriteOnData}>
+          Server rewrite, resolved on data
+        </button>
+      </p>
+
+      <p>
         <Link
           href="/users"
           data-testid="onclick-link"
@@ -89,34 +107,22 @@ export default function LinkBehaviorPage(props: Props) {
       </p>
 
       <p>
-        <Link
+        <a
           href="/users"
-          data-testid="prevented-navigate-link"
-          onNavigate={(event) => {
-            event.preventDefault();
-            (window as LinkBehaviorWindow).__preventedNavigate = true;
-          }}
+          data-testid="replace-link"
+          onClick={createLinkClickHandler(router, { replace: true })}
         >
-          Prevented navigate
-        </Link>
-      </p>
-
-      <p>
-        <Link href="/users" data-testid="replace-link" replace>
           Replace with users
-        </Link>
+        </a>
       </p>
 
       <p>
-        <Link href="/link-behavior" method="post" data-testid="post-link">
-          Post to this page
+        <Link href="/users" data-testid="view-transition-link" viewTransition>
+          Users with a view transition
         </Link>
-      </p>
-
-      <p>
-        <Link href="/users" data-testid="reload-link" reloadDocument>
-          Reload document
-        </Link>
+        <a href="/users" data-testid="view-transition-anchor" data-void-view-transition="true">
+          Users with a view transition (plain anchor)
+        </a>
       </p>
 
       <p>
@@ -130,74 +136,6 @@ export default function LinkBehaviorPage(props: Props) {
           Download users
         </Link>
       </p>
-
-      <p>
-        <Link
-          href="/link-behavior"
-          data={{
-            tag: ['a', 'b'],
-            page: 2,
-            active: true,
-            skip: null,
-            missing: undefined,
-          }}
-          data-testid="query-data-link"
-        >
-          Query data
-        </Link>
-      </p>
-
-      <ErrorBoundary
-        fallback={(error) => (
-          <p data-testid="reactive-prefetch-error">
-            {error instanceof Error ? error.message : String(error)}
-          </p>
-        )}
-      >
-        <p>
-          <button
-            type="button"
-            data-testid="toggle-prefetch-method"
-            onClick={() => setPrefetchMethod('POST')}
-          >
-            Make prefetch a mutation
-          </button>
-          <Link
-            href="/users"
-            method={prefetchMethod()}
-            prefetch
-            data-testid="reactive-prefetch-link"
-          >
-            Reactive prefetch link
-          </Link>
-        </p>
-      </ErrorBoundary>
-
-      <ErrorBoundary
-        fallback={(error) => (
-          <p data-testid="reactive-reload-error">
-            {error instanceof Error ? error.message : String(error)}
-          </p>
-        )}
-      >
-        <p>
-          <button
-            type="button"
-            data-testid="toggle-reload-method"
-            onClick={() => setReloadMethod('POST')}
-          >
-            Make reload a mutation
-          </button>
-          <Link
-            href="/users"
-            method={reloadMethod()}
-            reloadDocument
-            data-testid="reactive-reload-link"
-          >
-            Reactive reload link
-          </Link>
-        </p>
-      </ErrorBoundary>
     </div>
   );
 }

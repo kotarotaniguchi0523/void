@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { action, Form, Link, useForm } from '@void/vue';
+import { action, createLinkClickHandler, Form, Link, useForm, useRouter } from '@void/vue';
 import type { Props } from './scroll-restoration.server.ts';
 defineProps<Props>();
+const visitUser = createLinkClickHandler(useRouter(), { preserveScroll: true });
 const form = useForm('/scroll-restoration?touch', {});
 const anchorForm = useForm('/scroll-restoration?typedAnchor', {});
 </script>
@@ -14,6 +15,9 @@ const anchorForm = useForm('/scroll-restoration?typedAnchor', {});
     <output data-testid="scroll-page">{{ page }}</output>
     <button @click="action('/scroll-restoration?anchor')">Redirect to anchor</button>
     <Form :form="anchorForm"><button type="submit">Submit to anchor</button></Form>
+    <a href="/users/1?action-race=1" data-testid="race-link" @click="visitUser"
+      >Visit user with preserved scroll</a
+    >
     <section
       v-for="row in 80"
       :key="row"

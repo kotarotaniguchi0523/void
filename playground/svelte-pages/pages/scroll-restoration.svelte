@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { action, Form, Link, useForm } from "@void/svelte";
+  import { action, createLinkClickHandler, Form, Link, useForm, useRouter } from "@void/svelte";
   import type { Props } from "./scroll-restoration.server.ts";
   let { requestId, page }: Props = $props();
+  const visitUser = createLinkClickHandler(useRouter(), { preserveScroll: true });
   const form = useForm("/scroll-restoration?touch", {});
   const anchorForm = useForm("/scroll-restoration?typedAnchor", {});
   const rows = Array.from({ length: 80 }, (_, index) => index + 1);
@@ -14,6 +15,7 @@
   <output data-testid="scroll-page">{page}</output>
   <button onclick={() => action("/scroll-restoration?anchor")}>Redirect to anchor</button>
   <Form form={anchorForm}><button type="submit">Submit to anchor</button></Form>
+  <a href="/users/1?action-race=1" data-testid="race-link" onclick={visitUser}>Visit user with preserved scroll</a>
   {#each rows as row (row)}
     <section id={row === 60 ? "details" : undefined} data-testid={`scroll-row-${row}`} style="height: 120px">
       <h2 style="margin: 0">Row {row}</h2>

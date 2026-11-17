@@ -6,15 +6,15 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   return (
     <div>
       <nav>
-        <Link href="/" prefetch>
+        <Link href="/" prefetch="hover">
           Home
         </Link>{' '}
         |{' '}
-        <Link href="/chat" prefetch>
+        <Link href="/chat" prefetch="hover">
           Chat
         </Link>{' '}
         |{' '}
-        <Link href="/notifications" prefetch>
+        <Link href="/notifications" prefetch="hover">
           Notifications
         </Link>{' '}
         | <span>{shared.appName}</span>

@@ -1,8 +1,9 @@
-import { action, Form, Link, useForm } from '@void/react';
+import { action, createLinkClickHandler, Form, Link, useForm, useRouter } from '@void/react';
 import { startTransition } from 'react';
 import type { Props } from './scroll-restoration.server.ts';
 
 export default function ScrollRestorationPage({ requestId, page }: Props) {
+  const visitUser = createLinkClickHandler(useRouter(), { preserveScroll: true });
   const form = useForm('/scroll-restoration?touch', {});
   const anchorForm = useForm('/scroll-restoration?typedAnchor', {});
   return (
@@ -23,6 +24,9 @@ export default function ScrollRestorationPage({ requestId, page }: Props) {
       <Form form={anchorForm}>
         <button type="submit">Submit to anchor</button>
       </Form>
+      <a href="/users/1?action-race=1" data-testid="race-link" onClick={visitUser}>
+        Visit user with preserved scroll
+      </a>
       {Array.from({ length: 80 }, (_, index) => {
         const row = index + 1;
         return (

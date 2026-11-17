@@ -1,15 +1,22 @@
 <script setup lang="ts">
-import { Link, useRouter } from '@void/vue';
+import { Link, createLinkClickHandler, useRouter } from '@void/vue';
 import type { Props } from './link-behavior.server.ts';
 
 defineProps<Props>();
 const router = useRouter();
+const replaceUsers = createLinkClickHandler(router, { replace: true });
 
 type LinkBehaviorWindow = Window & {
   __linkOnClick?: boolean;
   __preventedClick?: boolean;
-  __preventedNavigate?: boolean;
 };
+
+// Records the address at the moment the visit's promise resolves.
+function visitRewriteOnData() {
+  void router.visit('/link-rewrite', { resolveOn: 'data', viewTransition: true }).then(() => {
+    document.body.setAttribute('data-visit-resolved-at', window.location.pathname);
+  });
+}
 
 function setClicked() {
   (window as LinkBehaviorWindow).__linkOnClick = true;
@@ -18,11 +25,6 @@ function setClicked() {
 function preventClick(event: Event) {
   event.preventDefault();
   (window as LinkBehaviorWindow).__preventedClick = true;
-}
-
-function preventNavigate(event: { preventDefault(): void }) {
-  event.preventDefault();
-  (window as LinkBehaviorWindow).__preventedNavigate = true;
 }
 </script>
 
@@ -54,6 +56,15 @@ function preventNavigate(event: { preventDefault(): void }) {
     </p>
 
     <p>
+      <Link href="/link-redirect" data-testid="server-redirect-link">Server redirect</Link>
+      <Link href="/link-rewrite" data-testid="server-rewrite-link">Server rewrite</Link>
+      <Link href="/api/health" data-testid="non-page-link">Not a page</Link>
+      <button data-testid="server-rewrite-data-visit" @click="visitRewriteOnData">
+        Server rewrite, resolved on data
+      </button>
+    </p>
+
+    <p>
       <Link href="/users" data-testid="onclick-link" @click="setClicked">
         User handler then SPA
       </Link>
@@ -66,25 +77,16 @@ function preventNavigate(event: { preventDefault(): void }) {
     </p>
 
     <p>
-      <Link
-        href="/users"
-        data-testid="prevented-navigate-link"
-        v-bind="{ onNavigate: preventNavigate }"
-      >
-        Prevented navigate
+      <a href="/users" data-testid="replace-link" @click="replaceUsers">Replace with users</a>
+    </p>
+
+    <p>
+      <Link href="/users" data-testid="view-transition-link" view-transition>
+        Users with a view transition
       </Link>
-    </p>
-
-    <p>
-      <Link href="/users" data-testid="replace-link" replace>Replace with users</Link>
-    </p>
-
-    <p>
-      <Link href="/link-behavior" method="post" data-testid="post-link">Post to this page</Link>
-    </p>
-
-    <p>
-      <Link href="/users" data-testid="reload-link" reload-document>Reload document</Link>
+      <a href="/users" data-testid="view-transition-anchor" data-void-view-transition="true">
+        Users with a view transition (plain anchor)
+      </a>
     </p>
 
     <p>
@@ -93,22 +95,6 @@ function preventNavigate(event: { preventDefault(): void }) {
 
     <p>
       <Link href="/users" data-testid="download-link" download="users.html"> Download users </Link>
-    </p>
-
-    <p>
-      <Link
-        href="/link-behavior"
-        :data="{
-          tag: ['a', 'b'],
-          page: 2,
-          active: true,
-          skip: null,
-          missing: undefined,
-        }"
-        data-testid="query-data-link"
-      >
-        Query data
-      </Link>
     </p>
   </div>
 </template>

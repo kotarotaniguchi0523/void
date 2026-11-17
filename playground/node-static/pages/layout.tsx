@@ -7,11 +7,11 @@ export default function Layout({ children }: { children: ReactNode }) {
   return (
     <div>
       <nav>
-        <Link href="/" prefetch>
+        <Link href="/" prefetch="hover">
           Home
         </Link>{' '}
         |{' '}
-        <Link href="/about" prefetch>
+        <Link href="/about" prefetch="hover">
           About
         </Link>{' '}
         | <Link href="/legacy">Legacy</Link> | <Link href="/external-legacy">External Legacy</Link>{' '}

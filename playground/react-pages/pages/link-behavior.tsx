@@ -1,30 +1,25 @@
-import { Link, useNavigation, useRouter } from '@void/react';
-import { useEffect, useRef, useState } from 'react';
+import { Link, createLinkClickHandler, useNavigation, useRouter } from '@void/react';
+import { useRef, useState } from 'react';
 import type { Props } from './link-behavior.server.ts';
 
 type LinkBehaviorWindow = Window & {
-  __hashNavigationStarts?: number;
-  __hashNavigationEnds?: number;
-  __hashNavigationReady?: boolean;
   __linkOnClick?: boolean;
   __preventedClick?: boolean;
-  __preventedNavigate?: boolean;
 };
 
 export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeUrl }: Props) {
   const [abortTestStatus, setAbortTestStatus] = useState('Not run');
 
-  useEffect(() => {
-    const linkWindow = window as LinkBehaviorWindow;
-    linkWindow.__hashNavigationStarts = 0;
-    linkWindow.__hashNavigationEnds = 0;
-    linkWindow.__hashNavigationReady = true;
-  }, []);
-
   const router = useRouter();
   const navigation = useNavigation();
-  const previousNavigationState = useRef(navigation.state);
   const abortTestCleanupRef = useRef<() => void>(() => {});
+
+  // Records the address at the moment the visit's promise resolves.
+  const visitRewriteOnData = () => {
+    void router.visit('/link-rewrite', { resolveOn: 'data', viewTransition: true }).then(() => {
+      document.body.setAttribute('data-visit-resolved-at', window.location.pathname);
+    });
+  };
 
   const runAbortNavigationTest = () => {
     const observedErrors: Array<string> = [];
@@ -67,17 +62,6 @@ export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeU
     }, 800);
   };
 
-  useEffect(() => {
-    const linkWindow = window as LinkBehaviorWindow;
-    if (previousNavigationState.current === 'idle' && navigation.state !== 'idle') {
-      linkWindow.__hashNavigationStarts = (linkWindow.__hashNavigationStarts ?? 0) + 1;
-    }
-    if (previousNavigationState.current !== 'idle' && navigation.state === 'idle') {
-      linkWindow.__hashNavigationEnds = (linkWindow.__hashNavigationEnds ?? 0) + 1;
-    }
-    previousNavigationState.current = navigation.state;
-  }, [navigation.state]);
-
   return (
     <div>
       <h1>{title}</h1>
@@ -110,6 +94,21 @@ export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeU
       </p>
 
       <p>
+        <Link href="/link-redirect" data-testid="server-redirect-link">
+          Server redirect
+        </Link>
+        <Link href="/link-rewrite" data-testid="server-rewrite-link">
+          Server rewrite
+        </Link>
+        <Link href="/api/health" data-testid="non-page-link">
+          Not a page
+        </Link>
+        <button data-testid="server-rewrite-data-visit" onClick={visitRewriteOnData}>
+          Server rewrite, resolved on data
+        </button>
+      </p>
+
+      <p>
         <Link
           href="/users"
           data-testid="onclick-link"
@@ -135,34 +134,22 @@ export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeU
       </p>
 
       <p>
-        <Link
+        <a
           href="/users"
-          data-testid="prevented-navigate-link"
-          onNavigate={(event) => {
-            event.preventDefault();
-            (window as LinkBehaviorWindow).__preventedNavigate = true;
-          }}
+          data-testid="replace-link"
+          onClick={createLinkClickHandler(router, { replace: true })}
         >
-          Prevented navigate
-        </Link>
-      </p>
-
-      <p>
-        <Link href="/users" data-testid="replace-link" replace>
           Replace with users
-        </Link>
+        </a>
       </p>
 
       <p>
-        <Link href="/link-behavior" method="post" data-testid="post-link">
-          Post to this page
+        <Link href="/users" data-testid="view-transition-link" viewTransition>
+          Users with a view transition
         </Link>
-      </p>
-
-      <p>
-        <Link href="/users" data-testid="reload-link" reloadDocument>
-          Reload document
-        </Link>
+        <a href="/users" data-testid="view-transition-anchor" data-void-view-transition="true">
+          Users with a view transition (plain anchor)
+        </a>
       </p>
 
       <p>
@@ -178,36 +165,9 @@ export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeU
       </p>
 
       <p>
-        <Link
-          href="/link-behavior"
-          data={{
-            tag: ['a', 'b'],
-            page: 2,
-            active: true,
-            skip: null,
-            missing: undefined,
-          }}
-          data-testid="query-data-link"
-        >
-          Query data
-        </Link>
-      </p>
-
-      <p>
-        <Link href="#hash-target" data-testid="hash-link">
-          Hash target
-        </Link>
-      </p>
-
-      <p>
         <a href="#plain-hash-target" data-testid="plain-hash-link">
           Plain hash target
         </a>
-      </p>
-
-      <p data-testid="navigation-location">
-        {router.url.pathname}
-        {router.url.hash}
       </p>
       <p data-testid="navigation-state">{navigation.state}</p>
 
@@ -217,10 +177,6 @@ export default function LinkBehaviorPage({ title, absoluteUrl, protocolRelativeU
           Run interrupted navigation check
         </button>
         <p data-testid="abort-navigation-status">{abortTestStatus}</p>
-      </section>
-
-      <section id="hash-target">
-        <h2>Hash target</h2>
       </section>
 
       <section id="plain-hash-target">

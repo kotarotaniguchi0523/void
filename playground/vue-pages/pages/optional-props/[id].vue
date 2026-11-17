@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { Link } from '@void/vue';
+import { createLinkClickHandler, useRouter } from '@void/vue';
 import { ref } from 'vue';
 
 const props = defineProps<{ title: string; note?: string }>();
 const draft = ref('');
+const keepState = createLinkClickHandler(useRouter(), { preserveState: true });
 </script>
 
 <template>
@@ -11,6 +12,6 @@ const draft = ref('');
     <h1>{{ props.title }}</h1>
     <p>{{ props.note }}</p>
     <label>Draft <input v-model="draft" /></label>
-    <Link href="/optional-props/second" preserve-state>Show note</Link>
+    <a href="/optional-props/second" @click="keepState">Show note</a>
   </section>
 </template>
