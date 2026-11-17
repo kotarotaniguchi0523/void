@@ -38,29 +38,34 @@ describe('GET-only Link', () => {
     expect(html).not.toContain('viewTransition');
   });
 
-  it('marks the active link and its parent', () => {
-    const active = renderAt('/users', { href: '/users' });
-    expect(active).toContain('aria-current="page"');
-    expect(active).toContain('data-void-active=""');
-    const parent = renderAt('/users/1', { href: '/users', activeMatch: 'prefix' });
-    expect(parent).not.toContain('aria-current');
-    expect(parent).toContain('data-void-active=""');
+  it('marks the link to the current page', () => {
+    const current = renderAt('/users', { href: '/users' });
+    expect(current).toContain('aria-current="page"');
+    expect(current).toContain('data-void-active=""');
+
+    const nested = renderAt('/users/1', { href: '/users', activeMatch: 'prefix' });
+    expect(nested).not.toContain('aria-current');
+    expect(nested).toContain('data-void-active=""');
+
+    expect(renderAt('/users/1', { href: '/users' })).not.toContain('data-void-active');
     expect(renderAt(null, { href: '/users' })).not.toContain('data-void-active');
   });
 
-  it('allows passed attributes to override computed state', () => {
+  it('lets passed attributes override the active state', () => {
+    const markup = renderAt('/checkout', { href: '/checkout', 'aria-current': 'step' });
+    expect(markup).toContain('aria-current="step"');
+    expect(markup).toContain('data-void-active=""');
+  });
+
+  it('lets a passed data-void-pending override the pending state', () => {
     const navigation: NavigationState = {
       state: 'loading',
       location: new URL('http://localhost/users'),
       method: 'GET',
     };
-    const props = {
-      href: '/users' as const,
-      'aria-current': 'step' as const,
-      'data-void-pending': undefined,
-    };
-    const html = renderAt('/users', props, navigation);
-    expect(html).toContain('aria-current="step"');
-    expect(html).not.toContain('data-void-pending');
+    expect(renderAt('/', { href: '/users' }, navigation)).toContain('data-void-pending=""');
+    // As in JSX: <Link href="/users" data-void-pending={undefined}>
+    const props = { href: '/users' as const, 'data-void-pending': undefined };
+    expect(renderAt('/', props, navigation)).not.toContain('data-void-pending');
   });
 });
