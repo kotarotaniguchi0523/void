@@ -4,12 +4,13 @@ import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 import type { RouteDestination } from 'void/routes';
 import { PAGES_PROTOCOL_VERSION } from '../../../edge/src/pages-protocol.ts';
 import {
+  createActionClient,
   createRouterFacade,
   createVoidRouter,
   initIslands,
-  mergeDataIntoHref,
   ssrProxy,
   submitAction,
+  type RuntimeVoidRouter,
   type VoidRouterConfig,
 } from '../../src/pages/client.ts';
 import { generateComponentManifest } from '../../src/pages/manifest.ts';
@@ -41,6 +42,11 @@ type TestRouterConfig = Partial<Omit<VoidRouterConfig, 'adapter'>> & {
   adapter?: Partial<VoidRouterConfig['adapter']>;
 };
 
+const browserWrites = {
+  push: vi.fn<(url: string) => void>(),
+  replace: vi.fn<(url: string) => void>(),
+};
+
 function stubClientGlobals(origin = 'http://localhost') {
   const documentStub = {
     createElement: vi.fn(() => ({})),
@@ -60,6 +66,7 @@ function stubClientGlobals(origin = 'http://localhost') {
       }
       return null;
     }),
+    getElementsByName: () => [],
     head: {
       appendChild: vi.fn(),
       querySelector: vi.fn(() => null),
@@ -69,8 +76,20 @@ function stubClientGlobals(origin = 'http://localhost') {
   };
 
   vi.stubGlobal('document', documentStub);
+  browserWrites.push.mockReset();
+  browserWrites.replace.mockReset();
   vi.stubGlobal('window', {
     addEventListener: vi.fn(),
+    navigation: Object.assign(new EventTarget(), {
+      entries: () => [],
+      navigate(url: string, { history }: NavigationNavigateOptions) {
+        const committed = Promise.resolve().then(() => {
+          browserWrites[history === 'replace' ? 'replace' : 'push'](url);
+          return { key: 'test-entry' };
+        });
+        return { committed, finished: committed };
+      },
+    }),
     location: {
       origin,
       pathname: '/',
@@ -82,8 +101,6 @@ function stubClientGlobals(origin = 'http://localhost') {
     scrollTo: vi.fn(),
   });
   vi.stubGlobal('history', {
-    pushState: vi.fn(),
-    replaceState: vi.fn(),
     scrollRestoration: 'auto',
   });
   vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
@@ -108,6 +125,230 @@ function controlledPromise<T>() {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+function stubBrowserNavigation() {
+  const browser = Object.assign(new EventTarget(), {
+    currentEntry: Object.assign(new EventTarget(), {
+      key: 'initial-entry',
+      getState: () => undefined,
+    }),
+    entries: () => [browser.currentEntry],
+  });
+  let active: AbortController | undefined;
+  Object.defineProperty(browser, 'navigate', {
+    value(url: string, options: NavigationNavigateOptions) {
+      active?.abort();
+      const controller = new AbortController();
+      active = controller;
+      let interception: NavigationInterceptOptions | undefined;
+      const destination = new URL(url, window.location.origin);
+      const event = Object.assign(new Event('navigate', { cancelable: true }), {
+        canIntercept: true,
+        destination: { url: destination.href },
+        downloadRequest: null,
+        formData: null,
+        hashChange: false,
+        info: options.info,
+        navigationType: options.history,
+        signal: controller.signal,
+        intercept(value: NavigationInterceptOptions) {
+          interception = value;
+        },
+      });
+      browser.dispatchEvent(event);
+      const handlers: Array<() => unknown> = [];
+      const committed = Promise.resolve().then(async () => {
+        await interception?.precommitHandler?.({
+          redirect: () => {
+            throw new Error('Unexpected redirect');
+          },
+          addHandler: (handler) => {
+            handlers.push(handler);
+          },
+        });
+        controller.signal.throwIfAborted();
+        const { pathname, search, hash } = destination;
+        Object.assign(window.location, { pathname, search, hash });
+        browser.currentEntry = Object.assign(new EventTarget(), {
+          key: 'test-entry',
+          getState: () => undefined,
+        });
+        return browser.currentEntry;
+      });
+      const finished = committed.then(async () => {
+        await interception?.handler?.();
+        for (const handler of handlers) {
+          await handler();
+        }
+      });
+      return { committed, finished };
+    },
+  });
+  Object.assign(window, { navigation: browser });
+}
+
+/**
+ * A session history with real entries: push, replace and traversal move through it.
+ * As in a browser, `history: 'auto'` replaces the entry when the URL is the current one,
+ * a replacement keeps the key of the entry it replaces, and an entry that leaves the
+ * history is disposed after `currententrychange`.
+ */
+function stubNavigationHistory() {
+  type Entry = EventTarget & { key: string; url: string; getState(): unknown };
+  let created = 0;
+  const createEntry = (url: URL, key = `entry-${++created}`): Entry =>
+    Object.assign(new EventTarget(), { key, url: url.href, getState: () => undefined });
+  const { origin, pathname, search, hash } = window.location;
+  const entries = [createEntry(new URL(origin + pathname + search + hash), 'initial-entry')];
+  const browser = Object.assign(new EventTarget(), {
+    currentEntry: entries[0]!,
+    entries: () => [...entries],
+    navigate(url: string, options: NavigationNavigateOptions) {
+      const destination = new URL(url, window.location.origin);
+      const index = entries.indexOf(browser.currentEntry);
+      const navigationType =
+        options.history === 'replace' ||
+        (options.history === 'auto' && destination.href === browser.currentEntry.url)
+          ? 'replace'
+          : 'push';
+      return run(destination, '', navigationType, options.info, () => {
+        const entry = createEntry(
+          destination,
+          navigationType === 'replace' ? browser.currentEntry.key : undefined,
+        );
+        disposed = entries.splice(
+          navigationType === 'replace' ? index : index + 1,
+          Infinity,
+          entry,
+        );
+        return entry;
+      });
+    },
+    traverseTo(key: string, options: NavigationOptions = {}) {
+      const entry = entries.find((candidate) => candidate.key === key)!;
+      return run(new URL(entry.url), key, 'traverse', options.info, () => entry);
+    },
+  });
+  let active: AbortController | undefined;
+  let disposed: Array<Entry> = [];
+  function run(
+    destination: URL,
+    key: string,
+    navigationType: NavigationType,
+    info: unknown,
+    commit: () => Entry,
+  ) {
+    active?.abort();
+    const controller = new AbortController();
+    active = controller;
+    let interception: NavigationInterceptOptions | undefined;
+    const current = new URL(browser.currentEntry.url);
+    browser.dispatchEvent(
+      Object.assign(new Event('navigate', { cancelable: true }), {
+        canIntercept: true,
+        destination: { url: destination.href, key, sameDocument: true },
+        downloadRequest: null,
+        formData: null,
+        hashChange:
+          destination.pathname + destination.search === current.pathname + current.search &&
+          destination.hash !== current.hash,
+        info,
+        navigationType,
+        signal: controller.signal,
+        intercept(value: NavigationInterceptOptions) {
+          interception = value;
+        },
+      }),
+    );
+    const handlers: Array<() => unknown> = [];
+    const committed = Promise.resolve().then(async () => {
+      await interception?.precommitHandler?.({
+        redirect: () => {
+          throw new Error('Unexpected redirect');
+        },
+        addHandler: (handler) => {
+          handlers.push(handler);
+        },
+      });
+      controller.signal.throwIfAborted();
+      const { pathname, search, hash } = destination;
+      Object.assign(window.location, { pathname, search, hash });
+      const from = browser.currentEntry;
+      browser.currentEntry = commit();
+      browser.dispatchEvent(
+        Object.assign(new Event('currententrychange'), { from, navigationType }),
+      );
+      for (const entry of disposed.splice(0)) {
+        entry.dispatchEvent(new Event('dispose'));
+      }
+      return browser.currentEntry;
+    });
+    const finished = committed.then(async () => {
+      await interception?.handler?.();
+      for (const handler of handlers) {
+        await handler();
+      }
+    });
+    return { committed, finished };
+  }
+  Object.assign(window, { navigation: browser });
+  return browser;
+}
+
+type NavigateInit = {
+  navigationType: NavigationType;
+  key?: string;
+  sourceElement?: unknown;
+  hashChange?: boolean;
+  hasUAVisualTransition?: boolean;
+};
+
+/** Deliver the event a browser fires before it commits `url`. */
+function dispatchNavigate(url: string, init: NavigateInit) {
+  const controller = new AbortController();
+  const result: { controller: AbortController; interception?: NavigationInterceptOptions } = {
+    controller,
+  };
+  const event = Object.assign(new Event('navigate', { cancelable: true }), {
+    canIntercept: true,
+    destination: {
+      url: new URL(url, window.location.origin).href,
+      key: init.key ?? '',
+      sameDocument: true,
+    },
+    downloadRequest: null,
+    formData: null,
+    hashChange: init.hashChange ?? false,
+    info: undefined,
+    navigationType: init.navigationType,
+    signal: controller.signal,
+    sourceElement: init.sourceElement ?? null,
+    hasUAVisualTransition: init.hasUAVisualTransition ?? false,
+    intercept(value: NavigationInterceptOptions) {
+      result.interception = value;
+    },
+  });
+  window.navigation.dispatchEvent(event);
+  return result;
+}
+
+/** Make `url` the current entry, as the browser does when a navigation commits. */
+function commitEntry(url: string, key: string, navigationType: NavigationType) {
+  const destination = new URL(url, window.location.origin);
+  const { pathname, search, hash } = destination;
+  Object.assign(window.location, { pathname, search, hash });
+  const from = window.navigation.currentEntry;
+  Object.assign(window.navigation, {
+    currentEntry: Object.assign(new EventTarget(), {
+      key,
+      url: destination.href,
+      getState: () => undefined,
+    }),
+  });
+  window.navigation.dispatchEvent(
+    Object.assign(new Event('currententrychange'), { from, navigationType }),
+  );
 }
 
 function createTestRouter({ adapter, ...config }: TestRouterConfig = {}) {
@@ -407,24 +648,21 @@ describe('createVoidRouter', () => {
     });
   });
 
-  it.each(['POST', 'PUT', 'PATCH', 'DELETE'])(
-    'preserves scroll for an in-place %s action',
-    async (method) => {
-      stubClientGlobals();
-      window.location.pathname = '/editor';
-      window.scrollY = 1800;
-      vi.stubGlobal(
-        'fetch',
-        vi.fn(async () => pageJson({ component: 'home', props: {}, url: '/editor', errors: null })),
-      );
-      const { router } = await createTestRouter();
+  it.each(['POST', 'DELETE'])('preserves scroll for an in-place %s action', async (method) => {
+    stubClientGlobals();
+    window.location.pathname = '/editor';
+    window.scrollY = 1800;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => pageJson({ component: 'home', props: {}, url: '/editor', errors: null })),
+    );
+    const { router } = await createTestRouter();
 
-      await submitAction(router, '/editor?save', { method });
+    await submitAction(router, '/editor?save', { method });
 
-      expect(window.scrollTo).not.toHaveBeenCalled();
-      expect(history.replaceState).toHaveBeenCalledWith(expect.anything(), '', '/editor');
-    },
-  );
+    expect(window.scrollTo).not.toHaveBeenCalled();
+    expect(browserWrites.replace).not.toHaveBeenCalled();
+  });
 
   it('keeps the page query, scroll and history entry for an in-place action', async () => {
     stubClientGlobals();
@@ -446,12 +684,9 @@ describe('createVoidRouter', () => {
       }),
     );
     expect(window.scrollTo).not.toHaveBeenCalled();
-    expect(history.pushState).not.toHaveBeenCalled();
-    expect(history.replaceState).toHaveBeenCalledWith(
-      expect.anything(),
-      '',
-      '/editor?page=2&search=foo',
-    );
+    // The address bar already shows the page query, so the entry is left as it is.
+    expect(browserWrites.push).not.toHaveBeenCalled();
+    expect(browserWrites.replace).not.toHaveBeenCalled();
   });
 
   it.each(['?page=2&search=foo', '?delete=confirm&page=2'])(
@@ -500,8 +735,8 @@ describe('createVoidRouter', () => {
         props: { query },
         url: '/editor' + search,
       });
-      expect(history.pushState).not.toHaveBeenCalled();
-      expect(history.replaceState).toHaveBeenCalledWith(expect.anything(), '', '/editor' + search);
+      expect(browserWrites.push).not.toHaveBeenCalled();
+      expect(browserWrites.replace).not.toHaveBeenCalled();
       expect(window.scrollTo).not.toHaveBeenCalled();
     },
   );
@@ -533,8 +768,11 @@ describe('createVoidRouter', () => {
         ...(preserveScroll === undefined ? {} : { preserveScroll }),
       });
 
-      const writeHistory = destination === '/editor' ? history.replaceState : history.pushState;
-      expect(writeHistory).toHaveBeenCalledWith(expect.anything(), '', destination);
+      if (destination === '/editor') {
+        expect(browserWrites.replace).not.toHaveBeenCalled();
+      } else {
+        expect(browserWrites.push).toHaveBeenCalledWith(destination);
+      }
       if (preserved) {
         expect(window.scrollTo).not.toHaveBeenCalled();
       } else {
@@ -578,7 +816,7 @@ describe('createVoidRouter', () => {
     await submitAction(router, '/editor?save', { method: 'POST' });
 
     expect(scrollIntoView).toHaveBeenCalledOnce();
-    expect(history.pushState).toHaveBeenCalledWith(expect.anything(), '', '/destination#details');
+    expect(browserWrites.push).toHaveBeenCalledWith('/destination#details');
   });
 
   it.each([undefined, false])(
@@ -621,17 +859,118 @@ describe('createVoidRouter', () => {
     expect(window.scrollTo).toHaveBeenCalledWith(0, 0);
   });
 
-  it('exposes the default prefetch strategy to Links', async () => {
+  it('keeps the prefetch hover delay and default strategy on the engine', async () => {
     stubClientGlobals();
-    const { router } = await createTestRouter({ prefetchDefaultStrategy: ['hover', 'click'] });
-    expect(router._prefetchDefaultStrategy).toEqual(['hover', 'click']);
-    expect(createRouterFacade(router, () => '/')._prefetchDefaultStrategy).toEqual([
-      'hover',
-      'click',
-    ]);
+    const config = {
+      adapter: {
+        createDeferred: () => ({}),
+        resolveDeferred: (_ref: unknown, value: unknown) => value,
+        rejectDeferred: (_ref: unknown, error: unknown) => error,
+        isLoading: () => false,
+      },
+      components: { home: loadComponent },
+      layoutTree: {},
+      routeMeta: {},
+      matchRoute: () => 'home',
+      viewTransitions: false,
+      prefetchHoverDelay: 75,
+      prefetchDefaultCacheFor: parseCacheFor('30s'),
+    };
+    const engine = await createPageNavigationEngine({
+      ...config,
+      prefetchDefaultStrategy: ['hover', 'click'],
+    });
+    expect(engine._hoverDelay).toBe(75);
+    expect(engine._prefetchDefaultStrategy).toEqual(['hover', 'click']);
 
-    const { router: plain } = await createTestRouter();
+    const plain = await createPageNavigationEngine(config);
     expect(plain._prefetchDefaultStrategy).toBe(false);
+
+    const { router } = await createTestRouter({ prefetchDefaultStrategy: ['hover', 'click'] });
+    expect('_hoverDelay' in router).toBe(false);
+    expect('_prefetchDefaultStrategy' in router).toBe(false);
+  });
+
+  it('filters mutation and internal options at every public facade boundary', async () => {
+    stubClientGlobals();
+    const visit = vi.fn(async () => ({}));
+    const raw = {
+      url: new URL('http://localhost/'),
+      params: {},
+      path: '/',
+      query: new URLSearchParams(),
+      visit,
+      refresh: vi.fn(async () => ({})),
+      prefetch: vi.fn(async () => ({})),
+      flush: vi.fn(),
+      flushAll: vi.fn(),
+    } satisfies RuntimeVoidRouter;
+    createActionClient().setActionRouter(raw);
+    const facade = createRouterFacade(
+      createRouterFacade(raw, () => '/'),
+      () => '/',
+    );
+    const unsafe = {
+      method: 'POST',
+      data: { secret: true },
+      _resolveOnShell: true,
+      preserveScroll: true,
+    };
+    await facade.visit('/users', unsafe);
+    const refreshOptions = { ...unsafe, replace: false };
+    await facade.refresh(refreshOptions);
+    await facade.prefetch('/users', { ...unsafe, cacheFor: '5s' });
+    expect(visit).toHaveBeenCalledWith('/users', { preserveScroll: true });
+    expect(raw.refresh).toHaveBeenCalledWith({ preserveScroll: true });
+    expect(raw.prefetch).toHaveBeenCalledWith('/users', { cacheFor: '5s' });
+    await submitAction(facade, '/users?save', { method: 'POST', data: { name: 'Ada' } });
+    expect(visit).toHaveBeenLastCalledWith('/users?save', {
+      method: 'POST',
+      data: { name: 'Ada' },
+    });
+  });
+
+  it('keeps runtime page data private when using the public router facade', async () => {
+    const raw = {
+      url: new URL('http://localhost/users'),
+      path: '/users',
+      query: new URLSearchParams(),
+      params: {},
+      visit: vi.fn(async () => ({ component: 'users' })),
+      refresh: vi.fn(async () => ({ component: 'users' })),
+      prefetch: vi.fn(async () => ({ component: 'users' })),
+      flush: vi.fn(),
+      flushAll: vi.fn(),
+    } satisfies RuntimeVoidRouter;
+    vi.stubGlobal('window', { location: { pathname: '/users', search: '' } });
+    createActionClient().setActionRouter(raw);
+    const router = createRouterFacade(raw, () => '/users');
+    expect(await router.visit('/users')).toBeUndefined();
+    expect(await router.refresh()).toBeUndefined();
+    expect(await router.prefetch('/users')).toBeUndefined();
+    expect(raw.visit).toHaveBeenCalledWith('/users', {});
+    const action = await submitAction(router, '/users?save', {
+      method: 'POST',
+      data: { name: 'Ada' },
+    });
+    expect(action.ok).toBe(true);
+    const nested = createRouterFacade(router, () => '/users/42');
+    const nestedResult = await submitAction(nested, '/users?save', { method: 'POST' });
+    expect(nestedResult.ok).toBe(true);
+    expect(raw.visit).toHaveBeenCalledWith('/users?save', {
+      method: 'POST',
+      data: { name: 'Ada' },
+    });
+  });
+
+  it('rejects Action access on arbitrary GET routers without a registered transport', async () => {
+    const fake = {
+      visit: vi.fn(async () => ({})),
+    } as unknown as RuntimeVoidRouter;
+    await expect(submitAction(fake, '/users?save', { method: 'POST' })).rejects.toThrow(
+      'internal Pages action router is not available',
+    );
+    expect(fake.visit).not.toHaveBeenCalled();
   });
 
   it('uses the same typed destination for visits, prefetching and cache invalidation', async () => {
@@ -657,11 +996,7 @@ describe('createVoidRouter', () => {
     await router.prefetch(destination);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     await router.visit(destination);
-    expect(history.pushState).toHaveBeenCalledWith(
-      expect.anything(),
-      '',
-      '/typed-router/a%2Fb?tag=one&tag=two#details',
-    );
+    expect(browserWrites.push).toHaveBeenCalledWith('/typed-router/a%2Fb?tag=one&tag=two#details');
   });
 
   it('requires the page-data script even when a legacy data-page attribute is present', async () => {
@@ -779,9 +1114,7 @@ describe('createVoidRouter', () => {
       await expect(visit).resolves.toEqual(pageData);
       expect(destinationLoader).toHaveBeenCalledOnce();
       expect(applyUpdate.mock.calls[0][0]).toEqual(pageData);
-      expect(history.pushState).toHaveBeenCalledWith(
-        expect.anything(),
-        '',
+      expect(browserWrites.push).toHaveBeenCalledWith(
         kind === 'redirect' ? '/destination' : '/users',
       );
     },
@@ -868,36 +1201,32 @@ describe('createVoidRouter', () => {
     },
   );
 
-  it('rejects non-GET methods before route side effects', async () => {
-    const documentStub = stubClientGlobals();
-    const homeLoader = vi.fn(async () => ({ default: {} }));
-    const usersLoader = vi.fn(async () => ({ default: {} }));
-    const layoutLoader = vi.fn(async () => ({ default: {} }));
-    const matchRoute = vi.fn(() => 'users');
-
+  it('does not prefetch another origin or a non-Page scheme', async () => {
+    stubClientGlobals();
+    const fetchMock = vi.fn(async () => pageJson({ component: 'users', props: {} }));
+    const loader = vi.fn(loadComponent);
+    vi.stubGlobal('fetch', fetchMock);
     const { router } = await createTestRouter({
-      components: {
-        home: homeLoader,
-        layout: layoutLoader,
-        users: usersLoader,
-      },
-      layoutTree: {
-        users: ['layout'],
-      },
-      matchRoute,
-      routeMeta: {
-        users: {},
-      },
+      components: { home: loadComponent, users: loader },
+      matchRoute: (path) => (path === '/users' ? 'users' : null),
     });
+    await expect(router.prefetch('https://other.example/users')).resolves.toBeUndefined();
+    await expect(router.prefetch('blob:http://localhost/123')).resolves.toBeUndefined();
+    await expect(router.prefetch('javascript:alert(1)')).resolves.toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(loader).not.toHaveBeenCalled();
+    router.flushAll();
+  });
 
-    expect(() => router.prefetch('/users', { method: 'POST' })).toThrow(
-      'Void Router: prefetch() only supports GET requests.',
-    );
-    expect(matchRoute).not.toHaveBeenCalled();
-    expect(usersLoader).not.toHaveBeenCalled();
-    expect(layoutLoader).not.toHaveBeenCalled();
-    expect(documentStub.createElement).not.toHaveBeenCalled();
-    expect(documentStub.head.appendChild).not.toHaveBeenCalled();
+  it('prefetches the page path of an absolute same-origin URL with a fragment', async () => {
+    stubClientGlobals();
+    const fetchMock = vi.fn(async () => pageJson({ component: 'home', props: {} }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { router } = await createTestRouter();
+    await router.prefetch('http://localhost/#intro');
+    await router.prefetch('/');
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith('/', expect.anything());
+    router.flushAll();
   });
 
   it('returns a promise that resolves when page data is prefetched', async () => {
@@ -991,6 +1320,143 @@ describe('createVoidRouter', () => {
       await Promise.all([prefetch, visit]);
       router.flushAll();
     }
+  });
+
+  it('retries after a speculative fetch fails instead of caching a hard reload', async () => {
+    stubClientGlobals();
+    const pageData = { component: 'users', props: { users: [] } };
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError('Network unavailable'))
+      .mockResolvedValueOnce(pageJson(pageData));
+    vi.stubGlobal('fetch', fetchMock);
+    const { router } = await createTestRouter({
+      components: { home: loadComponent, users: loadComponent },
+      matchRoute: (url) => (url === '/users' ? 'users' : 'home'),
+    });
+
+    await expect(router.prefetch('/users')).resolves.toBeUndefined();
+    await expect(router.prefetch('/users')).resolves.toEqual(pageData);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(window.location.href).toBeUndefined();
+    router.flushAll();
+  });
+
+  it('resolves the public prefetch when the request fails, and the visit then requests the page', async () => {
+    stubClientGlobals();
+    const pageData = { component: 'users', props: { users: [] } };
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError('Network unavailable'))
+      .mockResolvedValueOnce(pageJson(pageData));
+    vi.stubGlobal('fetch', fetchMock);
+    const { router: raw } = await createTestRouter({
+      components: { home: loadComponent, users: loadComponent },
+      matchRoute: (url) => (url === '/users' ? 'users' : 'home'),
+    });
+    const router = createRouterFacade(raw, () => '/');
+
+    const first = router.prefetch('/users');
+    // A second caller shares the request that is still in flight.
+    const second = router.prefetch('/users');
+    await expect(first).resolves.toBeUndefined();
+    await expect(second).resolves.toBeUndefined();
+
+    await expect(raw.visit('/users')).resolves.toMatchObject(pageData);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(window.location.href).toBeUndefined();
+    expect(() => router.prefetch('/other', { cacheFor: '30 sec' })).toThrow(
+      "prefetch: Invalid cacheFor value '30 sec'",
+    );
+    router.flushAll();
+  });
+
+  it('retries a speculative response that fails during an in-flight visit', async () => {
+    stubClientGlobals();
+    const delayed = controlledPromise<Response>();
+    const pageData = { component: 'users', props: { users: [] } };
+    const fetchMock = vi
+      .fn()
+      .mockImplementationOnce(() => delayed.promise)
+      .mockResolvedValueOnce(pageJson(pageData));
+    vi.stubGlobal('fetch', fetchMock);
+    const { router } = await createTestRouter({
+      components: { home: loadComponent, users: loadComponent },
+      matchRoute: (url) => (url === '/users' ? 'users' : 'home'),
+    });
+
+    const speculative = router.prefetch('/users');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const visit = router.visit('/users');
+    delayed.reject(new TypeError('Offline during prefetch'));
+    await expect(speculative).resolves.toBeUndefined();
+    await expect(visit).resolves.toMatchObject(pageData);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    router.flushAll();
+  });
+
+  it('reuses a same-origin redirected prefetch without re-fetching its destination', async () => {
+    stubClientGlobals();
+    const pageData = { component: 'users', props: { users: [] }, url: '/users' };
+    const response = pageJson(pageData);
+    Object.defineProperties(response, {
+      redirected: { value: true },
+      url: { value: 'http://localhost/users' },
+    });
+    const fetchMock = vi.fn(async () => response);
+    vi.stubGlobal('fetch', fetchMock);
+    const applyUpdate = vi.fn();
+    const { router } = await createTestRouter({
+      adapter: { applyUpdate },
+      components: { home: loadComponent, users: loadComponent },
+      matchRoute: (path) => (path === '/from' || path === '/users' ? 'users' : 'home'),
+    });
+
+    await expect(router.prefetch('/from')).resolves.toEqual(pageData);
+    await router.visit('/from');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(browserWrites.push).toHaveBeenCalledWith('/users');
+    expect(applyUpdate).toHaveBeenCalledTimes(1);
+    expect(window.location.href).toBeUndefined();
+    router.flushAll();
+  });
+
+  it('honours cacheFor: 0 by consuming prefetched data on the next visit', async () => {
+    stubClientGlobals();
+    const pageData = { component: 'users', props: { users: [] } };
+    const fetchMock = vi.fn(async () => pageJson(pageData));
+    vi.stubGlobal('fetch', fetchMock);
+    const { router } = await createTestRouter({
+      components: { home: loadComponent, users: loadComponent },
+      matchRoute: (url) => (url === '/users' ? 'users' : 'home'),
+    });
+
+    await router.prefetch('/users', { cacheFor: 0 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await router.visit('/users');
+    // A single-use hit must not trigger stale-while-revalidate in the background.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await router.prefetch('/users', { cacheFor: 0 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    router.flushAll();
+  });
+
+  it('handles rejected speculative component imports without rejecting page-data prefetch', async () => {
+    stubClientGlobals();
+    const pageData = { component: 'users', props: {} };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => pageJson(pageData)),
+    );
+    const loader = vi.fn(() => Promise.reject(new Error('Speculative import failed')));
+    const { router } = await createTestRouter({
+      components: { home: loadComponent, users: loader },
+      matchRoute: (url) => (url === '/users' ? 'users' : 'home'),
+    });
+
+    await expect(router.prefetch('/users')).resolves.toEqual(pageData);
+    expect(loader).toHaveBeenCalledOnce();
+    router.flushAll();
   });
 
   it.each(['replace', 'mutate'])(
@@ -1314,6 +1780,7 @@ describe('createVoidRouter', () => {
 
   it('does not resolve disposed initial deferred props into a later page', async () => {
     stubClientGlobals();
+    stubBrowserNavigation();
     const initialPayload = {
       component: 'home',
       deferredKeys: { stats: 'stats' },
@@ -1445,22 +1912,25 @@ describe('createVoidRouter', () => {
     ['/books?delete', '/books', '/books'],
     ['/books?page=2', '/books?page=2', '/books?page=2'],
     ['/books?a&b', '/books?a&b', '/books?a&b'],
-  ])('replaces history for POST %s with page URL %s as %s', async (url, pageUrl, historyUrl) => {
-    stubClientGlobals();
-    const historyLocation = new URL(historyUrl, 'http://localhost');
-    window.location.pathname = historyLocation.pathname;
-    window.location.search = historyLocation.search;
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async () => pageJson({ component: 'home', props: {}, url: pageUrl, errors: null })),
-    );
-    const { router } = await createTestRouter();
+  ])(
+    'keeps the current entry for POST %s with page URL %s at %s',
+    async (url, pageUrl, historyUrl) => {
+      stubClientGlobals();
+      const historyLocation = new URL(historyUrl, 'http://localhost');
+      window.location.pathname = historyLocation.pathname;
+      window.location.search = historyLocation.search;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => pageJson({ component: 'home', props: {}, url: pageUrl, errors: null })),
+      );
+      const { router } = await createTestRouter();
 
-    await router.visit(url, { method: 'POST' });
+      await router.visit(url, { method: 'POST' });
 
-    expect(history.replaceState).toHaveBeenCalledWith(expect.anything(), '', historyUrl);
-    expect(history.pushState).not.toHaveBeenCalled();
-  });
+      expect(browserWrites.replace).not.toHaveBeenCalled();
+      expect(browserWrites.push).not.toHaveBeenCalled();
+    },
+  );
 
   it('pushes history when a POST redirects to a different query on the same path', async () => {
     stubClientGlobals();
@@ -1484,13 +1954,13 @@ describe('createVoidRouter', () => {
 
     await router.visit('/books?delete', { method: 'POST' });
 
-    expect(history.pushState).toHaveBeenCalledWith(expect.anything(), '', '/books?page=2');
-    expect(history.replaceState).not.toHaveBeenCalled();
+    expect(browserWrites.push).toHaveBeenCalledWith('/books?page=2');
+    expect(browserWrites.replace).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(applyUpdate).toHaveBeenCalledWith(pageData, {}, [], expect.anything());
   });
 
-  it.each(['POST', 'PUT', 'PATCH', 'DELETE'])(
+  it.each(['POST', 'DELETE'])(
     'preserves the visible query after a %s with a query-only middleware rewrite',
     async (method) => {
       stubClientGlobals();
@@ -1530,63 +2000,43 @@ describe('createVoidRouter', () => {
 
       await router.visit('/books?category=public', { method });
 
-      expect(history.replaceState).toHaveBeenCalledWith(
-        expect.anything(),
-        '',
-        '/books?category=public',
-      );
-      expect(history.pushState).not.toHaveBeenCalled();
+      expect(browserWrites.replace).not.toHaveBeenCalled();
+      expect(browserWrites.push).not.toHaveBeenCalled();
     },
   );
 
-  it('does not grow history on repeated same-page named action submits', async () => {
-    stubClientGlobals();
-    window.location.pathname = '/db';
-    window.location.search = '';
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async () => pageJson({ component: 'home', props: {}, url: '/db', errors: null })),
-    );
-    const { router } = await createTestRouter();
-
-    await router.visit('/db?create', { method: 'POST' });
-    await router.visit('/db?create', { method: 'POST' });
-
-    expect(history.pushState).not.toHaveBeenCalled();
-    expect(history.replaceState).toHaveBeenCalledTimes(2);
-    expect(history.replaceState).toHaveBeenLastCalledWith(expect.anything(), '', '/db');
-  });
-
-  it('runs navigation listeners for same-page hash visits', async () => {
+  it('leaves a same-page hash visit to the browser and follows its URL', async () => {
     const documentStub = stubClientGlobals();
     window.location.pathname = '/docs';
     window.location.search = '?tab=api';
+    const browser = stubNavigationHistory();
     const applyUpdate = vi.fn();
     const matchRoute = vi.fn(() => 'home');
+    const onRouteChange = vi.fn();
     vi.stubGlobal('fetch', vi.fn());
 
-    const events: Array<string> = [];
-    const { router } = await createTestRouter({
-      adapter: { applyUpdate },
-      matchRoute,
-      onNavigationChange(navigation) {
-        events.push(navigation.state);
-      },
-    });
+    const created = await createTestRouter({ adapter: { applyUpdate }, matchRoute, onRouteChange });
+    created.start();
+    created.commitInitialRender();
 
-    await router.visit('#section');
+    await created.router.visit('#section');
 
-    expect(events).toEqual(['loading', 'idle']);
-    expect(history.pushState).toHaveBeenCalledWith(
-      expect.objectContaining({ __voidScrollKey: expect.any(String) }),
-      '',
-      '/docs?tab=api#section',
-    );
-    expect(window.scrollTo).toHaveBeenCalledWith(0, 0);
+    expect(browser.entries().map((entry) => entry.url)).toEqual([
+      'http://localhost/docs?tab=api',
+      'http://localhost/docs?tab=api#section',
+    ]);
+    expect(onRouteChange).toHaveBeenLastCalledWith('/docs?tab=api#section');
+    expect(created.router.url.hash).toBe('#section');
+    // The browser scrolls to the fragment.
+    expect(window.scrollTo).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
     expect(applyUpdate).not.toHaveBeenCalled();
     expect(matchRoute).not.toHaveBeenCalled();
     expect(documentStub.head.appendChild).not.toHaveBeenCalled();
+
+    await created.router.visit('#other', { replace: true });
+    expect(browser.entries().map((entry) => new URL(entry.url).hash)).toEqual(['', '#other']);
+    expect(created.router.url.hash).toBe('#other');
   });
 
   it('resolves query-only visits against the current page', async () => {
@@ -1600,20 +2050,7 @@ describe('createVoidRouter', () => {
     await router.visit('?page=2');
 
     expect(fetchMock).toHaveBeenLastCalledWith('/products?page=2', expect.anything());
-    expect(history.pushState).toHaveBeenLastCalledWith(expect.anything(), '', '/products?page=2');
-  });
-
-  it('keeps the current path when Link data is merged into a hash-only href', async () => {
-    stubClientGlobals();
-    window.location.pathname = '/products';
-    const fetchMock = vi.fn(() => Promise.resolve(pageJson({ component: 'home', props: {} })));
-    vi.stubGlobal('fetch', fetchMock);
-    const { router } = await createTestRouter();
-
-    await router.visit(mergeDataIntoHref('#c', { x: 1 }));
-
-    expect(fetchMock).toHaveBeenLastCalledWith('/products?x=1', expect.anything());
-    expect(history.pushState).toHaveBeenLastCalledWith(expect.anything(), '', '/products?x=1#c');
+    expect(browserWrites.push).toHaveBeenLastCalledWith('/products?page=2');
   });
 
   it('keeps pending navigation state when an older visit aborts', async () => {
@@ -1718,132 +2155,44 @@ describe('createVoidRouter', () => {
     await expect(slowVisit).resolves.toBeUndefined();
   });
 
-  it('does not fetch or write history for same-page hash popstate visits', async () => {
+  it('restores entry positions without fetching on traversals between fragments', async () => {
     stubClientGlobals();
     window.location.pathname = '/docs';
     window.location.search = '?tab=api';
-    const applyUpdate = vi.fn();
-    vi.stubGlobal('fetch', vi.fn());
-
-    const { router } = await createTestRouter({ adapter: { applyUpdate } });
-
-    await router.visit('/docs?tab=api#section', {
-      preserveState: true,
-      _popstate: true,
-      _scrollPosition: { x: 0, y: 42 },
-    });
-
-    expect(fetch).not.toHaveBeenCalled();
-    expect(applyUpdate).not.toHaveBeenCalled();
-    expect(history.pushState).not.toHaveBeenCalled();
-    expect(history.replaceState).not.toHaveBeenCalled();
-    expect(window.scrollTo).toHaveBeenCalledWith(0, 42);
-  });
-
-  it('does not fetch or write history for same-page hash removal popstate visits', async () => {
-    stubClientGlobals();
-    window.location.pathname = '/docs';
-    window.location.search = '?tab=api';
+    const browser = stubNavigationHistory();
     const applyUpdate = vi.fn();
     const matchRoute = vi.fn(() => 'home');
     vi.stubGlobal('fetch', vi.fn());
 
-    const { router } = await createTestRouter({ adapter: { applyUpdate }, matchRoute });
+    const created = await createTestRouter({ adapter: { applyUpdate }, matchRoute });
+    created.start();
+    created.commitInitialRender();
 
-    await router.visit('/docs?tab=api', {
-      preserveState: true,
-      _popstate: true,
-      _scrollPosition: { x: 0, y: 42 },
-    });
+    Object.assign(window, { scrollY: 42 });
+    await created.router.visit('#section');
+    const section = browser.currentEntry.key;
 
+    // Back to the entry without a fragment.
+    Object.assign(window, { scrollY: 300 });
+    await browser.traverseTo('initial-entry').finished;
+    expect(window.scrollTo).toHaveBeenLastCalledWith(0, 42);
+    expect(created.router.url.hash).toBe('');
+
+    Object.assign(window, { scrollY: 42 });
+    await browser.traverseTo(section).finished;
+    expect(window.scrollTo).toHaveBeenLastCalledWith(0, 300);
+    expect(created.router.url.hash).toBe('#section');
+
+    expect(browser.entries()).toHaveLength(2);
     expect(fetch).not.toHaveBeenCalled();
     expect(applyUpdate).not.toHaveBeenCalled();
     expect(matchRoute).not.toHaveBeenCalled();
-    expect(history.pushState).not.toHaveBeenCalled();
-    expect(history.replaceState).not.toHaveBeenCalled();
-    expect(window.scrollTo).toHaveBeenCalledWith(0, 42);
   });
 
-  it('writes history for same-page hash visits when state is preserved', async () => {
+  it('aborts a pending visit when the browser moves to a fragment of the page', async () => {
     stubClientGlobals();
     window.location.pathname = '/docs';
-    window.location.search = '?tab=api';
-    const applyUpdate = vi.fn();
-    vi.stubGlobal('fetch', vi.fn());
-
-    const { router } = await createTestRouter({ adapter: { applyUpdate } });
-
-    await router.visit('#section', { preserveState: true });
-
-    expect(fetch).not.toHaveBeenCalled();
-    expect(applyUpdate).not.toHaveBeenCalled();
-    expect(history.pushState).toHaveBeenCalledWith(
-      expect.objectContaining({ __voidScrollKey: expect.any(String) }),
-      '',
-      '/docs?tab=api#section',
-    );
-    expect(history.replaceState).not.toHaveBeenCalled();
-    expect(window.scrollTo).toHaveBeenCalledWith(0, 0);
-  });
-
-  it('uses the browser URL for non-popstate hash visits after preserved navigation', async () => {
-    stubClientGlobals();
-    window.location.pathname = '/';
-    const applyUpdate = vi.fn();
-    const fetchMock = vi.fn((url: string) => {
-      if (url !== '/next') {
-        throw new Error(`Unexpected fetch: ${url}`);
-      }
-      return Promise.resolve(pageJson({ component: 'next', props: { title: 'Next' } }));
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    const { router } = await createTestRouter({
-      adapter: { applyUpdate },
-      components: { home: loadComponent, next: loadComponent },
-      matchRoute: (url) => (url === '/next' ? 'next' : 'home'),
-    });
-
-    await router.visit('/next', { preserveState: true });
-    expect(fetchMock).toHaveBeenCalledWith(
-      '/next',
-      expect.objectContaining({
-        headers: {
-          'X-VoidPages': 'true',
-          'X-VoidPages-Version': PAGES_PROTOCOL_VERSION,
-          'X-VoidPages-Redirect': 'manual',
-          Accept: 'application/json',
-        },
-      }),
-    );
-    expect(applyUpdate).toHaveBeenCalledWith(
-      expect.objectContaining({ component: 'next' }),
-      {},
-      [],
-      expect.objectContaining({ preserveState: expect.any(Boolean) }),
-    );
-
-    fetchMock.mockClear();
-    applyUpdate.mockClear();
-    vi.mocked(history.pushState).mockClear();
-    vi.mocked(history.replaceState).mockClear();
-    vi.mocked(window.scrollTo).mockClear();
-
-    await router.visit('#section');
-
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(applyUpdate).not.toHaveBeenCalled();
-    expect(history.pushState).toHaveBeenCalledWith(
-      expect.objectContaining({ __voidScrollKey: expect.any(String) }),
-      '',
-      '/#section',
-    );
-    expect(window.scrollTo).toHaveBeenCalledWith(0, 0);
-  });
-
-  it('aborts pending navigations before same-page hash popstate visits', async () => {
-    stubClientGlobals();
-    window.location.pathname = '/docs';
+    stubNavigationHistory();
     const applyUpdate = vi.fn();
     let aborted = false;
     let resolveSlow!: (response: Response) => void;
@@ -1869,15 +2218,11 @@ describe('createVoidRouter', () => {
     const slowVisit = router.visit('/slow').catch(() => undefined);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    await router.visit('/docs#section', {
-      preserveState: true,
-      _popstate: true,
-      _scrollPosition: { x: 0, y: 42 },
-    });
+    await router.visit('/docs#section');
 
     expect(aborted).toBe(true);
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(window.scrollTo).toHaveBeenCalledWith(0, 42);
+    expect(window.location.hash).toBe('#section');
 
     resolveSlow(pageJson({ component: 'slow', props: { title: 'Slow' } }));
     await slowVisit;
@@ -1885,7 +2230,7 @@ describe('createVoidRouter', () => {
     expect(applyUpdate).not.toHaveBeenCalled();
   });
 
-  it('fetches when a popstate hash visit targets a different committed page', async () => {
+  it('fetches when a traversal hash visit targets a different committed page', async () => {
     stubClientGlobals();
     window.location.pathname = '/users';
     const applyUpdate = vi.fn();
@@ -1894,17 +2239,16 @@ describe('createVoidRouter', () => {
     );
     vi.stubGlobal('fetch', fetchMock);
 
-    const { router } = await createTestRouter({
+    const created = await createTestRouter({
       adapter: { applyUpdate },
       components: { docs: loadComponent, home: loadComponent },
       matchRoute: () => 'docs',
     });
+    created.start();
 
-    window.location.pathname = '/docs';
-    await router.visit('/docs#section', {
-      preserveState: true,
-      _popstate: true,
-    });
+    const back = dispatchNavigate('/docs#section', { navigationType: 'traverse', key: 'docs' });
+    commitEntry('/docs#section', 'docs', 'traverse');
+    await back.interception!.handler!();
 
     expect(fetchMock).toHaveBeenCalledWith(
       '/docs',
@@ -2042,6 +2386,7 @@ describe('createVoidRouter', () => {
 
   it('keeps the committed page deferred registry alive while a new navigation is pending', async () => {
     stubClientGlobals();
+    stubBrowserNavigation();
     vi.mocked(document.getElementById).mockImplementation((id: string) => {
       if (id === '__VOID_PAGE_DATA__') {
         return {
@@ -2085,7 +2430,7 @@ describe('createVoidRouter', () => {
         rejectDeferred,
         resolveDeferred,
       },
-      components: { fast: loadComponent, home: loadComponent },
+      components: { fast: loadComponent, home: loadComponent, slow: loadComponent },
       matchRoute: (url) => (url === '/slow' ? 'slow' : 'fast'),
     });
 
@@ -2099,6 +2444,148 @@ describe('createVoidRouter', () => {
     await router.visit('/fast');
     await slowVisit;
     expect(rejectDeferred).not.toHaveBeenCalled();
+  });
+
+  it.each(['commit', 'failure'] as const)(
+    'releases a retired shell after its successor %s and renderer acknowledgement',
+    async (outcome) => {
+      stubClientGlobals();
+      stubBrowserNavigation();
+      const firstApplied = controlledPromise<void>();
+      const firstRender = controlledPromise<void>();
+      const secondResponse = controlledPromise<Response>();
+      let firstSignal: AbortSignal | null | undefined;
+      let firstStream!: ReadableStreamDefaultController<Uint8Array>;
+      const encoder = new TextEncoder();
+      const send = (message: object) =>
+        firstStream.enqueue(encoder.encode(JSON.stringify(message) + '\n'));
+      vi.stubGlobal('fetch', (url: string, init: RequestInit) => {
+        if (url !== '/first') {
+          return secondResponse.promise;
+        }
+        firstSignal = init.signal;
+        return Promise.resolve(
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                firstStream = controller;
+                send({
+                  component: 'home',
+                  props: { stats: { loading: true } },
+                  deferredKeys: { stats: 'stats' },
+                });
+              },
+            }),
+            { headers: { 'content-type': 'application/x-ndjson', 'X-VoidPages': 'true' } },
+          ),
+        );
+      });
+      const resolveDeferred = vi.fn((_ref, value) => ({ loading: false, value }));
+      const { router, start } = await createTestRouter({
+        adapter: {
+          applyUpdate(page) {
+            if (page.props.stats) {
+              firstApplied.resolve();
+              return firstRender.promise;
+            }
+          },
+          createDeferred: () => ({ loading: true }),
+          isLoading: (ref) => Boolean((ref as { loading?: boolean })?.loading),
+          resolveDeferred,
+        },
+      });
+      start();
+      const first = router.visit('/first', { method: 'POST' });
+      const firstSettled = expect(first).rejects.toMatchObject({ name: 'AbortError' });
+      await firstApplied.promise;
+      const second = router.visit('/second');
+      expect(firstSignal?.aborted).toBe(false);
+      send({ __deferred: 'stats', data: 42 });
+      await vi.waitFor(() => expect(resolveDeferred).toHaveBeenCalledWith(expect.anything(), 42));
+      if (outcome === 'failure') {
+        const rejected = expect(second).rejects.toBeInstanceOf(SyntaxError);
+        secondResponse.resolve(new Response('{', { headers: { 'X-VoidPages': 'true' } }));
+        await rejected;
+        // The failed successor has not removed the first render from the DOM.
+        expect(firstSignal?.aborted).toBe(false);
+      } else {
+        secondResponse.resolve(pageJson({ component: 'home', props: {} }));
+        await second;
+        expect(firstSignal?.aborted).toBe(true);
+      }
+      firstRender.resolve();
+      await firstSettled;
+      expect(firstSignal?.aborted).toBe(true);
+      firstStream.close();
+      expect(window.location.pathname).toBe(outcome === 'commit' ? '/second' : '/');
+    },
+  );
+
+  it('accepts an NDJSON first page payload without a trailing newline', async () => {
+    stubClientGlobals();
+    const page = { component: 'users', props: { title: 'First line only' } };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify(page), {
+            headers: { 'content-type': 'application/x-ndjson', 'X-VoidPages': 'true' },
+          }),
+      ),
+    );
+    const { router } = await createTestRouter({
+      components: { home: loadComponent, users: loadComponent },
+      matchRoute: () => 'users',
+    });
+    await expect(router.visit('/users')).resolves.toMatchObject(page);
+  });
+
+  it('settles unresolved deferred props when NDJSON closes without a trailing newline', async () => {
+    stubClientGlobals();
+    const rejectDeferred = vi.fn((_ref, error) => ({ loading: false, error }));
+    const resolveDeferred = vi.fn((_ref, value) => ({ loading: false, value }));
+    const payload = [
+      JSON.stringify({
+        component: 'users',
+        props: { stats: null, usage: null },
+        deferredKeys: { stats: 'stats', usage: 'usage' },
+      }),
+      JSON.stringify({ __deferred: 'stats', data: { count: 42 } }),
+    ].join('\n');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode(payload));
+                controller.close();
+              },
+            }),
+            { headers: { 'content-type': 'application/x-ndjson', 'X-VoidPages': 'true' } },
+          ),
+      ),
+    );
+    const { router } = await createTestRouter({
+      adapter: {
+        createDeferred: () => ({ loading: true }),
+        isLoading: (ref) => Boolean((ref as { loading?: boolean })?.loading),
+        resolveDeferred,
+        rejectDeferred,
+      },
+      components: { home: loadComponent, users: loadComponent },
+      matchRoute: () => 'users',
+    });
+
+    await router.visit('/users');
+    await vi.waitFor(() => {
+      expect(resolveDeferred).toHaveBeenCalledWith(expect.anything(), { count: 42 });
+      expect(rejectDeferred).toHaveBeenCalledWith(
+        expect.anything(),
+        'Stream closed before resolution',
+      );
+    });
   });
 
   it('ignores deferred chunks from an aborted pending navigation', async () => {
@@ -2215,6 +2702,23 @@ describe('createVoidRouter other-origin visits', () => {
     expect(window.location.href).toBeUndefined();
   });
 
+  it('uses the document href when Capacitor exposes an opaque location.origin', async () => {
+    stubClientGlobals('null');
+    window.location.href = 'capacitor://localhost/';
+    const fetchMock = vi.fn(async () => pageJson({ component: 'users', props: {} }));
+    vi.stubGlobal('fetch', fetchMock);
+    const applyUpdate = vi.fn();
+    const { router } = await createTestRouter({
+      adapter: { applyUpdate },
+      components: { home: loadComponent, users: loadComponent },
+      matchRoute: (path) => (path === '/users' ? 'users' : 'home'),
+    });
+    await router.visit('/users');
+    expect(fetchMock).toHaveBeenCalledWith('/users', expect.anything());
+    expect(applyUpdate).toHaveBeenCalledOnce();
+    router.flushAll();
+  });
+
   it('does not fetch another Capacitor host for GET navigation', async () => {
     const { router, fetchMock, applyUpdate } = await createRouter('capacitor://localhost');
     await router.visit('capacitor://other/users');
@@ -2254,34 +2758,13 @@ describe('createVoidRouter other-origin visits', () => {
     },
   );
 
-  it('rejects a same-origin blob URL passed straight to the navigation engine', async () => {
-    stubClientGlobals();
-    const fetchMock = vi.fn(
-      async () => new Response('<script></script>', { headers: { 'Content-Type': 'text/html' } }),
+  it('does not rewrite a blob URL into an allowed HTTP page route', async () => {
+    const { router, fetchMock, applyUpdate } = await createRouter();
+    await expect(router.visit('blob:http://localhost/123')).rejects.toThrow(
+      'refusing to navigate to a blob: URL',
     );
-    vi.stubGlobal('fetch', fetchMock);
-    const engine = await createPageNavigationEngine({
-      adapter: {
-        createDeferred: () => ({}),
-        resolveDeferred: (_ref, value) => value,
-        rejectDeferred: (_ref, error) => error,
-        isLoading: () => false,
-      },
-      components: { home: loadComponent },
-      layoutTree: {},
-      routeMeta: {},
-      matchRoute: () => 'home',
-      viewTransitions: false,
-      prefetchHoverDelay: 75,
-      prefetchDefaultCacheFor: parseCacheFor('30s'),
-    });
-
-    const resource = engine.prepareVisit(
-      'blob:http://localhost/0b5e4c1a-7f0d-4f9e-9b52-1c3d2e4f5a6b',
-    );
-
-    await expect(resource.shell).rejects.toThrow('refusing to navigate to a blob: URL');
     expect(fetchMock).not.toHaveBeenCalled();
+    expect(applyUpdate).not.toHaveBeenCalled();
     expect(window.location.href).toBeUndefined();
   });
 
@@ -2342,14 +2825,17 @@ describe('preserveState history updates (#506)', () => {
     return { applyUpdate };
   }
 
-  async function router(applyUpdate: ReturnType<typeof setup>['applyUpdate']) {
-    const { router } = await createTestRouter({
+  async function router(applyUpdate: ReturnType<typeof setup>['applyUpdate'], start = false) {
+    const { router, start: startRouter } = await createTestRouter({
       adapter: { applyUpdate },
       components: { home: loadComponent, settings: loadComponent },
       matchRoute: (url) => (url.startsWith('/settings') ? 'settings' : 'home'),
     });
-    vi.mocked(history.pushState).mockClear();
-    vi.mocked(history.replaceState).mockClear();
+    if (start) {
+      startRouter();
+    }
+    browserWrites.push.mockClear();
+    browserWrites.replace.mockClear();
     return router;
   }
 
@@ -2365,13 +2851,9 @@ describe('preserveState history updates (#506)', () => {
       expect.anything(),
       { preserveState: true },
     );
-    expect(history.pushState).toHaveBeenCalledTimes(1);
-    expect(history.pushState).toHaveBeenCalledWith(
-      expect.objectContaining({ __voidScrollKey: expect.any(String) }),
-      '',
-      '/settings',
-    );
-    expect(history.replaceState).not.toHaveBeenCalled();
+    expect(browserWrites.push).toHaveBeenCalledTimes(1);
+    expect(browserWrites.push).toHaveBeenCalledWith('/settings');
+    expect(browserWrites.replace).not.toHaveBeenCalled();
   });
 
   it('replaces the current entry with replace: true while preserving state', async () => {
@@ -2381,12 +2863,8 @@ describe('preserveState history updates (#506)', () => {
     await r.visit('/settings?tab=a#top', { preserveState: true, replace: true });
 
     expect(applyUpdate.mock.calls[0][3]).toEqual({ preserveState: true });
-    expect(history.pushState).not.toHaveBeenCalled();
-    expect(history.replaceState).toHaveBeenCalledWith(
-      expect.objectContaining({ __voidScrollKey: expect.any(String) }),
-      '',
-      '/settings?tab=a#top',
-    );
+    expect(browserWrites.push).not.toHaveBeenCalled();
+    expect(browserWrites.replace).toHaveBeenCalledWith('/settings?tab=a#top');
   });
 
   it('refetches the current URL in place on router.refresh(), hash included', async () => {
@@ -2399,23 +2877,21 @@ describe('preserveState history updates (#506)', () => {
 
     expect(fetch).toHaveBeenCalledWith('/case?tab=a', expect.anything());
     expect(applyUpdate.mock.calls[0][3]).toEqual({ preserveState: true });
-    expect(history.pushState).not.toHaveBeenCalled();
-    expect(history.replaceState).toHaveBeenCalledWith(
-      expect.objectContaining({ __voidScrollKey: expect.any(String) }),
-      '',
-      '/case?tab=a#top',
-    );
+    expect(browserWrites.push).not.toHaveBeenCalled();
+    expect(browserWrites.replace).toHaveBeenCalledWith('/case?tab=a#top');
   });
 
   it('does not write history for back/forward navigation', async () => {
     const { applyUpdate } = setup();
-    const r = await router(applyUpdate);
+    await router(applyUpdate, true);
 
-    await r.visit('/settings', { preserveState: true, _popstate: true, _scrollPosition: null });
+    const back = dispatchNavigate('/settings', { navigationType: 'traverse', key: 'settings' });
+    commitEntry('/settings', 'settings', 'traverse');
+    await back.interception!.handler!();
 
     expect(applyUpdate.mock.calls[0][3]).toEqual({ preserveState: true });
-    expect(history.pushState).not.toHaveBeenCalled();
-    expect(history.replaceState).not.toHaveBeenCalled();
+    expect(browserWrites.push).not.toHaveBeenCalled();
+    expect(browserWrites.replace).not.toHaveBeenCalled();
   });
 });
 
@@ -2428,22 +2904,16 @@ describe('superseded navigation commits (#507)', () => {
     return { promise, release };
   }
 
-  // pushState and replaceState move window.location, like a browser.
+  // Simulate the URL changing when the browser commits an entry.
   function setup() {
     const documentStub = stubClientGlobals();
     Object.assign(documentStub, { title: 'Home' });
-    const writeHistory = (_state: unknown, _title: string, url?: string | URL | null) => {
-      if (url != null) {
-        const target = new URL(url, window.location.origin);
-        Object.assign(window.location, {
-          pathname: target.pathname,
-          search: target.search,
-          hash: target.hash,
-        });
-      }
+    const updateLocation = (url: string) => {
+      const { pathname, search, hash } = new URL(url, window.location.origin);
+      Object.assign(window.location, { pathname, search, hash });
     };
-    vi.mocked(history.pushState).mockImplementation(writeHistory);
-    vi.mocked(history.replaceState).mockImplementation(writeHistory);
+    browserWrites.push.mockImplementation(updateLocation);
+    browserWrites.replace.mockImplementation(updateLocation);
     const fetchGates = new Map<string, Promise<void>>();
     vi.stubGlobal(
       'fetch',
@@ -2470,7 +2940,11 @@ describe('superseded navigation commits (#507)', () => {
     return { documentStub, fetchGates, updateGates, rendered, applyUpdate, rejectDeferred };
   }
 
-  async function router(page: ReturnType<typeof setup>, config: TestRouterConfig = {}) {
+  async function router(
+    page: ReturnType<typeof setup>,
+    config: TestRouterConfig = {},
+    start = false,
+  ) {
     const created = await createTestRouter({
       ...config,
       adapter: {
@@ -2482,14 +2956,21 @@ describe('superseded navigation commits (#507)', () => {
       components: { a: loadComponent, b: loadComponent, home: loadComponent },
       matchRoute: (url) => (url.startsWith('/a') ? 'a' : url.startsWith('/b') ? 'b' : 'home'),
     });
-    vi.mocked(history.pushState).mockClear();
-    vi.mocked(history.replaceState).mockClear();
+    if (start) {
+      created.start();
+    }
+    browserWrites.push.mockClear();
+    browserWrites.replace.mockClear();
     vi.mocked(window.scrollTo).mockClear();
     return created.router;
   }
 
   async function entered(page: ReturnType<typeof setup>, url: string) {
     await vi.waitFor(() => expect(page.rendered).toContain(url));
+  }
+
+  function states(onNavigationChange: ReturnType<typeof vi.fn>) {
+    return onNavigationChange.mock.calls.map((call) => (call[0] as { state: string }).state);
   }
 
   it('commits each visit in order when they do not overlap', async () => {
@@ -2499,7 +2980,7 @@ describe('superseded navigation commits (#507)', () => {
     await r.visit('/a');
     await r.visit('/b');
 
-    expect(vi.mocked(history.pushState).mock.calls.map((call) => call[2])).toEqual(['/a', '/b']);
+    expect(browserWrites.push.mock.calls.map((call) => call[0])).toEqual(['/a', '/b']);
     expect(window.location.pathname).toBe('/b');
     expect(page.documentStub).toMatchObject({ title: 'B' });
   });
@@ -2519,32 +3000,64 @@ describe('superseded navigation commits (#507)', () => {
     await expect(visitA).resolves.toBeUndefined();
     expect(window.location.pathname).toBe('/b');
     expect(r.url.pathname).toBe('/b');
-    expect(vi.mocked(history.pushState).mock.calls.map((call) => call[2])).toEqual(['/b']);
+    expect(browserWrites.push.mock.calls.map((call) => call[0])).toEqual(['/b']);
     expect(page.documentStub).toMatchObject({ title: 'B' });
     expect(window.scrollTo).not.toHaveBeenCalled();
     // A's commit would have disposed B and rejected its pending Deferred prop.
     expect(page.rejectDeferred).not.toHaveBeenCalled();
   });
 
-  it('commits an older visit that finishes before the newer one commits', async () => {
+  it('blocks an older visit from publishing while the newer one is still loading', async () => {
     const page = setup();
     const a = gate();
     const b = gate();
     page.updateGates.set('/a', a.promise);
     page.fetchGates.set('/b', b.promise);
-    const r = await router(page);
+    const onNavigationChange = vi.fn();
+    const r = await router(page, { onNavigationChange });
 
     const visitA = r.visit('/a');
     await entered(page, '/a');
     const visitB = r.visit('/b');
     a.release();
-    // A is on screen, so its URL is written until B commits.
-    await expect(visitA).resolves.toMatchObject({ url: '/a' });
-    expect(window.location.pathname).toBe('/a');
+    await expect(visitA).resolves.toBeUndefined();
+
+    // B is still loading, so A stays on screen until B settles.
+    expect(page.rendered).toEqual(['/a']);
+    expect(states(onNavigationChange).at(-1)).toBe('loading');
+    expect(window.location.pathname).toBe('/');
+    expect(browserWrites.push).not.toHaveBeenCalled();
 
     b.release();
-    await visitB;
-    expect(vi.mocked(history.pushState).mock.calls.map((call) => call[2])).toEqual(['/a', '/b']);
+    await expect(visitB).resolves.toMatchObject({ url: '/b' });
+    expect(page.rendered).toEqual(['/a', '/b']);
+    expect(browserWrites.push.mock.calls.map((call) => call[0])).toEqual(['/b']);
+    expect(window.location.pathname).toBe('/b');
+    expect(page.documentStub).toMatchObject({ title: 'B' });
+    expect(states(onNavigationChange).at(-1)).toBe('idle');
+  });
+
+  it('does not let an old POST interrupt a GET waiting in browser precommit', async () => {
+    const page = setup();
+    stubBrowserNavigation();
+    const posting = gate();
+    const loading = gate();
+    page.updateGates.set('/a', posting.promise);
+    page.fetchGates.set('/b', loading.promise);
+    const created = await createTestRouter({
+      adapter: { applyUpdate: page.applyUpdate },
+      components: { home: loadComponent, a: loadComponent, b: loadComponent },
+    });
+    created.start();
+    const submission = created.router.visit('/a', { method: 'POST' });
+    const rejected = expect(submission).rejects.toMatchObject({ name: 'AbortError' });
+    await entered(page, '/a');
+    const visit = created.router.visit('/b');
+    posting.release();
+    await rejected;
+    expect(window.location.pathname).toBe('/');
+    loading.release();
+    await expect(visit).resolves.toMatchObject({ url: '/b' });
     expect(window.location.pathname).toBe('/b');
   });
 
@@ -2563,50 +3076,62 @@ describe('superseded navigation commits (#507)', () => {
     await r.visit('/a');
     await vi.waitFor(() => expect(window.location.pathname).toBe('/b'));
 
-    expect(vi.mocked(history.pushState).mock.calls.map((call) => call[2])).toEqual(['/a']);
-    expect(vi.mocked(history.replaceState).mock.calls.at(-1)?.[2]).toBe('/b');
+    expect(browserWrites.push).not.toHaveBeenCalled();
+    expect(browserWrites.replace.mock.calls.at(-1)?.[0]).toBe('/b');
   });
 
   it('keeps page and URL together when a same-page hash visit starts during an update', async () => {
     const page = setup();
+    stubNavigationHistory();
     const a = gate();
     page.updateGates.set('/a', a.promise);
-    const r = await router(page);
+    const onNavigationChange = vi.fn();
+    const r = await router(page, { onNavigationChange });
 
     const visitA = r.visit('/a');
     await entered(page, '/a');
     await r.visit('#x');
     a.release();
 
-    await expect(visitA).resolves.toMatchObject({ url: '/a' });
-    expect(window.location.pathname).toBe('/a');
-    expect(page.documentStub).toMatchObject({ title: 'A' });
+    await expect(visitA).resolves.toBeUndefined();
+    expect(window.location.pathname + window.location.hash).toBe('/#x');
+    expect(page.documentStub).toMatchObject({ title: 'Home' });
+    expect(page.rendered).toEqual(['/a', '']);
+    expect(states(onNavigationChange).at(-1)).toBe('idle');
   });
 
   it('does not push an older URL after a back/forward visit', async () => {
     const page = setup();
+    const browser = stubNavigationHistory();
     const a = gate();
     const b = gate();
     page.updateGates.set('/a', a.promise);
+    const r = await router(page, {}, true);
+    await r.visit('/b');
+    const entryB = browser.currentEntry.key;
+    // Another page is on screen when the browser goes back to /b, so /b has to load.
+    await r.visit('/c');
     page.fetchGates.set('/b', b.promise);
-    const r = await router(page);
 
     const visitA = r.visit('/a');
     await entered(page, '/a');
-    // The browser has already moved to /b when popstate fires, before /b loads.
-    window.location.pathname = '/b';
-    const visitB = r.visit('/b', { _popstate: true, _scrollPosition: null });
+    const navigate = vi.spyOn(browser, 'navigate');
+    // The browser has already moved to /b when its visit starts, before /b loads.
+    const visitB = browser.traverseTo(entryB).finished;
     a.release();
     await expect(visitA).resolves.toBeUndefined();
     b.release();
     await visitB;
 
-    expect(history.pushState).not.toHaveBeenCalled();
+    expect(page.rendered.at(-1)).toBe('/b');
+    expect(navigate).not.toHaveBeenCalled();
+    expect(browserWrites.push).not.toHaveBeenCalled();
     expect(window.location.pathname).toBe('/b');
   });
 
   it('keeps page and URL together after Back to a same-page hash entry during an update', async () => {
     const page = setup();
+    const browser = stubNavigationHistory();
     const a = gate();
     page.updateGates.set('/a', a.promise);
     const r = await router(page);
@@ -2615,13 +3140,13 @@ describe('superseded navigation commits (#507)', () => {
     const visitA = r.visit('/a');
     await entered(page, '/a');
     // Back from /#s to /: a same-page entry, so nothing new renders.
-    window.location.hash = '';
-    await r.visit('/', { _popstate: true, _scrollPosition: null });
+    await browser.traverseTo('initial-entry').finished;
     a.release();
 
-    await expect(visitA).resolves.toMatchObject({ url: '/a' });
-    expect(window.location.pathname).toBe('/a');
-    expect(page.documentStub).toMatchObject({ title: 'A' });
+    await expect(visitA).resolves.toBeUndefined();
+    expect(window.location.pathname + window.location.hash).toBe('/');
+    expect(page.documentStub).toMatchObject({ title: 'Home' });
+    expect(page.rendered).toEqual(['/a', '']);
   });
 
   it('rejects a superseded form submission with an AbortError', async () => {
@@ -2637,6 +3162,150 @@ describe('superseded navigation commits (#507)', () => {
 
     await expect(submitA).rejects.toMatchObject({ name: 'AbortError' });
     expect(window.location.pathname).toBe('/b');
+  });
+
+  describe('resolveOn data on visits that no navigate event carries', () => {
+    async function settledState(promise: Promise<unknown>) {
+      let state = 'pending';
+      promise.then(
+        () => (state = 'resolved'),
+        () => (state = 'rejected'),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      return state;
+    }
+
+    it('resolves a GET with its page data before the page is applied', async () => {
+      const page = setup();
+      const a = gate();
+      page.updateGates.set('/a', a.promise);
+      const r = await router(page);
+
+      const visit = r.visit('/a', { resolveOn: 'data' });
+      await entered(page, '/a');
+
+      expect(await settledState(visit)).toBe('resolved');
+      await expect(visit).resolves.toMatchObject({ component: 'a', url: '/a' });
+      expect(window.location.pathname).toBe('/');
+      expect(browserWrites.push).not.toHaveBeenCalled();
+
+      a.release();
+      await vi.waitFor(() => expect(window.location.pathname).toBe('/a'));
+    });
+
+    it('resolves an action with its page data before the page is applied', async () => {
+      const page = setup();
+      const a = gate();
+      page.updateGates.set('/a', a.promise);
+      const r = await router(page);
+
+      const submit = r.visit('/a', { method: 'post', data: { name: 'x' }, resolveOn: 'data' });
+      await entered(page, '/a');
+
+      expect(await settledState(submit)).toBe('resolved');
+      await expect(submit).resolves.toMatchObject({ component: 'a' });
+      expect(window.location.pathname).toBe('/');
+      a.release();
+      await vi.waitFor(() => expect(window.location.pathname).toBe('/a'));
+    });
+
+    it('waits for the commit by default', async () => {
+      const page = setup();
+      const a = gate();
+      page.updateGates.set('/a', a.promise);
+      const r = await router(page);
+
+      const visit = r.visit('/a');
+      await entered(page, '/a');
+      expect(await settledState(visit)).toBe('pending');
+
+      a.release();
+      await expect(visit).resolves.toMatchObject({ url: '/a' });
+      expect(window.location.pathname).toBe('/a');
+    });
+
+    it('keeps its page data when the page then fails to render', async () => {
+      const page = setup();
+      const a = gate();
+      page.updateGates.set(
+        '/a',
+        a.promise.then(() => {
+          throw new Error('render failed');
+        }),
+      );
+      const r = await router(page);
+
+      const visit = r.visit('/a', { resolveOn: 'data' });
+      await entered(page, '/a');
+      a.release();
+
+      await expect(visit).resolves.toMatchObject({ url: '/a' });
+      await vi.waitFor(() => expect(page.rendered).toEqual(['/a', '']));
+      expect(window.location.pathname).toBe('/');
+    });
+
+    it('rejects when the page data fails to load', async () => {
+      const page = setup();
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('No', { status: 500 })),
+      );
+      const r = await router(page);
+
+      await expect(
+        r.visit('/a', { method: 'post', data: {}, resolveOn: 'data' }),
+      ).rejects.toMatchObject({ status: 500 });
+      expect(page.rendered).toEqual([]);
+    });
+
+    it('settles a visit that is superseded before its data is ready as an abandoned visit', async () => {
+      const page = setup();
+      const a = gate();
+      page.fetchGates.set('/a', a.promise);
+      const r = await router(page);
+
+      const visitA = r.visit('/a', { resolveOn: 'data' });
+      const submitA = r.visit('/a', { method: 'post', data: {}, resolveOn: 'data' });
+      await r.visit('/b');
+      a.release();
+
+      await expect(visitA).resolves.toBeUndefined();
+      await expect(submitA).rejects.toMatchObject({ name: 'AbortError' });
+      expect(page.rendered).toEqual(['/b']);
+    });
+  });
+
+  it('restores the committed page when the action that superseded a visit fails', async () => {
+    const page = setup();
+    const b = gate();
+    const a = gate();
+    page.updateGates.set('/b', b.promise);
+    const fetchPage = fetch;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (init?.method?.toUpperCase() === 'POST') {
+          await a.promise;
+          return new Response('down', { status: 500 });
+        }
+        return fetchPage(url, init);
+      }),
+    );
+    const onNavigationChange = vi.fn();
+    const r = await router(page, { onNavigationChange });
+
+    const visitB = r.visit('/b');
+    await entered(page, '/b');
+    const submitA = r.visit('/a', { method: 'post', data: { name: 'x' } });
+    b.release();
+    await expect(visitB).resolves.toBeUndefined();
+    a.release();
+    await expect(submitA).rejects.toThrow();
+
+    expect(page.rendered).toEqual(['/b', '']);
+    expect(window.location.pathname).toBe('/');
+    expect(page.documentStub).toMatchObject({ title: 'Home' });
+    expect(states(onNavigationChange).at(-1)).toBe('idle');
   });
 
   it('does not apply an older view transition after a newer visit rendered', async () => {
@@ -2665,6 +3334,35 @@ describe('superseded navigation commits (#507)', () => {
     expect(window.location.pathname).toBe('/b');
   });
 
+  it('reports a render error in a view transition once, through the visit', async () => {
+    const page = setup();
+    const error = new Error('render failed');
+    page.applyUpdate.mockRejectedValueOnce(error);
+    Object.assign(document, {
+      // As in browsers: a rejected callback also rejects `ready` and `finished`.
+      startViewTransition(callback: () => Promise<void>) {
+        const updateCallbackDone = Promise.resolve().then(callback);
+        return {
+          updateCallbackDone,
+          ready: updateCallbackDone.then(() => {}),
+          finished: updateCallbackDone.then(() => {}),
+        };
+      },
+    });
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      const r = await router(page);
+
+      await expect(r.visit('/a', { viewTransition: true })).rejects.toBe(error);
+      // Node reports unhandled rejections after the microtask queue drains.
+      await new Promise((resolve) => setTimeout(resolve));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', unhandled);
+    }
+  });
+
   it('skips an older engine commit after a newer one, as the React adapter calls it', async () => {
     const page = setup();
     const engine = await createPageNavigationEngine({
@@ -2690,29 +3388,25 @@ describe('superseded navigation commits (#507)', () => {
     await b.commit();
     await a.commit();
 
-    expect(vi.mocked(history.pushState).mock.calls.map((call) => call[2])).toEqual(['/b']);
+    expect(browserWrites.push.mock.calls.map((call) => call[0])).toEqual(['/b']);
     expect(page.documentStub).toMatchObject({ title: 'B' });
     expect(page.rejectDeferred).not.toHaveBeenCalled();
   });
 
   describe('failed history writes (#562)', () => {
-    function failNext(method: 'pushState' | 'replaceState') {
+    function failNext(method: 'push' | 'replace') {
       const error = new DOMException('History blocked', 'SecurityError');
-      vi.mocked(history[method]).mockImplementationOnce(() => {
+      browserWrites[method].mockImplementationOnce(() => {
         throw error;
       });
       return error;
     }
 
-    function states(onNavigationChange: ReturnType<typeof vi.fn>) {
-      return onNavigationChange.mock.calls.map((call) => (call[0] as { state: string }).state);
-    }
-
-    it('keeps the committed page, URL and head when pushState fails', async () => {
+    it('keeps the committed page, URL and head when push fails', async () => {
       const page = setup();
       const onNavigationChange = vi.fn();
       const r = await router(page, { onNavigationChange });
-      const error = failNext('pushState');
+      const error = failNext('push');
 
       await expect(r.visit('/b')).rejects.toBe(error);
 
@@ -2735,19 +3429,19 @@ describe('superseded navigation commits (#507)', () => {
     it('navigates normally after a failed write', async () => {
       const page = setup();
       const r = await router(page);
-      failNext('pushState');
+      failNext('push');
       await r.visit('/b').catch(() => {});
 
       await expect(r.visit('/a')).resolves.toMatchObject({ url: '/a' });
-      expect(vi.mocked(history.pushState).mock.calls.map((call) => call[2])).toEqual(['/b', '/a']);
+      expect(browserWrites.push.mock.calls.map((call) => call[0])).toEqual(['/b', '/a']);
       expect(window.location.pathname).toBe('/a');
       expect(page.documentStub).toMatchObject({ title: 'A' });
     });
 
-    it('keeps the committed page when replaceState fails for replace: true', async () => {
+    it('keeps the committed page when replace fails for replace: true', async () => {
       const page = setup();
       const r = await router(page);
-      const error = failNext('replaceState');
+      const error = failNext('replace');
 
       await expect(r.visit('/a', { replace: true })).rejects.toBe(error);
 
@@ -2756,116 +3450,15 @@ describe('superseded navigation commits (#507)', () => {
       expect(page.documentStub).toMatchObject({ title: 'Home' });
     });
 
-    it('keeps form state when a same-URL submission cannot replace its entry', async () => {
-      const page = setup();
-      const r = await router(page);
-      await r.visit('/a');
-      const committedA = page.applyUpdate.mock.calls[0][0];
-      const error = failNext('replaceState');
-
-      await expect(r.visit('/a', { method: 'post', data: { name: 'x' } })).rejects.toBe(error);
-
-      expect(history.pushState).toHaveBeenCalledTimes(1);
-      expect(page.applyUpdate).toHaveBeenLastCalledWith(
-        committedA,
-        expect.anything(),
-        expect.anything(),
-        { preserveState: true },
-      );
-      expect(window.location.pathname).toBe('/a');
-    });
-
-    it('leaves the page to a newer visit when an older commit fails', async () => {
-      const page = setup();
-      const b = gate();
-      const a = gate();
-      page.updateGates.set('/b', b.promise);
-      page.fetchGates.set('/a', a.promise);
-      const onNavigationChange = vi.fn();
-      const r = await router(page, { onNavigationChange });
-
-      const visitB = r.visit('/b');
-      await entered(page, '/b');
-      const visitA = r.visit('/a');
-      const error = failNext('pushState');
-      b.release();
-      await expect(visitB).rejects.toBe(error);
-
-      // A is still loading, so B stays on screen until A settles.
-      expect(page.rendered).toEqual(['/b']);
-      expect(states(onNavigationChange).at(-1)).toBe('loading');
-
-      a.release();
-      await expect(visitA).resolves.toMatchObject({ url: '/a' });
-      expect(page.rendered).toEqual(['/b', '/a']);
-      expect(window.location.pathname).toBe('/a');
-      expect(page.documentStub).toMatchObject({ title: 'A' });
-      expect(states(onNavigationChange).at(-1)).toBe('idle');
-    });
-
-    it('restores the committed page once a newer visit fails too', async () => {
-      const page = setup();
-      const b = gate();
-      const a = gate();
-      page.updateGates.set('/b', b.promise);
-      const fetchPage = fetch;
-      vi.stubGlobal(
-        'fetch',
-        vi.fn(async (url: string, init?: RequestInit) => {
-          if (init?.method?.toUpperCase() === 'POST') {
-            await a.promise;
-            return new Response('down', { status: 500 });
-          }
-          return fetchPage(url, init);
-        }),
-      );
-      const onNavigationChange = vi.fn();
-      const r = await router(page, { onNavigationChange });
-
-      const visitB = r.visit('/b');
-      await entered(page, '/b');
-      const submitA = r.visit('/a', { method: 'post', data: { name: 'x' } });
-      const error = failNext('pushState');
-      b.release();
-      await expect(visitB).rejects.toBe(error);
-      a.release();
-      await expect(submitA).rejects.toThrow();
-
-      expect(page.rendered).toEqual(['/b', '']);
-      expect(window.location.pathname).toBe('/');
-      expect(page.documentStub).toMatchObject({ title: 'Home' });
-      expect(states(onNavigationChange).at(-1)).toBe('idle');
-    });
-
-    it('restores the committed page when a hash visit settled first', async () => {
-      const page = setup();
-      const b = gate();
-      page.updateGates.set('/b', b.promise);
-      const onNavigationChange = vi.fn();
-      const r = await router(page, { onNavigationChange });
-
-      const visitB = r.visit('/b');
-      await entered(page, '/b');
-      await r.visit('#x');
-      const error = failNext('pushState');
-      b.release();
-
-      await expect(visitB).rejects.toBe(error);
-      expect(page.rendered).toEqual(['/b', '']);
-      expect(window.location.pathname + window.location.hash).toBe('/#x');
-      expect(page.documentStub).toMatchObject({ title: 'Home' });
-      expect(states(onNavigationChange).at(-1)).toBe('idle');
-    });
-
-    it('ends a hash visit whose history write fails like any failed visit', async () => {
+    it('rejects a hash visit whose history write fails and stays ready', async () => {
       const page = setup();
       const onNavigationChange = vi.fn();
       const r = await router(page, { onNavigationChange });
-      const error = failNext('pushState');
+      const error = failNext('push');
 
       const visit = r.visit('#x');
       await expect(visit).rejects.toBe(error);
-      expect(states(onNavigationChange)).toEqual(['loading', 'idle']);
+      expect(states(onNavigationChange)).toEqual([]);
       expect(window.location.hash).toBe('');
 
       await r.visit('/#y');
@@ -2903,7 +3496,7 @@ describe('superseded navigation commits (#507)', () => {
         prefetchHoverDelay: 75,
         prefetchDefaultCacheFor: parseCacheFor('30s'),
       });
-      const error = failNext('pushState');
+      const error = failNext('push');
 
       const b = engine.prepareVisit('/b');
       await b.shell;
@@ -2919,5 +3512,1011 @@ describe('superseded navigation commits (#507)', () => {
       await expect(a.commit()).resolves.toBe(true);
       expect(window.location.pathname).toBe('/a');
     });
+  });
+});
+
+describe('browser navigate events', () => {
+  function setup() {
+    stubClientGlobals();
+    const fetchPage = vi.fn(async (url: string) => pageJson({ component: 'home', url, props: {} }));
+    vi.stubGlobal('fetch', fetchPage);
+    return { fetchPage, applyUpdate: vi.fn() };
+  }
+
+  it('leaves a link to the current URL and fragment to the browser', async () => {
+    const { fetchPage, applyUpdate } = setup();
+    Object.assign(window.location, { pathname: '/docs', hash: '#install' });
+    const created = await createTestRouter({ adapter: { applyUpdate } });
+    created.start();
+    const navigate = vi.spyOn(window.navigation, 'navigate');
+    const anchor = { hasAttribute: () => false, getAttribute: () => null };
+
+    const click = dispatchNavigate('/docs#install', {
+      navigationType: 'replace',
+      sourceElement: { closest: () => anchor },
+    });
+    // An interception would start its own history write from the precommit handler.
+    await click.interception?.precommitHandler?.({ redirect: vi.fn(), addHandler: vi.fn() });
+    expect(click.interception).toBeUndefined();
+    expect(navigate).not.toHaveBeenCalled();
+
+    // The browser replaces the entry and scrolls to the fragment itself.
+    commitEntry('/docs#install', 'docs-entry', 'replace');
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(navigate).not.toHaveBeenCalled();
+    expect(fetchPage).not.toHaveBeenCalled();
+    expect(window.scrollTo).not.toHaveBeenCalled();
+    expect(applyUpdate).not.toHaveBeenCalled();
+  });
+
+  it('follows the URL of a fragment navigation it leaves to the browser', async () => {
+    const { fetchPage, applyUpdate } = setup();
+    window.location.pathname = '/docs';
+    const onRouteChange = vi.fn();
+    const created = await createTestRouter({ adapter: { applyUpdate }, onRouteChange });
+    created.start();
+
+    const click = dispatchNavigate('/docs#install', { navigationType: 'push', hashChange: true });
+    expect(click.interception).toBeUndefined();
+    commitEntry('/docs#install', 'install-entry', 'push');
+    expect(created.router.url.hash).toBe('#install');
+    expect(onRouteChange).toHaveBeenLastCalledWith('/docs#install');
+
+    // history.pushState() from app code changes the fragment without a hashChange.
+    const write = dispatchNavigate('/docs#usage', { navigationType: 'push' });
+    expect(write.interception).toBeUndefined();
+    commitEntry('/docs#usage', 'usage-entry', 'push');
+    expect(created.router.url.hash).toBe('#usage');
+
+    expect(fetchPage).not.toHaveBeenCalled();
+    expect(window.scrollTo).not.toHaveBeenCalled();
+    expect(applyUpdate).not.toHaveBeenCalled();
+  });
+
+  it('loads the page for a fragment navigation from an entry whose page never rendered', async () => {
+    const { fetchPage, applyUpdate } = setup();
+    const created = await createTestRouter({ adapter: { applyUpdate } });
+    created.start();
+    // The address shows /next while the page on screen is still the one at /.
+    window.location.pathname = '/next';
+
+    const click = dispatchNavigate('/next#details', { navigationType: 'push', hashChange: true });
+    expect(click.interception?.precommitHandler).toBeTypeOf('function');
+    await click.interception!.precommitHandler!({ redirect: vi.fn(), addHandler: vi.fn() });
+    expect(fetchPage).toHaveBeenCalledOnce();
+    expect(fetchPage.mock.calls[0]![0]).toBe('/next');
+  });
+
+  it('keeps a failed action away from an entry that another visit is rendering', async () => {
+    stubClientGlobals();
+    stubBrowserNavigation();
+    const reload = vi.fn();
+    Object.assign(window.location, { reload });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) =>
+        init?.method === 'POST'
+          ? Response.json({ errors: { name: 'Required' } }, { status: 422 })
+          : pageJson({ component: 'home', url, props: {} }),
+      ),
+    );
+    const rendering = controlledPromise<void>();
+    const applyUpdate = vi.fn(() => rendering.promise);
+    const created = await createTestRouter({ adapter: { applyUpdate } });
+    created.start();
+
+    // The browser has committed /next, but its page is still rendering.
+    const visit = created.router.visit('/next');
+    await vi.waitFor(() => expect(applyUpdate).toHaveBeenCalledOnce());
+    expect(window.location.pathname).toBe('/next');
+
+    await expect(created.router.visit('/', { method: 'POST' })).rejects.toMatchObject({
+      name: 'VoidActionError',
+      status: 422,
+    });
+    expect(reload).not.toHaveBeenCalled();
+
+    rendering.resolve();
+    await visit;
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it('keeps an intercepted traversal through a history write from other code', async () => {
+    const { fetchPage, applyUpdate } = setup();
+    const created = await createTestRouter({ adapter: { applyUpdate } });
+    created.start();
+
+    const back = dispatchNavigate('/back', { navigationType: 'traverse', key: 'back-entry' });
+    expect(back.interception?.handler).toBeTypeOf('function');
+    // history.replaceState() from app or analytics code, before the traversal commits.
+    const write = dispatchNavigate('/', { navigationType: 'replace' });
+    expect(write.interception).toBeUndefined();
+
+    commitEntry('/back', 'back-entry', 'traverse');
+    expect(fetchPage).not.toHaveBeenCalled();
+    await back.interception!.handler!();
+    expect(fetchPage).toHaveBeenCalledOnce();
+    expect(applyUpdate).toHaveBeenCalledOnce();
+  });
+
+  describe('a visit that app code starts from currententrychange and that fails', () => {
+    /** The visit to /bad starts as soon as the browser commits `path`, and never renders. */
+    async function setup(path: string) {
+      stubClientGlobals();
+      const browser = stubNavigationHistory();
+      const reload = vi.fn();
+      Object.assign(window.location, { reload });
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string, init?: RequestInit) => {
+          if (url === '/bad') {
+            return new Response('{', { headers: { 'X-VoidPages': 'true' } });
+          }
+          const page = pageJson({ component: 'home', url: path, props: {} });
+          return init?.method === 'POST'
+            ? Object.defineProperties(page, {
+                redirected: { value: true },
+                url: { value: 'http://localhost' + path },
+              })
+            : page;
+        }),
+      );
+      const created = await createTestRouter();
+      created.start();
+      created.commitInitialRender();
+      let failed: Promise<unknown> | undefined;
+      browser.addEventListener('currententrychange', () => {
+        if (window.location.pathname === path) {
+          failed ??= created.router.visit('/bad');
+        }
+      });
+      const settled = async () => {
+        await vi.waitFor(() => expect(failed).toBeDefined());
+        await expect(failed).rejects.toBeInstanceOf(SyntaxError);
+      };
+      return { created, reload, settled };
+    }
+
+    it('reloads the entry of a visit it superseded before that page rendered', async () => {
+      const { created, reload, settled } = await setup('/next');
+
+      await created.router.visit('/next');
+      await settled();
+      expect(window.location.pathname).toBe('/next');
+      expect(reload).toHaveBeenCalledOnce();
+    });
+
+    it('reloads the entry an action published when the action lost its commit', async () => {
+      const { created, reload, settled } = await setup('/done');
+
+      await created.router.visit('/', { method: 'POST' }).catch(() => {});
+      await settled();
+      expect(window.location.pathname).toBe('/done');
+      expect(reload).toHaveBeenCalledOnce();
+    });
+  });
+
+  it.each([
+    ['is not a page', () => new Response('moved', { headers: { 'content-type': 'text/plain' } })],
+    ['names an unknown component', () => pageJson({ component: 'missing', url: '/', props: {} })],
+  ])(
+    'loads the document once when the response to a traversal %s',
+    async (_case, documentResponse) => {
+      stubClientGlobals();
+      const browser = stubNavigationHistory();
+      const reload = vi.fn();
+      Object.assign(window.location, { reload });
+      let traversing = false;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string) =>
+          traversing ? documentResponse() : pageJson({ component: 'home', url, props: {} }),
+        ),
+      );
+      const created = await createTestRouter();
+      created.start();
+      created.commitInitialRender();
+      await created.router.visit('/next');
+      expect(window.location.pathname).toBe('/next');
+
+      traversing = true;
+      await expect(browser.traverseTo('initial-entry').finished).rejects.toMatchObject({
+        name: 'AbortError',
+      });
+      // The browser is at the entry already: the document loads once, as a reload of it.
+      expect(reload).toHaveBeenCalledOnce();
+      expect(window.location.href).toBeUndefined();
+    },
+  );
+
+  it('does not reload an unrendered entry whose visit the loader handed to the document', async () => {
+    stubClientGlobals();
+    const browser = stubNavigationHistory();
+    const reload = vi.fn();
+    Object.assign(window.location, { reload });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url === '/document') {
+          return new Response('moved', { headers: { 'content-type': 'text/plain' } });
+        }
+        const page = pageJson({ component: 'home', url: '/done', props: {} });
+        return init?.method === 'POST'
+          ? Object.defineProperties(page, {
+              redirected: { value: true },
+              url: { value: 'http://localhost/done' },
+            })
+          : page;
+      }),
+    );
+    const created = await createTestRouter({
+      matchRoute: (path) => (path === '/document' ? null : 'home'),
+    });
+    created.start();
+    created.commitInitialRender();
+    // The action publishes /done, and app code leaves for a URL that is not a page
+    // before the action's page is recorded as rendered.
+    let left: Promise<unknown> | undefined;
+    browser.addEventListener('currententrychange', () => {
+      if (window.location.pathname === '/done') {
+        left ??= created.router.visit('/document');
+      }
+    });
+
+    await created.router.visit('/', { method: 'POST' }).catch(() => {});
+    await vi.waitFor(() => expect(left).toBeDefined());
+    await left;
+    expect(window.location.href).toBe('/document');
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  describe('scroll records of an entry that is replaced', () => {
+    async function setup() {
+      stubClientGlobals();
+      const browser = stubNavigationHistory();
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string) => pageJson({ component: 'home', url, props: {} })),
+      );
+      const created = await createTestRouter();
+      created.start();
+      created.commitInitialRender();
+      const scrollTo = vi.mocked(window.scrollTo);
+      const scroll = (scrollY: number) => Object.assign(window, { scrollY });
+      return { browser, created, scroll, scrollTo };
+    }
+
+    it.each([
+      ['history.replaceState', '/'],
+      ['history.replaceState with a new query', '/?tab=open'],
+    ])('restores the page on Back after %s', async (_case, url) => {
+      const { browser, created, scroll, scrollTo } = await setup();
+      scroll(3500);
+      // App or analytics code replaces the entry: a new entry object with the same key.
+      await browser.navigate(url, { history: 'replace' }).finished;
+      expect(browser.currentEntry.key).toBe('initial-entry');
+      scroll(3600);
+
+      await created.router.visit('/next');
+      scroll(0);
+      scrollTo.mockClear();
+      await browser.traverseTo('initial-entry').finished;
+      expect(scrollTo).toHaveBeenLastCalledWith(0, 3600);
+    });
+
+    it.each(['visit', 'refresh'] as const)(
+      'restores the page a replace %s rendered, not the page it replaced',
+      async (operation) => {
+        const { browser, created, scroll, scrollTo } = await setup();
+        scroll(3500);
+        await (operation === 'visit'
+          ? created.router.visit('/other', { replace: true })
+          : created.router.refresh());
+        expect(browser.currentEntry.key).toBe('initial-entry');
+        scroll(1200);
+
+        await created.router.visit('/next');
+        scroll(0);
+        scrollTo.mockClear();
+        await browser.traverseTo('initial-entry').finished;
+        expect(scrollTo).toHaveBeenLastCalledWith(0, 1200);
+      },
+    );
+  });
+
+  it('reloads the committed browser URL when the adapter cannot apply it', async () => {
+    stubClientGlobals();
+    stubBrowserNavigation();
+    const reload = vi.fn();
+    Object.assign(window.location, { reload });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => pageJson({ component: 'home', url: '/next', props: {} })),
+    );
+    const error = new Error('render failed');
+    const applyUpdate = vi.fn().mockRejectedValueOnce(error);
+    const created = await createTestRouter({ adapter: { applyUpdate } });
+    created.start();
+
+    await expect(created.router.visit('/next')).rejects.toBe(error);
+    expect(window.location.pathname).toBe('/next');
+    expect(reload).toHaveBeenCalledOnce();
+  });
+
+  describe('view transition decision', () => {
+    const ATTRIBUTE = 'data-void-view-transition';
+
+    /** The browser's navigation stub must be in place before the engine listens to it. */
+    async function setupTransitions(viewTransitions: boolean, browser = false) {
+      stubClientGlobals();
+      if (browser) {
+        stubBrowserNavigation();
+      }
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string) => pageJson({ component: 'home', url, props: {}, errors: null })),
+      );
+      const startViewTransition = vi.fn((callback: () => unknown) => {
+        const updateCallbackDone = Promise.resolve()
+          .then(callback)
+          .then(() => {});
+        return { updateCallbackDone, ready: updateCallbackDone, finished: updateCallbackDone };
+      });
+      Object.assign(document, { startViewTransition });
+      const applyUpdate = vi.fn();
+      const created = await createTestRouter({ viewTransitions, adapter: { applyUpdate } });
+      return { ...created, applyUpdate, startViewTransition };
+    }
+
+    function anchorWith(value?: string) {
+      const anchor = {
+        hasAttribute: (name: string) => name === ATTRIBUTE && value !== undefined,
+        getAttribute: (name: string) => (name === ATTRIBUTE ? (value ?? null) : null),
+      };
+      return { closest: () => anchor };
+    }
+
+    /** Click an anchor to `url`, then commit and render it as the browser does. */
+    async function click(url: string, attribute?: string, hasUAVisualTransition = false) {
+      const { interception } = dispatchNavigate(url, {
+        navigationType: 'push',
+        sourceElement: anchorWith(attribute),
+        hasUAVisualTransition,
+      });
+      const handlers: Array<() => unknown> = [];
+      await interception!.precommitHandler!({
+        redirect: vi.fn(),
+        addHandler: (handler) => {
+          handlers.push(handler);
+        },
+      });
+      commitEntry(url, `${url}-entry`, 'push');
+      await handlers[0]!();
+    }
+
+    async function traverse(url: string, init: Partial<NavigateInit> = {}) {
+      const back = dispatchNavigate(url, { navigationType: 'traverse', key: 'back', ...init });
+      commitEntry(url, 'back', 'traverse');
+      await back.interception!.handler!();
+    }
+
+    /** Add fields to every navigate event the browser stub dispatches. */
+    function decorateNavigateEvents(fields: Record<string, unknown>) {
+      const dispatch = window.navigation.dispatchEvent.bind(window.navigation);
+      window.navigation.dispatchEvent = (event) => dispatch(Object.assign(event, fields));
+    }
+
+    it.each([true, false])(
+      'uses the plugin default %j for a link without the attribute',
+      async (on) => {
+        const page = await setupTransitions(on);
+        page.start();
+
+        await click('/a');
+
+        expect(page.startViewTransition).toHaveBeenCalledTimes(on ? 1 : 0);
+        expect(page.applyUpdate).toHaveBeenCalledOnce();
+      },
+    );
+
+    it.each([
+      [false, 'true', 1],
+      [true, 'false', 0],
+    ])('lets a link attribute override the default %j with %j', async (on, attribute, count) => {
+      const page = await setupTransitions(on);
+      page.start();
+
+      await click('/a', attribute);
+
+      expect(page.startViewTransition).toHaveBeenCalledTimes(count);
+      expect(page.applyUpdate).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      [true, '', 1],
+      [true, 'no', 1],
+      [true, 'FALSE', 1],
+      [false, 'TRUE', 0],
+      [false, '1', 0],
+    ])('keeps the default %j for the invalid attribute value %j', async (on, attribute, count) => {
+      const page = await setupTransitions(on);
+      page.start();
+
+      await click('/a', attribute);
+
+      expect(page.startViewTransition).toHaveBeenCalledTimes(count);
+    });
+
+    it.each([
+      [false, true, 1],
+      [true, false, 0],
+    ])('lets a visit option override the default %j with %j', async (on, viewTransition, count) => {
+      const page = await setupTransitions(on, true);
+      page.start();
+
+      await page.router.visit('/a', { viewTransition });
+
+      expect(page.startViewTransition).toHaveBeenCalledTimes(count);
+      expect(page.applyUpdate).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      [true, 'false', 1],
+      [false, 'true', 0],
+    ])(
+      'lets the visit option %j override the link attribute %j',
+      async (viewTransition, attribute, count) => {
+        // The default disagrees with the option too, so only the option explains the result.
+        const page = await setupTransitions(!viewTransition, true);
+        page.start();
+        decorateNavigateEvents({ sourceElement: anchorWith(attribute) });
+
+        await page.router.visit('/a', { viewTransition });
+
+        expect(page.startViewTransition).toHaveBeenCalledTimes(count);
+      },
+    );
+
+    it('skips the transition when the browser has already animated the navigation', async () => {
+      const page = await setupTransitions(true);
+      page.start();
+
+      await click('/a', undefined, true);
+      await click('/b', 'true', true);
+      await traverse('/c', { hasUAVisualTransition: true });
+
+      expect(page.startViewTransition).not.toHaveBeenCalled();
+      expect(page.applyUpdate).toHaveBeenCalledTimes(3);
+    });
+
+    it('skips a visit option too when the browser has already animated', async () => {
+      const page = await setupTransitions(true, true);
+      page.start();
+      decorateNavigateEvents({ hasUAVisualTransition: true });
+
+      await page.router.visit('/a', { viewTransition: true });
+
+      expect(page.startViewTransition).not.toHaveBeenCalled();
+      expect(page.applyUpdate).toHaveBeenCalledOnce();
+    });
+
+    it.each([true, false])('uses only the plugin default %j for a traversal', async (on) => {
+      const page = await setupTransitions(on);
+      page.start();
+
+      // A traversal has no link; an attribute on its source element does not apply.
+      await traverse('/a', { sourceElement: anchorWith(on ? 'false' : 'true') });
+
+      expect(page.startViewTransition).toHaveBeenCalledTimes(on ? 1 : 0);
+      expect(page.applyUpdate).toHaveBeenCalledOnce();
+    });
+
+    it.each([true, false])('uses the plugin default %j for an action', async (on) => {
+      const page = await setupTransitions(on, true);
+      page.start();
+
+      await submitAction(page.router, '/?save', { method: 'POST' });
+
+      expect(page.startViewTransition).toHaveBeenCalledTimes(on ? 1 : 0);
+      expect(page.applyUpdate).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      [false, true, 1],
+      [true, false, 0],
+    ])(
+      'lets an action option override the default %j with %j',
+      async (on, viewTransition, count) => {
+        const page = await setupTransitions(on, true);
+        page.start();
+
+        await page.router.visit('/?save', { method: 'POST', viewTransition });
+
+        expect(page.startViewTransition).toHaveBeenCalledTimes(count);
+      },
+    );
+
+    it('updates without a transition in a browser that has no view transitions', async () => {
+      const page = await setupTransitions(true);
+      Object.assign(document, { startViewTransition: undefined });
+      page.start();
+
+      await click('/a', 'true');
+
+      expect(page.applyUpdate).toHaveBeenCalledOnce();
+    });
+
+    it('hands the adapter one resolved value with each resource', async () => {
+      const engineWith = async (viewTransitions: boolean) => {
+        stubClientGlobals();
+        vi.stubGlobal(
+          'fetch',
+          vi.fn(async (url: string) => pageJson({ component: 'home', url, props: {} })),
+        );
+        return createPageNavigationEngine({
+          adapter: {
+            createDeferred: () => ({}),
+            isLoading: () => false,
+            resolveDeferred: (_ref, value) => value,
+            rejectDeferred: (_ref, error) => error,
+          },
+          components: { home: loadComponent },
+          layoutTree: {},
+          routeMeta: {},
+          matchRoute: () => 'home',
+          viewTransitions,
+          prefetchHoverDelay: 75,
+          prefetchDefaultCacheFor: parseCacheFor('30s'),
+        });
+      };
+
+      /** A visit prepared without a navigate event, as actions are. */
+      const prepared = (
+        engine: Awaited<ReturnType<typeof engineWith>>,
+        options?: { viewTransition: boolean },
+      ) => {
+        const resource = engine.prepareVisit('/a', options);
+        // The next visit supersedes this one before it loads.
+        void resource.shell.catch(() => {});
+        return resource.viewTransition;
+      };
+
+      const off = await engineWith(false);
+      expect(prepared(off)).toBe(false);
+      expect(prepared(off, { viewTransition: true })).toBe(true);
+      const on = await engineWith(true);
+      expect(prepared(on)).toBe(true);
+      expect(prepared(on, { viewTransition: false })).toBe(false);
+
+      // The adapter's browser visit handler receives the same value.
+      const resources: Array<{ viewTransition: boolean }> = [];
+      on.setBrowserVisitHandler(async (resource) => {
+        resources.push(resource);
+        return (await resource.shell)?.pageData;
+      });
+      await traverse('/b');
+      await click('/c', 'false');
+      expect(resources.map((resource) => resource.viewTransition)).toEqual([true, false]);
+    });
+  });
+
+  describe('URLs outside the route table', () => {
+    /** `/dashboard` and `/api/health` are not pages: only the server knows what they serve. */
+    async function setupUnmatched(respond: (url: string) => Response) {
+      stubClientGlobals();
+      const fetchPage = vi.fn(async (url: string) => respond(url));
+      vi.stubGlobal('fetch', fetchPage);
+      const applyUpdate = vi.fn();
+      const created = await createTestRouter({
+        adapter: { applyUpdate },
+        matchRoute: (path) => (path === '/dashboard' || path === '/api/health' ? null : 'home'),
+      });
+      created.start();
+      return { fetchPage, applyUpdate };
+    }
+
+    function clickAnchor(url: string, attributes: Array<string>) {
+      const anchor = {
+        hasAttribute: (name: string) => attributes.includes(name),
+        getAttribute: (name: string) => (attributes.includes(name) ? '' : null),
+      };
+      return dispatchNavigate(url, {
+        navigationType: 'push',
+        sourceElement: { closest: () => anchor },
+      }).interception;
+    }
+
+    const page = (url: string) => pageJson({ component: 'home', url, props: {} });
+
+    it('fetches a Link once and renders the page the server selects', async () => {
+      const { fetchPage, applyUpdate } = await setupUnmatched(page);
+      const interception = clickAnchor('/dashboard', ['data-void-link']);
+      expect(interception?.precommitHandler).toBeTypeOf('function');
+
+      const handlers: Array<() => unknown> = [];
+      const redirect = vi.fn();
+      await interception!.precommitHandler!({
+        redirect,
+        addHandler: (handler) => {
+          handlers.push(handler);
+        },
+      });
+      expect(redirect).not.toHaveBeenCalled();
+      expect(handlers).toHaveLength(1);
+      commitEntry('/dashboard', 'dashboard-entry', 'push');
+      await handlers[0]!();
+
+      expect(fetchPage).toHaveBeenCalledOnce();
+      expect(fetchPage.mock.calls[0]![0]).toBe('/dashboard');
+      expect(applyUpdate).toHaveBeenCalledOnce();
+      expect(window.location.href).toBeUndefined();
+    });
+
+    it('resolves a visit with resolveOn data once the server has selected the page', async () => {
+      stubClientGlobals();
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string) => page(url)),
+      );
+      const applying = controlledPromise<void>();
+      const applyUpdate = vi.fn(() => applying.promise);
+      const created = await createTestRouter({
+        adapter: { applyUpdate },
+        matchRoute: (path) => (path === '/dashboard' ? null : 'home'),
+      });
+      created.start();
+
+      await expect(
+        created.router.visit('/dashboard', { resolveOn: 'data' }),
+      ).resolves.toMatchObject({ url: '/dashboard' });
+      expect(applyUpdate).toHaveBeenCalledOnce();
+      expect(browserWrites.push).not.toHaveBeenCalled();
+
+      applying.resolve();
+      await vi.waitFor(() => expect(browserWrites.push).toHaveBeenCalledWith('/dashboard'));
+    });
+
+    it('leaves a plain anchor to the browser', async () => {
+      const { fetchPage, applyUpdate } = await setupUnmatched(page);
+      expect(clickAnchor('/dashboard', [])).toBeUndefined();
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(fetchPage).not.toHaveBeenCalled();
+      expect(applyUpdate).not.toHaveBeenCalled();
+    });
+
+    it.each(['download', 'data-void-reload'])(
+      'leaves a Link with %s to the browser',
+      async (attribute) => {
+        const { fetchPage } = await setupUnmatched(page);
+        expect(clickAnchor('/dashboard', ['data-void-link', attribute])).toBeUndefined();
+        expect(fetchPage).not.toHaveBeenCalled();
+      },
+    );
+
+    it('loads the document when a Link does not return a page', async () => {
+      const { fetchPage, applyUpdate } = await setupUnmatched(() =>
+        Response.json({ status: 'ok' }),
+      );
+      const interception = clickAnchor('/api/health', ['data-void-link']);
+      expect(interception?.precommitHandler).toBeTypeOf('function');
+
+      const addHandler = vi.fn();
+      // The precommit handler settles without an error: the document load takes over.
+      await interception!.precommitHandler!({ redirect: vi.fn(), addHandler });
+
+      expect(window.location.href).toBe('/api/health');
+      expect(fetchPage).toHaveBeenCalledOnce();
+      expect(addHandler).not.toHaveBeenCalled();
+      expect(applyUpdate).not.toHaveBeenCalled();
+    });
+
+    it('renders a same-document entry again on traversal', async () => {
+      const { fetchPage, applyUpdate } = await setupUnmatched(page);
+
+      const back = dispatchNavigate('/dashboard', {
+        navigationType: 'traverse',
+        key: 'dashboard-entry',
+      });
+      expect(back.interception?.handler).toBeTypeOf('function');
+      commitEntry('/dashboard', 'dashboard-entry', 'traverse');
+      await back.interception!.handler!();
+      expect(fetchPage).toHaveBeenCalledOnce();
+      expect(applyUpdate).toHaveBeenCalledOnce();
+
+      // The entry commits before its handler runs: only the handler loads the page.
+      const forward = dispatchNavigate('/api/health', {
+        navigationType: 'traverse',
+        key: 'other-entry',
+      });
+      commitEntry('/api/health', 'other-entry', 'traverse');
+      expect(fetchPage).toHaveBeenCalledOnce();
+      await forward.interception!.handler!();
+      expect(fetchPage).toHaveBeenCalledTimes(2);
+      expect(fetchPage.mock.calls[1]![0]).toBe('/api/health');
+      expect(applyUpdate).toHaveBeenCalledTimes(2);
+    });
+  });
+});
+
+describe('actions that supersede a navigation with a committed URL', () => {
+  /** The browser has committed /next, but its page is still rendering. */
+  async function setup(action: (url: string) => Response, linkOptions = {}) {
+    stubClientGlobals();
+    const browser = stubNavigationHistory();
+    const reload = vi.fn();
+    Object.assign(window.location, { reload });
+    const fetchPage = vi.fn(async (url: string, init?: RequestInit) =>
+      init?.method === 'POST' ? action(url) : pageJson({ component: 'home', url, props: {} }),
+    );
+    vi.stubGlobal('fetch', fetchPage);
+    const rendering = controlledPromise<void>();
+    const applyUpdate = vi.fn<() => Promise<void> | undefined>();
+    applyUpdate.mockReturnValueOnce(rendering.promise);
+    const created = await createTestRouter({ adapter: { applyUpdate } });
+    created.start();
+    created.commitInitialRender();
+
+    const link = created.router.visit('/next', linkOptions);
+    await vi.waitFor(() => expect(applyUpdate).toHaveBeenCalledOnce());
+    expect(window.location.pathname).toBe('/next');
+    const paths = () => browser.entries().map((entry) => new URL(entry.url).pathname);
+    const requests = () => fetchPage.mock.calls.map(([url, init]) => [init?.method, url]);
+    return { browser, created, link, rendering, reload, paths, requests };
+  }
+
+  const invalid = () => Response.json({ errors: { name: 'Required' } }, { status: 422 });
+
+  it('returns to the entry of the page on screen when the action fails', async () => {
+    const { browser, created, link, rendering, reload, paths, requests } = await setup(invalid);
+
+    await expect(created.router.visit('/', { method: 'POST' })).rejects.toMatchObject({
+      name: 'VoidActionError',
+      status: 422,
+    });
+    // The address and the router agree with the page that shows the errors.
+    expect(window.location.pathname).toBe('/');
+    expect(created.router.url.pathname).toBe('/');
+    expect(browser.currentEntry.key).toBe('initial-entry');
+    expect(paths()).toEqual(['/', '/next']);
+
+    rendering.resolve();
+    await link;
+    // The page was not loaded again, scrolled or reloaded.
+    expect(requests()).toEqual([
+      ['GET', '/next'],
+      ['POST', '/'],
+    ]);
+    expect(window.scrollTo).not.toHaveBeenCalled();
+    expect(reload).not.toHaveBeenCalled();
+    expect(window.location.pathname).toBe('/');
+  });
+
+  it('gives a replaced entry the URL of the page on screen when the action fails', async () => {
+    const { browser, created, reload, paths, requests } = await setup(invalid, { replace: true });
+    expect(paths()).toEqual(['/next']);
+
+    await expect(created.router.visit('/', { method: 'POST' })).rejects.toMatchObject({
+      status: 422,
+    });
+    expect(window.location.pathname).toBe('/');
+    expect(created.router.url.pathname).toBe('/');
+    expect(browser.currentEntry.key).toBe('initial-entry');
+    expect(paths()).toEqual(['/']);
+    expect(requests()).toEqual([
+      ['GET', '/next'],
+      ['POST', '/'],
+    ]);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it('updates the page on screen in its own entry when the action succeeds', async () => {
+    const { browser, created, reload, paths } = await setup((url) =>
+      pageJson({ component: 'home', url, props: { saved: true } }),
+    );
+
+    await expect(created.router.visit('/', { method: 'POST' })).resolves.toMatchObject({
+      props: { saved: true },
+    });
+    expect(window.location.pathname).toBe('/');
+    expect(browser.currentEntry.key).toBe('initial-entry');
+    // No second entry for the page, and an update in place keeps its scroll position.
+    expect(paths()).toEqual(['/', '/next']);
+    expect(window.scrollTo).not.toHaveBeenCalled();
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it('opens the page an action redirects to after the page on screen', async () => {
+    const { created, reload, paths } = await setup(() =>
+      Object.defineProperties(pageJson({ component: 'home', url: '/done', props: {} }), {
+        redirected: { value: true },
+        url: { value: 'http://localhost/done' },
+      }),
+    );
+
+    await created.router.visit('/', { method: 'POST' });
+    expect(window.location.pathname).toBe('/done');
+    expect(paths()).toEqual(['/', '/done']);
+    expect(reload).not.toHaveBeenCalled();
+  });
+});
+
+describe('history writes from app code on the rendered page', () => {
+  async function setup({ committed = true, adapter = {} as TestRouterConfig['adapter'] } = {}) {
+    stubClientGlobals();
+    window.location.pathname = '/issues';
+    const browser = stubNavigationHistory();
+    const reload = vi.fn();
+    Object.assign(window.location, { reload });
+    const fetchPage = vi.fn(async (url: string) => pageJson({ component: 'home', url, props: {} }));
+    vi.stubGlobal('fetch', fetchPage);
+    const applyUpdate = vi.fn();
+    const created = await createTestRouter({ adapter: { applyUpdate, ...adapter } });
+    created.start();
+    if (committed) {
+      created.commitInitialRender();
+    }
+    /** history.pushState() or replaceState(): a navigation that no router code started. */
+    const write = (url: string, history: 'push' | 'replace') =>
+      browser.navigate(url, { history }).finished;
+    /** A plain anchor to a fragment: the browser reports a hash change. */
+    const followFragment = (url: string) => browser.navigate(url, { history: 'push' }).finished;
+    const scroll = (scrollY: number) => Object.assign(window, { scrollY });
+    const requests = () => fetchPage.mock.calls.map(([url]) => url);
+    return { browser, created, reload, applyUpdate, write, followFragment, scroll, requests };
+  }
+
+  it('leaves a fragment to the browser after replaceState changed the query', async () => {
+    const { created, applyUpdate, write, followFragment, requests } = await setup();
+
+    await write('/issues?tab=open', 'replace');
+    expect(created.router.url.search).toBe('?tab=open');
+
+    await followFragment('/issues?tab=open#comments');
+    expect(created.router.url.href).toBe('http://localhost/issues?tab=open#comments');
+    await created.router.visit('#activity');
+    expect(created.router.url.hash).toBe('#activity');
+
+    expect(requests()).toEqual([]);
+    expect(applyUpdate).not.toHaveBeenCalled();
+    expect(window.scrollTo).not.toHaveBeenCalled();
+  });
+
+  it('loads the page of the entry that Back or Forward reaches after pushState', async () => {
+    const { browser, created, applyUpdate, write, scroll, requests } = await setup();
+
+    scroll(500);
+    await write('/issues?tab=closed', 'push');
+    const pushed = browser.currentEntry.key;
+    expect(created.router.url.search).toBe('?tab=closed');
+    expect(requests()).toEqual([]);
+
+    // The position of the page belongs to the entry that app code moved it to.
+    scroll(900);
+    await browser.traverseTo('initial-entry').finished;
+    expect(requests()).toEqual(['/issues']);
+    expect(applyUpdate).toHaveBeenCalledOnce();
+    expect(created.router.url.search).toBe('');
+    expect(window.scrollTo).toHaveBeenLastCalledWith(0, 500);
+
+    scroll(40);
+    await browser.traverseTo(pushed).finished;
+    expect(requests()).toEqual(['/issues', '/issues?tab=closed']);
+    expect(created.router.url.search).toBe('?tab=closed');
+    expect(window.scrollTo).toHaveBeenLastCalledWith(0, 900);
+  });
+
+  it.each(['replace', 'push'] as const)(
+    'follows a %sState that runs before the initial render commits',
+    async (history) => {
+      const { browser, created, write, scroll, requests } = await setup({ committed: false });
+
+      // As an effect of the page does while the app mounts.
+      await write('/issues?tab=open', history);
+      const key = browser.currentEntry.key;
+      created.commitInitialRender();
+      expect(created.router.url.search).toBe('?tab=open');
+      await created.router.visit('#comments', { replace: true });
+      expect(requests()).toEqual([]);
+
+      // The page's position is recorded for the entry that shows it.
+      scroll(700);
+      await created.router.visit('/next');
+      scroll(0);
+      await browser.traverseTo(key).finished;
+      expect(requests()).toEqual(['/next', '/issues?tab=open']);
+      expect(window.scrollTo).toHaveBeenLastCalledWith(0, 700);
+    },
+  );
+
+  it.each(['replace', 'push'] as const)(
+    'follows a %sState that cancels a visit before its URL commits',
+    async (history) => {
+      const { created, reload, applyUpdate, write, followFragment, requests } = await setup();
+      const response = controlledPromise<Response>();
+      vi.mocked(fetch).mockImplementationOnce(() => response.promise);
+
+      const visit = created.router.visit('/next');
+      await vi.waitFor(() => expect(requests()).toEqual(['/next']));
+      // The browser aborts the pending navigation before it commits the write.
+      await write('/issues?tab=open', history);
+      response.resolve(pageJson({ component: 'home', url: '/next', props: {} }));
+      await expect(visit).resolves.toBeUndefined();
+
+      expect(created.router.url.href).toBe('http://localhost/issues?tab=open');
+      await followFragment('/issues?tab=open#comments');
+      expect(requests()).toEqual(['/next']);
+      expect(applyUpdate).not.toHaveBeenCalled();
+      expect(reload).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['replace', 'push'] as const)(
+    'does not take a %sState on an entry whose page has yet to render for the rendered page',
+    async (history) => {
+      const rendering = controlledPromise<void>();
+      const applyUpdate = vi.fn(() => rendering.promise);
+      const { created, reload, write, followFragment, requests } = await setup({
+        adapter: { applyUpdate },
+      });
+
+      // The browser has committed /next, and its page is still rendering.
+      const visit = created.router.visit('/next');
+      void visit.catch(() => {});
+      await vi.waitFor(() => expect(applyUpdate).toHaveBeenCalledOnce());
+      expect(window.location.pathname).toBe('/next');
+      await write('/next?step=2', history);
+      rendering.resolve();
+
+      // The page on screen is still the one at /issues: this address is not its URL,
+      // so a fragment of it is a visit that loads the page.
+      await followFragment('/next?step=2#details');
+      expect(requests()).toEqual(['/next', '/next?step=2']);
+      expect(reload).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe('visits to the current URL and fragment', () => {
+  function setup() {
+    stubClientGlobals();
+    Object.assign(window.location, { pathname: '/docs', hash: '#top' });
+    const fetchPage = vi.fn(async (url: string) => pageJson({ component: 'home', url, props: {} }));
+    vi.stubGlobal('fetch', fetchPage);
+    return fetchPage;
+  }
+
+  it('adds no history entry and leaves the scroll to the browser', async () => {
+    const fetchPage = setup();
+    const browser = stubNavigationHistory();
+    const created = await createTestRouter();
+    created.start();
+    created.commitInitialRender();
+
+    await created.router.visit('/docs#top');
+    expect(browser.entries()).toHaveLength(1);
+    expect(browser.currentEntry.key).toBe('initial-entry');
+    expect(window.scrollTo).not.toHaveBeenCalled();
+    expect(fetchPage).not.toHaveBeenCalled();
+
+    // Another fragment of the page is a new entry.
+    await created.router.visit('/docs#other');
+    expect(browser.entries().map((entry) => new URL(entry.url).hash)).toEqual(['#top', '#other']);
+    expect(fetchPage).not.toHaveBeenCalled();
+  });
+
+  it('refreshes a URL with a fragment in its entry', async () => {
+    const fetchPage = setup();
+    const browser = stubNavigationHistory();
+    const applyUpdate = vi.fn();
+    const created = await createTestRouter({ adapter: { applyUpdate } });
+    created.start();
+    created.commitInitialRender();
+
+    await created.router.refresh();
+    expect(fetchPage).toHaveBeenCalledOnce();
+    expect(fetchPage.mock.calls[0]![0]).toBe('/docs');
+    expect(applyUpdate).toHaveBeenCalledOnce();
+    expect(browser.entries()).toHaveLength(1);
+    expect(browser.currentEntry.key).toBe('initial-entry');
   });
 });

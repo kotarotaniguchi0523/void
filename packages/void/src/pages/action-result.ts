@@ -89,6 +89,10 @@ export function isCallSiteActionError(error: unknown): error is VoidActionError 
   return isVoidActionError(error) && categorizeActionError(error.status) === 'callSite';
 }
 
+export function abortError(): DOMException {
+  return new DOMException('Navigation aborted', 'AbortError');
+}
+
 export function isAbortError(error: unknown): boolean {
   return (
     typeof error === 'object' &&
@@ -96,6 +100,18 @@ export function isAbortError(error: unknown): boolean {
     'name' in error &&
     (error as { name?: unknown }).name === 'AbortError'
   );
+}
+
+/**
+ * Whether a visit that is aborted resolves `undefined` instead of rejecting with the
+ * AbortError. GET visits do, except the visits React Actions make (`_resolveOnShell`).
+ * `method` is the upper-cased method of the visit's resource.
+ */
+export function abortedVisitResolvesUndefined(
+  method: string,
+  options: { _resolveOnShell?: boolean },
+): boolean {
+  return method === 'GET' && !options._resolveOnShell;
 }
 
 async function readActionErrorBody(response: Response): Promise<unknown> {

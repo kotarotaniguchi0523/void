@@ -1,10 +1,32 @@
-export function isSameOrigin(url: URL, origin: string): boolean {
-  // Custom schemes have an opaque URL.origin, even for different hosts.
+/** Only web and supported local-app schemes can represent a Pages navigation. */
+export function isPageUrlProtocol(url: URL): boolean {
+  return url.protocol === 'http:' || url.protocol === 'https:' || url.protocol === 'capacitor:';
+}
+
+/**
+ * The current document URL: the base for relative URLs and for `isSameOrigin`.
+ * A full URL, because the opaque origin of a Capacitor WebView is not a URL base.
+ */
+export function documentBaseUrl(): URL {
+  if (typeof window === 'undefined') {
+    return new URL('http://localhost/');
+  }
+  const { href, origin, pathname, search, hash } = window.location;
+  return new URL(href || origin + pathname + search + hash);
+}
+
+/** Use the browser's origin or a URL base for custom schemes with opaque origins. */
+export function isSameOrigin(url: URL, origin: string | URL): boolean {
   if (url.protocol === 'capacitor:') {
-    const current = new URL(origin);
+    const current = origin instanceof URL ? origin : new URL(origin);
     return current.protocol === 'capacitor:' && url.host !== '' && url.host === current.host;
   }
-  return url.origin === origin;
+  return url.origin === (origin instanceof URL ? origin.origin : origin);
+}
+
+/** A URL the router can load page data for: a page scheme, on the document's origin. */
+export function isSameOriginPageUrl(url: URL, base: URL = documentBaseUrl()): boolean {
+  return isPageUrlProtocol(url) && isSameOrigin(url, base);
 }
 
 function isHexDigit(char: string | undefined): boolean {

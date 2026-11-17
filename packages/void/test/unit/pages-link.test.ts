@@ -3,7 +3,6 @@ import {
   createRouterFacade,
   createSsrRouter,
   idleNavigationState,
-  type NavigationMethod,
   type VoidRouter,
 } from '../../src/pages/client.ts';
 import {
@@ -11,10 +10,12 @@ import {
   LINK_VISIBLE_PREFETCH_DELAY,
   linkActiveAttributes,
   linkPendingAttributes,
+  linkPrefetchAttributes,
   linkPrefetchStrategies,
+  linkViewTransition,
   observeLinkVisible,
-  prefetchLink,
-  resolveLink,
+  prefetchResolvedLink,
+  resolveSameOrigin,
   type BaseLinkProps,
   type LinkActiveMatch,
 } from '../../src/pages/link.ts';
@@ -61,78 +62,73 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('resolveLink', () => {
-  it('merges GET data into the destination', () => {
-    expect(resolveLink({ href: '/users', method: 'get', data: { page: 2 } })).toEqual({
-      method: 'GET',
-      isGet: true,
-      href: '/users?page=2',
-    });
-  });
-
-  it('keeps data out of the destination for other methods', () => {
-    expect(resolveLink({ href: '/users', method: 'post', data: { name: 'Ada' } })).toEqual({
-      method: 'POST',
-      isGet: false,
-      href: '/users',
-    });
-  });
-
-  it('rejects prefetch on non-GET links', () => {
-    expect(() => resolveLink({ href: '/users', method: 'POST', prefetch: 'mount' })).toThrow(
-      'Link: prefetch only supports GET links',
-    );
-    expect(() => resolveLink({ href: '/users', method: 'POST', prefetch: false })).not.toThrow();
-  });
-
-  it('rejects reloadDocument on non-GET links', () => {
-    expect(() => resolveLink({ href: '/users', method: 'DELETE', reloadDocument: true })).toThrow(
-      'Link: reloadDocument only supports GET links.',
-    );
-  });
-});
-
-describe('linkPrefetchStrategies', () => {
-  const get = { isGet: true };
-  const post = { isGet: false };
-
+describe('Link prefetch strategies and attributes', () => {
   it.each([
     [undefined, []],
     [false, []],
-    [true, ['hover']],
     ['visible', ['visible']],
     [['mount', 'click'] as const, ['mount', 'click']],
   ] as const)('maps prefetch=%j to %j', (prefetch, expected) => {
-    expect(linkPrefetchStrategies({ prefetch }, get)).toEqual(expected);
+    expect(linkPrefetchStrategies({ prefetch })).toEqual(expected);
   });
 
-  it('disables prefetch for document reloads', () => {
-    expect(linkPrefetchStrategies({ prefetch: 'mount', reloadDocument: true }, get)).toEqual([]);
-    expect(linkPrefetchStrategies({ reloadDocument: true }, get, 'hover')).toEqual([]);
+  it('applies app defaults and honours document opt-outs', () => {
+    expect(linkPrefetchStrategies({}, 'mount')).toEqual(['mount']);
+    expect(linkPrefetchStrategies({ prefetch: 'visible' }, 'mount')).toEqual(['visible']);
+    expect(linkPrefetchStrategies({ prefetch: false }, 'hover')).toEqual([]);
+    expect(linkPrefetchStrategies({ reloadDocument: true }, 'hover')).toEqual([]);
   });
 
-  it.each([
-    [true, ['hover']],
-    ['visible', ['visible']],
-    [['hover', 'click'] as const, ['hover', 'click']],
-    [false, []],
-  ] as const)(
-    'uses defaultStrategy=%j for a Link without a prefetch prop',
-    (fallback, expected) => {
-      expect(linkPrefetchStrategies({}, get, fallback)).toEqual(expected);
-    },
-  );
-
-  it('replaces the default with the Link prop', () => {
-    expect(linkPrefetchStrategies({ prefetch: 'visible' }, get, ['hover', 'click'])).toEqual([
-      'visible',
-    ]);
-    expect(linkPrefetchStrategies({ prefetch: true }, get, 'mount')).toEqual(['hover']);
-    expect(linkPrefetchStrategies({ prefetch: false }, get, 'hover')).toEqual([]);
+  it('marks every Link anchor, on the server and the client', () => {
+    const marker = { 'data-void-link': '' };
+    for (const router of [createSsrRouter('/'), createRouter()]) {
+      expect(linkPrefetchAttributes(router, {})).toEqual({
+        ...marker,
+        'data-void-prefetch': 'default',
+      });
+      expect(linkPrefetchAttributes(router, { prefetch: false })).toEqual(marker);
+      expect(linkPrefetchAttributes(router, { reloadDocument: true })).toEqual(marker);
+    }
+    expect(linkPrefetchAttributes(null, {})).toEqual({});
   });
 
-  it('applies the default only to GET links', () => {
-    expect(linkPrefetchStrategies({}, post, 'hover')).toEqual([]);
+  it('renders the view transition override, on the server and the client', () => {
+    const attribute = 'data-void-view-transition';
+    for (const router of [createSsrRouter('/'), createRouter()]) {
+      expect(linkPrefetchAttributes(router, { viewTransition: true })).toEqual({
+        'data-void-link': '',
+        'data-void-prefetch': 'default',
+        [attribute]: 'true',
+      });
+      expect(linkPrefetchAttributes(router, { viewTransition: false })).toMatchObject({
+        [attribute]: 'false',
+      });
+      // Independent of prefetching and of a document reload.
+      expect(linkPrefetchAttributes(router, { prefetch: false, viewTransition: true })).toEqual({
+        'data-void-link': '',
+        [attribute]: 'true',
+      });
+      expect(linkPrefetchAttributes(router, {})).not.toHaveProperty(attribute);
+      expect(linkPrefetchAttributes(router, { viewTransition: undefined })).not.toHaveProperty(
+        attribute,
+      );
+    }
+  });
+});
+
+describe('linkViewTransition', () => {
+  const anchor = (value: string | null) =>
+    ({
+      getAttribute: (name: string) => (name === 'data-void-view-transition' ? value : null),
+    }) as Element;
+
+  it('reads true and false', () => {
+    expect(linkViewTransition(anchor('true'))).toBe(true);
+    expect(linkViewTransition(anchor('false'))).toBe(false);
+  });
+
+  it.each([null, '', 'TRUE', 'yes', '1', '0', ' true'])('ignores %j', (value) => {
+    expect(linkViewTransition(anchor(value))).toBeUndefined();
   });
 });
 
@@ -140,13 +136,9 @@ describe('linkActiveAttributes', () => {
   const page = { 'aria-current': 'page', 'data-void-active': '' };
   const nested = { 'data-void-active': '' };
 
-  function attributes(
-    url: string,
-    props: Pick<BaseLinkProps, 'href' | 'method' | 'data'>,
-    match?: LinkActiveMatch,
-  ) {
+  function attributes(url: string, props: Pick<BaseLinkProps, 'href'>, match?: LinkActiveMatch) {
     const router = { url: new URL(url, 'https://app.test') } as VoidRouter;
-    return linkActiveAttributes(router, resolveLink(props), match);
+    return linkActiveAttributes(router, props.href, match);
   }
 
   it('marks only the current page by default', () => {
@@ -187,20 +179,19 @@ describe('linkActiveAttributes', () => {
     expect(attributes('/issues', { href: '/issues?status=' })).toEqual({});
   });
 
+  it('counts duplicate query values instead of treating them as a set', () => {
+    expect(attributes('/search?tag=a', { href: '/search?tag=a&tag=a' })).toEqual({});
+    expect(attributes('/search?tag=a&tag=a', { href: '/search?tag=a&tag=a' })).toEqual(page);
+    expect(attributes('/search?tag=a&tag=b', { href: '/search?tag=a&tag=a' })).toEqual({});
+    expect(attributes('/search?tag=b&tag=a&tag=a', { href: '/search?tag=a&tag=a' })).toEqual(page);
+  });
+
   it('compares decoded query values and repeated params', () => {
     expect(attributes('/search?q=void+pages', { href: '/search?q=void%20pages' })).toEqual(page);
     expect(attributes('/search?tag=a&tag=b', { href: '/search?tag=b' })).toEqual(page);
     expect(attributes('/search?tag=a&tag=b', { href: '/search?tag=b&tag=a' })).toEqual(page);
     expect(attributes('/search?tag=a', { href: '/search?tag=a&tag=b' })).toEqual({});
     expect(attributes('/search?Tag=a', { href: '/search?tag=a' })).toEqual({});
-  });
-
-  it('treats GET data as part of the link query', () => {
-    expect(attributes('/search', { href: '/search', data: { q: 'void' } })).toEqual({});
-    expect(attributes('/search?q=void', { href: '/search', data: { q: 'void' } })).toEqual(page);
-    expect(
-      attributes('/search?q=void&page=2', { href: '/search?q=void', data: { page: 3 } }),
-    ).toEqual({});
   });
 
   it('resolves query-only and hash-only hrefs against the current URL', () => {
@@ -244,28 +235,17 @@ describe('linkActiveAttributes', () => {
     vi.stubGlobal('window', undefined);
     const router = createSsrRouter('/users?view=all', {}, 'https://app.test/users?view=all');
     expect(router.url.href).toBe('https://app.test/users?view=all');
-    expect(linkActiveAttributes(router, resolveLink({ href: 'https://app.test/users' }))).toEqual(
-      page,
-    );
-    expect(linkActiveAttributes(router, resolveLink({ href: '//app.test/users' }))).toEqual(page);
-    expect(linkActiveAttributes(router, resolveLink({ href: 'http://localhost/users' }))).toEqual(
-      {},
-    );
+    expect(linkActiveAttributes(router, 'https://app.test/users')).toEqual(page);
+    expect(linkActiveAttributes(router, '//app.test/users')).toEqual(page);
+    expect(linkActiveAttributes(router, 'http://localhost/users')).toEqual({});
   });
 
   it('preserves the router origin in a server-side facade', () => {
     vi.stubGlobal('window', undefined);
     const router = createRouterFacade(createSsrRouter('https://app.test/previous'), () => '/users');
     expect(router.url.href).toBe('https://app.test/users');
-    expect(linkActiveAttributes(router, resolveLink({ href: '//app.test/users' }))).toEqual(page);
-    expect(linkActiveAttributes(router, resolveLink({ href: 'http://localhost/users' }))).toEqual(
-      {},
-    );
-  });
-
-  it('never marks links that are not GET or have no router', () => {
-    expect(attributes('/logout', { href: '/logout', method: 'post' })).toEqual({});
-    expect(linkActiveAttributes(null, resolveLink({ href: '/' }))).toEqual({});
+    expect(linkActiveAttributes(router, '//app.test/users')).toEqual(page);
+    expect(linkActiveAttributes(router, 'http://localhost/users')).toEqual({});
   });
 });
 
@@ -274,20 +254,16 @@ describe('linkPendingAttributes', () => {
   const router = { url: new URL('/admin/users?page=1', 'https://app.test') } as VoidRouter;
 
   /** A visit in flight to `destination`, as the router reports it. */
-  function visiting(destination: string, method: NavigationMethod = 'GET') {
+  function visiting(destination: string) {
     return {
-      state: method === 'GET' ? ('loading' as const) : ('submitting' as const),
+      state: 'loading' as const,
       location: new URL(destination, 'https://app.test'),
-      method,
+      method: 'GET' as const,
     };
   }
 
-  function attributes(destination: string, props: Pick<BaseLinkProps, 'href' | 'method' | 'data'>) {
-    return linkPendingAttributes(
-      router,
-      visiting(destination, props.method?.toUpperCase() as NavigationMethod),
-      resolveLink(props),
-    );
+  function attributes(destination: string, props: Pick<BaseLinkProps, 'href'>) {
+    return linkPendingAttributes(router, visiting(destination), props.href);
   }
 
   it('marks a link while a visit to its destination loads', () => {
@@ -300,7 +276,7 @@ describe('linkPendingAttributes', () => {
     expect(attributes('/inbox?page=3', { href: '/inbox?page=3' })).toEqual(pending);
     expect(attributes('/inbox?page=3', { href: '/inbox?page=2' })).toEqual({});
     expect(attributes('/inbox?page=3', { href: '/inbox' })).toEqual({});
-    expect(attributes('/search?q=void', { href: '/search', data: { q: 'void' } })).toEqual(pending);
+    expect(attributes('/search?q=void', { href: '/search?q=void' })).toEqual(pending);
     expect(attributes('/docs#install', { href: '/docs#install' })).toEqual(pending);
     expect(attributes('/docs#install', { href: '/docs' })).toEqual({});
   });
@@ -323,23 +299,8 @@ describe('linkPendingAttributes', () => {
     );
   });
 
-  it('marks a non-GET link only during a visit with its method', () => {
-    expect(attributes('/logout', { href: '/logout', method: 'post' })).toEqual(pending);
-    expect(attributes('/users/1', { href: '/users/1', method: 'DELETE' })).toEqual(pending);
-    expect(
-      linkPendingAttributes(
-        router,
-        visiting('/logout', 'GET'),
-        resolveLink({ href: '/logout', method: 'post' }),
-      ),
-    ).toEqual({});
-    expect(
-      linkPendingAttributes(router, visiting('/users', 'POST'), resolveLink({ href: '/users' })),
-    ).toEqual({});
-  });
-
   it('marks nothing when no visit is loading or there is no router', () => {
-    const link = resolveLink({ href: '/admin/users/42' });
+    const link = '/admin/users/42';
     expect(linkPendingAttributes(router, idleNavigationState(), link)).toEqual({});
     expect(
       linkPendingAttributes(router, { state: 'loading', location: null, method: 'GET' }, link),
@@ -349,11 +310,38 @@ describe('linkPendingAttributes', () => {
   });
 });
 
-describe('prefetchLink', () => {
+describe('resolveSameOrigin', () => {
+  it('does not treat same-origin blob URLs as Pages links', () => {
+    const base = new URL('https://app.test/');
+    expect(resolveSameOrigin('blob:https://app.test/123', base)).toBeNull();
+    expect(resolveSameOrigin('javascript:alert(1)', base)).toBeNull();
+  });
+
+  it('rejects other hosts even when a custom scheme has opaque origin', () => {
+    const base = new URL('capacitor://localhost/users');
+    expect(resolveSameOrigin('capacitor://localhost/settings', base)?.pathname).toBe('/settings');
+    expect(resolveSameOrigin('capacitor://other/settings', base)).toBeNull();
+    expect(resolveSameOrigin('https://example.com/settings', base)).toBeNull();
+  });
+
+  it('accepts absolute same-origin URLs and rejects other sites and schemes', () => {
+    const base = new URL('https://app.test/users?page=1');
+    expect(resolveSameOrigin('https://app.test/users/42', base)?.pathname).toBe('/users/42');
+    expect(resolveSameOrigin('https://example.com/users/42', base)).toBeNull();
+    expect(resolveSameOrigin('mailto:ada@example.com', base)).toBeNull();
+  });
+});
+
+describe('prefetchResolvedLink', () => {
+  /** Prefetch `href` as the delegated anchor listener does once it has resolved the anchor. */
+  function prefetch(router: ReturnType<typeof createRouter>, href: string, cacheFor?: string) {
+    prefetchResolvedLink(router, href, cacheFor);
+  }
+
   it('prefetches other destinations with cacheFor only when given', () => {
     const router = createRouter();
-    prefetchLink(router, '/users/42', undefined);
-    prefetchLink(router, '/users/43', '30s');
+    prefetch(router, '/users/42');
+    prefetch(router, '/users/43', '30s');
 
     expect(router.prefetch.mock.calls).toEqual([
       ['/users/42', {}],
@@ -361,21 +349,11 @@ describe('prefetchLink', () => {
     ]);
   });
 
-  it('skips the current page and missing routers', () => {
+  it('skips the current page', () => {
     const router = createRouter();
-    prefetchLink(router, '/users?page=1', undefined);
-    prefetchLink(null, '/users/42', undefined);
+    prefetch(router, '/users?page=1');
 
     expect(router.prefetch).not.toHaveBeenCalled();
-  });
-
-  it('prefetches same-origin URLs and skips other sites and schemes', () => {
-    const router = createRouter();
-    prefetchLink(router, 'https://app.test/users/42', undefined);
-    prefetchLink(router, 'https://example.com/users/42', undefined);
-    prefetchLink(router, 'mailto:ada@example.com', undefined);
-
-    expect(router.prefetch.mock.calls).toEqual([['https://app.test/users/42', {}]]);
   });
 
   it('skips while data saver is on or the connection is 2G-class', () => {
@@ -386,7 +364,7 @@ describe('prefetchLink', () => {
       { effectiveType: 'slow-2g' },
     ]) {
       vi.stubGlobal('navigator', { connection });
-      prefetchLink(router, '/users/42', undefined);
+      prefetch(router, '/users/42');
     }
 
     expect(router.prefetch).not.toHaveBeenCalled();
@@ -400,7 +378,7 @@ describe('prefetchLink', () => {
       {},
     ]) {
       vi.stubGlobal('navigator', stub);
-      prefetchLink(router, '/users/42', undefined);
+      prefetch(router, '/users/42');
     }
 
     expect(router.prefetch).toHaveBeenCalledTimes(3);
@@ -410,72 +388,89 @@ describe('prefetchLink', () => {
     const router = createRouter();
     const connection = { saveData: true };
     vi.stubGlobal('navigator', { connection });
-    prefetchLink(router, '/users/42', undefined);
+    prefetch(router, '/users/42');
     connection.saveData = false;
-    prefetchLink(router, '/users/43', undefined);
+    prefetch(router, '/users/43');
 
     expect(router.prefetch.mock.calls).toEqual([['/users/43', {}]]);
   });
 });
 
-describe('handleLinkClick', () => {
-  it('visits same-origin destinations with the navigation options', () => {
+describe('explicit GET anchor clicks', () => {
+  it('reports failed explicit visits but ignores superseded navigation aborts', async () => {
+    const reporter = vi.fn();
+    vi.stubGlobal('reportError', reporter);
+    const router = createRouter();
+    router.visit.mockRejectedValueOnce(new Error('Render failed'));
+    const { event } = click();
+    handleLinkClick(event, router, '/users/42', { replace: true });
+    await vi.waitFor(() => expect(reporter).toHaveBeenCalledOnce());
+
+    router.visit.mockRejectedValueOnce(new DOMException('Superseded', 'AbortError'));
+    handleLinkClick(event, router, '/users/43', { replace: true });
+    await Promise.resolve();
+    expect(reporter).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves ordinary GET links to the browser', () => {
     const router = createRouter();
     const { event, preventDefault } = click();
-    handleLinkClick(event, router, resolveLink({ href: '/users/42' }), {
-      data: { ignored: true },
-      preserveScroll: true,
-      replace: true,
-    });
-
-    expect(preventDefault).toHaveBeenCalledOnce();
-    expect(router.visit).toHaveBeenCalledWith('/users/42', {
-      method: 'GET',
-      data: undefined,
-      preserveScroll: true,
-      preserveState: undefined,
-      replace: true,
-      viewTransition: undefined,
-    });
-  });
-
-  it('sends data as the body for other methods', () => {
-    const router = createRouter();
-    const { event } = click();
-    const data = { name: 'Ada' };
-    handleLinkClick(event, router, resolveLink({ href: '/users', method: 'post', data }), {
-      data,
-    });
-
-    expect(router.visit).toHaveBeenCalledWith(
-      '/users',
-      expect.objectContaining({ method: 'POST', data }),
-    );
-  });
-
-  it.each([
-    ['a modified click', click({ metaKey: true }).event, '/users/42', {}],
-    ['a new-tab target', click({}, { target: '_blank' }).event, '/users/42', {}],
-    ['a download', click({}, { download: '' }).event, '/users/42', {}],
-    ['a prevented click', click({ defaultPrevented: true }).event, '/users/42', {}],
-    ['a cross-origin destination', click().event, 'https://example.com/', {}],
-    ['a document reload', click().event, '/users/42', { reloadDocument: true }],
-  ] as const)('leaves %s to the browser', (_name, event, href, props) => {
-    const router = createRouter();
-    handleLinkClick(event, router, resolveLink({ href }), props);
-
-    expect(event.preventDefault).not.toHaveBeenCalled();
+    handleLinkClick(event, router, '/users/42', {});
+    expect(preventDefault).not.toHaveBeenCalled();
     expect(router.visit).not.toHaveBeenCalled();
   });
 
-  it('cancels the visit when onNavigate prevents it', () => {
+  it('intercepts only when visit options are present', () => {
     const router = createRouter();
     const { event, preventDefault } = click();
-    handleLinkClick(event, router, resolveLink({ href: '/users/42' }), {
-      onNavigate: (navigation) => navigation.preventDefault(),
+    handleLinkClick(event, router, '/users/42', { replace: true });
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(router.visit).toHaveBeenCalledWith('/users/42', { replace: true });
+  });
+
+  it('passes the anchor view transition setting unless the handler sets its own', () => {
+    const router = createRouter();
+    const on = click({}, { 'data-void-view-transition': 'true' });
+    handleLinkClick(on.event, router, '/users/42', { replace: true });
+    expect(router.visit).toHaveBeenLastCalledWith('/users/42', {
+      replace: true,
+      viewTransition: true,
     });
 
-    expect(preventDefault).toHaveBeenCalledOnce();
+    const off = click({}, { 'data-void-view-transition': 'false' });
+    handleLinkClick(off.event, router, '/users/42', { preserveScroll: true });
+    expect(router.visit).toHaveBeenLastCalledWith('/users/42', {
+      preserveScroll: true,
+      viewTransition: false,
+    });
+
+    // The handler's own option wins over the attribute.
+    handleLinkClick(on.event, router, '/users/42', { replace: true, viewTransition: false });
+    expect(router.visit).toHaveBeenLastCalledWith('/users/42', {
+      replace: true,
+      viewTransition: false,
+    });
+
+    // Without an attribute, or with an unknown value, the plugin default still decides.
+    const unknown = click({}, { 'data-void-view-transition': 'yes' });
+    handleLinkClick(unknown.event, router, '/users/42', { replace: true });
+    expect(router.visit).toHaveBeenLastCalledWith('/users/42', { replace: true });
+  });
+
+  it('keeps reloads, downloads, target and modified clicks native', () => {
+    const router = createRouter();
+    const variants = [
+      click({}, { download: '' }),
+      click({}, { 'data-void-reload': '' }),
+      click({}, { target: '_blank' }),
+      click({ ctrlKey: true }),
+      click({ button: 1 }),
+      click({ defaultPrevented: true }),
+    ];
+    for (const { event, preventDefault } of variants) {
+      handleLinkClick(event, router, '/users/42', { replace: true });
+      expect(preventDefault).not.toHaveBeenCalled();
+    }
     expect(router.visit).not.toHaveBeenCalled();
   });
 });

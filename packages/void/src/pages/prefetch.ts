@@ -70,7 +70,6 @@ export function parseCacheFor(value: CacheForInput): CacheForResult {
 
 export type CacheEntry = {
   url: string;
-  method: string;
   response: Promise<unknown>;
   pending: boolean;
   staleAt: number;
@@ -82,21 +81,20 @@ export type CacheEntry = {
 export class PrefetchCache {
   private readonly entries = new Map<string, CacheEntry>();
 
-  private key(url: string, method = 'GET'): string {
-    return `${method}:${url}`;
+  has(url: string): boolean {
+    return this.get(url) !== null;
   }
 
-  has(url: string, method = 'GET'): boolean {
-    return this.get(url, method) !== null;
-  }
-
-  get(url: string, method = 'GET'): CacheEntry | null {
-    const entry = this.entries.get(this.key(url, method));
+  get(url: string): CacheEntry | null {
+    const entry = this.entries.get(url);
     if (!entry) {
       return null;
     }
     if (Date.now() >= entry.expiresAt && !entry.singleUse) {
-      this.entries.delete(this.key(url, method));
+      if (entry.timer) {
+        clearTimeout(entry.timer);
+      }
+      this.entries.delete(url);
       return null;
     }
     return entry;
@@ -110,19 +108,20 @@ export class PrefetchCache {
     return Date.now() < entry.expiresAt || entry.singleUse;
   }
 
-  set(url: string, method: string, response: Promise<unknown>, ttl: CacheForResult): void {
-    const k = this.key(url, method);
+  set(url: string, response: Promise<unknown>, ttl: CacheForResult): void {
     // Don't overwrite existing entry that is still usable
-    const existing = this.entries.get(k);
+    const existing = this.entries.get(url);
     if (existing && this.isUsable(existing)) {
       return;
+    }
+    if (existing?.timer) {
+      clearTimeout(existing.timer);
     }
 
     const now = Date.now();
     const singleUse = ttl.stale === 0 && ttl.expires === 0;
     const entry: CacheEntry = {
       url,
-      method,
       response,
       pending: true,
       staleAt: now + ttl.stale,
@@ -138,30 +137,41 @@ export class PrefetchCache {
     );
 
     if (!singleUse && ttl.expires > 0) {
-      entry.timer = setTimeout(() => this.entries.delete(k), ttl.expires);
+      entry.timer = setTimeout(() => {
+        if (this.entries.get(url) === entry) {
+          this.entries.delete(url);
+        }
+      }, ttl.expires);
     }
 
-    this.entries.set(k, entry);
+    this.entries.set(url, entry);
+    void response.catch(() => {
+      if (this.entries.get(url) === entry) {
+        if (entry.timer) {
+          clearTimeout(entry.timer);
+        }
+        this.entries.delete(url);
+      }
+    });
   }
 
   /** Mark entry as consumed — removes it if singleUse. */
-  consume(url: string, method = 'GET'): void {
-    const entry = this.entries.get(this.key(url, method));
+  consume(url: string): void {
+    const entry = this.entries.get(url);
     if (entry?.singleUse) {
       if (entry.timer) {
         clearTimeout(entry.timer);
       }
-      this.entries.delete(this.key(url, method));
+      this.entries.delete(url);
     }
   }
 
-  flush(url: string, method = 'GET'): void {
-    const k = this.key(url, method);
-    const entry = this.entries.get(k);
+  flush(url: string): void {
+    const entry = this.entries.get(url);
     if (entry?.timer) {
       clearTimeout(entry.timer);
     }
-    this.entries.delete(k);
+    this.entries.delete(url);
   }
 
   flushAll(): void {

@@ -2,18 +2,54 @@
 
 import { PAGES_PROTOCOL_VERSION } from '@void/edge';
 import { PRESERVED_QUERY_HEADER, searchWithoutActionKey } from './action-key.ts';
-import { createActionErrorFromResponse, isAbortError } from './action-result.ts';
-import { pageBoundarySlots, clientPageError, showTerminalPageError } from './boundary-client.ts';
+import {
+  abortError,
+  abortedVisitResolvesUndefined,
+  createActionErrorFromResponse,
+  isAbortError,
+} from './action-result.ts';
+import { startAnchorPrefetch } from './anchor-prefetch.ts';
+import { hasPageBoundaries, showTerminalPageError } from './boundary-client.ts';
 import type { BoundaryManifest } from './boundary-plans.ts';
+import {
+  DeferredRegistry,
+  drainHtmlDeferredQueue,
+  installHtmlDeferredHandlers,
+  readPageDataStream,
+} from './deferred-registry.ts';
+import { createEntryTracker } from './entry-tracker.ts';
+import { hasFiles, objectToFormData } from './form-data.ts';
 import { initClientHead, applyClientHead } from './head-client.ts';
 import type { HeadDescriptor } from './head.ts';
-import { PrefetchCache, parseCacheFor } from './prefetch.ts';
+import { LINK_MARKER_ATTRIBUTE, isRouterLink, linkViewTransition } from './link.ts';
+import { createPageComponentLoader } from './page-components.ts';
+import {
+  abortSignalPromise,
+  clonePageData,
+  fetchPageResponse,
+  readInitialPageData,
+} from './page-data.ts';
+import {
+  createPrefetchRequests,
+  isPrefetchRedirect,
+  unwrapPrefetchedPageData,
+} from './prefetch-requests.ts';
+import { PrefetchCache } from './prefetch.ts';
 import type { CacheForInput, CacheForResult, LinkPrefetchValue } from './prefetch.ts';
 import type { PageObject } from './protocol.ts';
-import { fetchPages, type PagesFetchOptions, type PagesFetchResult } from './redirect.ts';
-import { createScrollRestoration } from './scroll-restoration.ts';
-import { decodePageData, deserializePageData, serializePageData } from './serialize.ts';
-import { decodePagePath, isSameOrigin } from './url.ts';
+import { fetchPages, type PagesFetchOptions } from './redirect.ts';
+import { createScrollRestoration, restoreScroll } from './scroll-restoration.ts';
+import { decodePageData } from './serialize.ts';
+import { createStaticPageDataLoader } from './static-page-data.ts';
+import {
+  decodePagePath,
+  documentBaseUrl,
+  isPageUrlProtocol,
+  isSameOrigin,
+  isSameOriginPageUrl,
+} from './url.ts';
+
+export { hasFiles, isFile, objectToFormData } from './form-data.ts';
 
 /**
  * The server leaves a named action's key out of the page URL. When the page URL
@@ -38,15 +74,7 @@ export type PageComponentModule = {
 
 export type PageData = PageObject;
 
-type DeferredWindow = Window & {
-  __resolveDeferred?: (group: string, data: unknown, serialized?: boolean) => void;
-  __rejectDeferred?: (group: string, error: unknown) => void;
-  __deferredQueue?: Array<[string, unknown] | [string, 0, unknown] | [string, unknown, 0, true]>;
-};
-
 type PageFetchOptions = PagesFetchOptions;
-
-type StaticPageDataResult = { pageData: PageData; resolvedDeferred: boolean };
 
 type NavigationCommitTarget = { fetchUrl: string; hash: string; method: string };
 
@@ -57,22 +85,43 @@ export type VisitOptions = {
   preserveState?: boolean;
   replace?: boolean;
   viewTransition?: boolean;
-  /** React navigation completion: page data readiness or UI commit (default). */
+  /** When the visit's promise resolves: page data readiness or UI commit (default). */
   resolveOn?: 'data' | 'commit';
-  /** @internal Used by React Actions to avoid waiting for a commit blocked by the action itself. */
+  /**
+   * @internal Used by React Actions to avoid waiting for a commit blocked by the action itself.
+   * Resolves like `resolveOn: 'data'`; an aborted GET rejects instead of resolving `undefined`.
+   */
   _resolveOnShell?: boolean;
-  /** @internal Used by popstate handler to pass saved scroll position */
-  _scrollPosition?: { x: number; y: number } | null;
-  /** @internal Used by popstate handler to avoid writing history while traversing */
-  _popstate?: boolean;
   /** @internal Used by router.refresh() to refetch the current URL even when it has a hash */
   _refresh?: boolean;
   /** @internal Used by actions: the page query they added to the URL, which redirects leave out */
   _preservedQuery?: string;
 };
 
+/**
+ * What the engine knows about the browser navigation a visit belongs to. The caller's
+ * wishes stay in `VisitOptions`; these facts come from the navigate event.
+ */
+type NavigationContext = {
+  /**
+   * `direct`: the engine renders first and then publishes the entry itself.
+   * `precommit`: the browser commits the entry once the page has loaded.
+   * `traverse`: the browser has already moved to the entry.
+   */
+  kind: 'direct' | 'precommit' | 'traverse';
+  /** The browser owns this visit’s URL and cancellation. */
+  signal?: AbortSignal;
+  /** Key of the visit's entry. A precommit visit learns it when the browser commits. */
+  entryKey?: string;
+  /** Saved position of the destination entry. */
+  scrollPosition?: { x: number; y: number } | null;
+  /** The view transition override of the anchor that started this visit. */
+  linkViewTransition?: boolean;
+  /** The browser has already animated this navigation, as a swipe gesture does. */
+  visualTransitionDone?: boolean;
+};
+
 export type PrefetchOptions = {
-  method?: string;
   cacheFor?: CacheForInput;
 };
 
@@ -115,17 +164,55 @@ export type PageNavigationResource = {
   url: string;
   fetchUrl: string;
   hash: string;
-  /** Destination after redirects, including its query and hash. */
-  readonly resolvedUrl?: string;
   method: string;
   options: VisitOptions;
-  immediate: boolean;
+  /**
+   * Whether to render this visit in a view transition. The engine decides once per
+   * visit; adapters only run the transition where they know the page has rendered.
+   */
+  viewTransition: boolean;
   shell: Promise<PageNavigationResult | undefined>;
+  /** Destination after redirects, including its query and hash. */
+  destination(): string;
   abort(): void;
-  /** Resolves false when a newer visit has already set the URL, so nothing was committed. */
+  /** Resolves false when this visit no longer owns the navigation. */
   commit(): Promise<boolean>;
   dispose(): void;
 };
+
+/**
+ * An adapter renders the visit and reports its commit: the page data once the page and its
+ * URL have committed, `undefined` when the visit ended without a page, or the error. An
+ * aborted visit rejects with its AbortError. The engine settles the caller's promise.
+ */
+type ApplyVisit = (resource: PageNavigationResource) => Promise<PageData | undefined>;
+type BrowserVisit = {
+  options: VisitOptions;
+  apply: ApplyVisit;
+  /** Resolves the promise of a visit that resolves on its data. */
+  dataReady?(pageData: PageData): void;
+};
+
+/** Whether the visit's promise resolves when its page data is ready, before the commit. */
+function resolvesOnData(options: VisitOptions): boolean {
+  return options.resolveOn === 'data' || !!options._resolveOnShell;
+}
+
+/**
+ * The promise of a visit that resolves on its data. `ready` resolves it with the page data;
+ * a visit that ends before its data is ready settles it with its outcome instead.
+ */
+function dataCompletion(outcome: Promise<PageData | undefined>): {
+  promise: Promise<PageData | undefined>;
+  ready(pageData: PageData): void;
+} {
+  let ready!: (pageData: PageData) => void;
+  const promise = new Promise<PageData | undefined>((resolve, reject) => {
+    ready = resolve;
+    outcome.then(resolve, reject);
+  });
+  return { promise, ready };
+}
 
 export type PageNavigationEngine = {
   _hoverDelay: number;
@@ -134,127 +221,19 @@ export type PageNavigationEngine = {
   initialComponent: unknown;
   initialLayouts: Array<unknown>;
   prepareVisit(url: string, options?: VisitOptions): PageNavigationResource;
+  visit(url: string, options: VisitOptions, apply: ApplyVisit): Promise<PageData | undefined>;
+  setBrowserVisitHandler(handler: ApplyVisit | null): void;
+  /** The handler runs when the browser moves to another fragment of the rendered page. */
+  setLocationHandler(handler: (() => void) | null): void;
+  /** Called after a renderer commit identifies the resources still in its tree. */
+  releaseRetiredResources(retainedIds: ReadonlySet<number>): void;
   prefetch(url: string, options?: PrefetchOptions): Promise<unknown>;
-  flush(url: string, method?: string): void;
+  flush(url: string): void;
   flushAll(): void;
-  setPopStateHandler(handler: (url: string, options: VisitOptions) => void): void;
   start(): void;
   /** Called after the adapter commits the initial page DOM. */
   commitInitialRender(): void;
 };
-
-const PAGE_DATA_SCRIPT_ID = '__VOID_PAGE_DATA__';
-const STATIC_PAGE_DATA_PREFIX = '/_void/pages';
-
-export function isFile(value: unknown): boolean {
-  return (
-    (typeof File !== 'undefined' && value instanceof File) ||
-    value instanceof Blob ||
-    (typeof FileList !== 'undefined' && value instanceof FileList && value.length > 0)
-  );
-}
-
-export function hasFiles(data: unknown): boolean {
-  return (
-    isFile(data) ||
-    (typeof data === 'object' && data !== null && Object.values(data).some(hasFiles))
-  );
-}
-
-export function objectToFormData(
-  source: Record<string, unknown>,
-  form?: FormData,
-  parentKey?: string,
-): FormData {
-  form = form || new FormData();
-  for (const key in source) {
-    if (!Object.prototype.hasOwnProperty.call(source, key)) {
-      continue;
-    }
-    const composed = parentKey ? parentKey + '[' + key + ']' : key;
-    const value = source[key];
-    if (value instanceof File) {
-      form.append(composed, value, value.name);
-    } else if (value instanceof Blob) {
-      form.append(composed, value);
-    } else if (typeof FileList !== 'undefined' && value instanceof FileList) {
-      for (let i = 0; i < value.length; i++) {
-        form.append(composed + '[]', value[i], value[i].name);
-      }
-    } else if (Array.isArray(value)) {
-      for (let i = 0; i < value.length; i++) {
-        objectToFormData({ [i]: value[i] }, form, composed);
-      }
-    } else if (value instanceof Date) {
-      form.append(composed, value.toISOString());
-    } else if (typeof value === 'boolean') {
-      form.append(composed, value ? '1' : '0');
-    } else if (typeof value === 'string') {
-      form.append(composed, value);
-    } else if (typeof value === 'number') {
-      form.append(composed, String(value));
-    } else if (value === null || value === undefined) {
-      form.append(composed, '');
-    } else {
-      objectToFormData(value as Record<string, unknown>, form, composed);
-    }
-  }
-  return form;
-}
-
-function clonePageData(pageData: PageData): PageData {
-  // structuredClone does not preserve all supported values, such as URL.
-  return deserializePageData<PageData>(serializePageData(pageData));
-}
-
-function readInitialPageData(): PageData {
-  const scriptEl = document.getElementById(PAGE_DATA_SCRIPT_ID);
-  if (scriptEl?.textContent) {
-    return deserializePageData<PageData>(scriptEl.textContent);
-  }
-
-  throw new Error('pages: Missing initial page payload.');
-}
-
-function parsePageDataFromHtml(html: string): PageData | null {
-  const doc = new DOMParser().parseFromString(html, 'text/html');
-  const scriptEl = doc.getElementById(PAGE_DATA_SCRIPT_ID);
-  if (!scriptEl?.textContent) {
-    return null;
-  }
-  try {
-    return deserializePageData<PageData>(scriptEl.textContent);
-  } catch {
-    return null;
-  }
-}
-
-function abortError(): DOMException {
-  return new DOMException('Navigation aborted', 'AbortError');
-}
-
-function abortSignalPromise(signal: AbortSignal): Promise<never> {
-  if (signal.aborted) {
-    return Promise.reject(abortError());
-  }
-  return new Promise((_resolve, reject) => {
-    signal.addEventListener('abort', () => reject(abortError()), { once: true });
-  });
-}
-
-async function fetchPageResponse(
-  fetchUrl: string,
-  init: PagesFetchOptions,
-): Promise<PagesFetchResult | null> {
-  try {
-    return await fetchPages(fetchUrl, init);
-  } catch (error) {
-    if (init.signal?.aborted || isAbortError(error)) {
-      throw abortError();
-    }
-    return null;
-  }
-}
 
 export async function createPageNavigationEngine(
   config: PageNavigationEngineConfig,
@@ -275,398 +254,234 @@ export async function createPageNavigationEngine(
   const matchRoute = (url: string) =>
     config.matchRoute(decodePagePath(new URL(url, 'http://x').pathname));
 
-  const hasBoundaries = Object.keys(config.boundaryManifest?.plans ?? {}).length > 0;
+  const hasBoundaries = hasPageBoundaries(config.boundaryManifest);
   const _prefetchCache = new PrefetchCache();
-  const uncachedPayloads = new WeakSet<object>();
   let _nextNavigationId = 0;
-  // The newest visit whose URL is in the address bar: the last commit, or a back/forward
-  // visit, which the browser has already moved to. An older visit must not commit over it.
-  let _urlNavigationId = 0;
+  /** The visit whose loader started a document navigation. */
+  let documentVisitId: number | undefined;
   let _pendingResource: PageNavigationResource | null = null;
   let _committedResource: PageNavigationResource | null = null;
   let _committedDeferredRegistry: DeferredRegistry | null = null;
   let _htmlDeferredRegistry: DeferredRegistry | null = null;
   let _currentFetchUrl = window.location.pathname + window.location.search;
-  let popStateHandler: ((url: string, options: VisitOptions) => void) | null = null;
+  let browserVisitHandler: ApplyVisit | null = null;
+  let locationHandler: (() => void) | null = null;
+  const browserVisits = new WeakSet<BrowserVisit>();
+  const renderedPageNavigation = Symbol('void:rendered-page-navigation');
+  let started = false;
+  const exposedResources = new Set<PageNavigationResource>();
+  const retiredResources = new Set<PageNavigationResource>();
+
+  /**
+   * The one place that decides whether a visit uses a view transition: the caller's
+   * option, then the link's attribute, then the app default. A navigation the browser
+   * has already animated gets none: a second animation would replay it.
+   */
+  function resolveViewTransition(options: VisitOptions, context: NavigationContext): boolean {
+    if (context.visualTransitionDone) {
+      return false;
+    }
+    return options.viewTransition ?? context.linkViewTransition ?? config.viewTransitions;
+  }
+
+  // Keyed by the resource and by each copy handed to an adapter.
+  const navigationContexts = new WeakMap<PageNavigationResource, NavigationContext>();
+  const directNavigation: NavigationContext = { kind: 'direct' };
+  const contextOf = (resource: PageNavigationResource): NavigationContext =>
+    navigationContexts.get(resource) ?? directNavigation;
+
+  function abortPendingResource(resource: PageNavigationResource): void {
+    if (_pendingResource === resource) {
+      _pendingResource = null;
+      supersedeResource(resource);
+    }
+  }
+
+  function supersedeResource(resource: PageNavigationResource): void {
+    if (exposedResources.delete(resource)) {
+      // An adapter can still render this payload while its successor is preparing.
+      retiredResources.add(resource);
+    } else {
+      resource.abort();
+    }
+  }
+
+  function exposeResource(
+    resource: PageNavigationResource,
+    shell = resource.shell,
+    options = resource.options,
+  ): PageNavigationResource {
+    const context = contextOf(resource);
+    const exposed = {
+      ...resource,
+      options,
+      shell: shell.then((result) => {
+        context.signal?.throwIfAborted();
+        if (result && _pendingResource === resource) {
+          exposedResources.add(resource);
+        }
+        return result;
+      }),
+    };
+    navigationContexts.set(exposed, context);
+    return exposed;
+  }
   let initialScrollPosition: { x: number; y: number } | null = null;
-  const initialUrl = window.location.pathname + window.location.search + window.location.hash;
-  const scrollRestoration = createScrollRestoration();
+  const initialEntryKey = window.navigation.currentEntry?.key;
+  const entries = createEntryTracker();
+  const scrollRestoration = createScrollRestoration(entries.renderedKey);
 
-  async function resolveComponent(id: string): Promise<unknown> {
-    const loader = components[id];
-    if (!loader) {
-      throw new Error(`pages: Unknown page component '${id}'.`);
-    }
-    return (await loader()).default;
-  }
-
-  async function resolveLayouts(componentId: string): Promise<Array<unknown>> {
-    const ids = layoutTree[componentId] || [];
-    return Promise.all(ids.map(async (id: string) => (await components[id]()).default));
-  }
-
-  async function recoverImportFailure(
-    page: PageData,
-    error: unknown,
-  ): Promise<PageNavigationResult> {
-    for (const boundary of pageBoundarySlots(config.boundaryManifest, page.component, components)) {
-      const pageData: PageData = {
-        ...page,
-        component: boundary.id,
-        props: { error: clientPageError(error, config.dev) },
-        deferred: undefined,
-        deferredKeys: undefined,
-        deferredErrors: undefined,
-        errors: null,
-      };
-      try {
-        const [component, layouts] = await Promise.all([
-          resolveComponent(boundary.id),
-          resolveLayouts(boundary.id),
-        ]);
-        return { pageData, component, layouts };
-      } catch {
-        /* A failed fallback import or layout tries its parent. */
-      }
-    }
-    throw error;
-  }
-
-  function getStaticPageDataUrl(url: string): string {
-    const { pathname } = new URL(url || '/', window.location.origin);
-    const filePath = pathname === '/' ? 'index' : pathname.replace(/^\/+/, '');
-    return `${STATIC_PAGE_DATA_PREFIX}/${filePath}${pathname !== '/' && pathname.endsWith('/') ? 'index' : ''}.json`;
-  }
-
-  function isUsablePageData(pageData: unknown, matchedId: string): pageData is PageData {
-    return (
-      typeof pageData === 'object' &&
-      pageData !== null &&
-      'component' in pageData &&
-      typeof pageData.component === 'string' &&
-      'props' in pageData &&
-      typeof pageData.props === 'object' &&
-      pageData.props !== null &&
-      pageData.component === matchedId &&
-      !routeMeta[pageData.component]?.island &&
-      Boolean(components[pageData.component])
-    );
-  }
-
-  class DeferredRegistry {
-    private active = true;
-    private keyRefs: Record<string, unknown> = {};
-    private props: Record<string, unknown> = {};
-    private groups: Record<string, Array<string>> = {};
-    private preservedSource: DeferredRegistry | null = null;
-    private preservedKeys: Set<string> | null = null;
-
-    /** Create a deferred ref per key; `resolved` payloads already carry the values inline. */
-    setup(pageData: PageData, resolved = false): void {
-      this.props = pageData.props;
-      this.keyRefs = {};
-      this.groups = {};
-
-      if (!pageData.deferredKeys) {
-        return;
-      }
-
-      for (const [key, group] of Object.entries(pageData.deferredKeys) as Array<[string, string]>) {
-        let value = adapter.createDeferred();
-        if (resolved) {
-          const error = pageData.deferredErrors?.[group];
-          value =
-            error === undefined
-              ? adapter.resolveDeferred(value, pageData.props[key])
-              : adapter.rejectDeferred(value, error);
-        }
-        this.keyRefs[key] = value;
-        this.props[key] = value;
-        (this.groups[group] ??= []).push(key);
-      }
-    }
-
-    preserveValuesFrom(source: DeferredRegistry | null, pageData: PageData): void {
-      if (!source) {
-        return;
-      }
-      const keys = source.applyPreservedValues(pageData);
-      if (keys) {
-        this.preservedSource = source;
-        this.preservedKeys = keys;
-      }
-    }
-
-    commitPreservedValues(
-      source: DeferredRegistry | null,
-      pageData: PageData,
-    ): DeferredRegistry | null {
-      if (!this.preservedSource || this.preservedSource !== source || !this.preservedKeys) {
-        return null;
-      }
-      this.preservedSource.retainOnly(this.preservedKeys, pageData.props);
-      return this.preservedSource;
-    }
-
-    private applyPreservedValues(pageData: PageData): Set<string> | null {
-      let keys: Set<string> | null = null;
-      for (const key of Object.keys(this.keyRefs)) {
-        if (pageData.props[key] === null && this.props[key] !== undefined) {
-          pageData.props[key] = this.props[key];
-          (keys ??= new Set()).add(key);
-        }
-      }
-      return keys;
-    }
-
-    resolve(group: string, data: unknown, error: unknown): void {
-      if (!this.active) {
-        return;
-      }
-
-      if (data !== undefined) {
-        this.resolveGroup(group, data);
-      } else if (error !== undefined) {
-        this.rejectGroup(group, typeof error === 'string' ? error : String(error));
-      }
-
-      adapter.onDeferredUpdate?.(this.props);
-    }
-
-    rejectPending(error: string, notify = true): void {
-      if (!this.active) {
-        return;
-      }
-
-      for (const [key, ref] of Object.entries(this.keyRefs)) {
-        if (adapter.isLoading(ref)) {
-          const updated = adapter.rejectDeferred(ref, error);
-          this.keyRefs[key] = updated;
-          this.props[key] = updated;
-        }
-      }
-      if (notify) {
-        adapter.onDeferredUpdate?.(this.props);
-      }
-    }
-
-    dispose(): void {
-      if (!this.active) {
-        return;
-      }
-      this.rejectPending('Navigation disposed before deferred props resolved', false);
-      this.active = false;
-    }
-
-    private retainOnly(keys: Set<string>, props: Record<string, unknown>): void {
-      const keyRefs: Record<string, unknown> = {};
-      for (const [key, ref] of Object.entries(this.keyRefs)) {
-        if (keys.has(key)) {
-          keyRefs[key] = ref;
-          props[key] = this.props[key];
-        } else if (adapter.isLoading(ref)) {
-          adapter.rejectDeferred(ref, 'Navigation disposed before deferred props resolved');
-        }
-      }
-      // Groups keep every key so a group resolves with its original shape.
-      // Keys dropped from keyRefs are skipped when the group settles.
-      this.props = props;
-      this.keyRefs = keyRefs;
-      adapter.onDeferredUpdate?.(this.props);
-    }
-
-    /** A one-key group takes the raw value; a larger group takes each key from the object. */
-    private resolveGroup(group: string, data: unknown): void {
-      const keys = this.groups[group] ?? (this.keyRefs[group] ? [group] : []);
-      if (keys.length === 1) {
-        this.resolveKey(keys[0]!, data);
-        return;
-      }
-      const values =
-        typeof data === 'object' && data !== null ? (data as Record<string, unknown>) : {};
-      for (const key of keys) {
-        this.resolveKey(key, values[key]);
-      }
-    }
-
-    private resolveKey(key: string, value: unknown): void {
-      const ref = this.keyRefs[key];
-      if (!ref || !adapter.isLoading(ref)) {
-        return;
-      }
-      const updated = adapter.resolveDeferred(ref, value);
-      this.keyRefs[key] = updated;
-      this.props[key] = updated;
-    }
-
-    private rejectGroup(group: string, error: string): void {
-      const keys = this.groups[group] ?? Object.keys(this.keyRefs);
-      for (const key of keys) {
-        const ref = this.keyRefs[key];
-        if (ref && adapter.isLoading(ref)) {
-          const updated = adapter.rejectDeferred(ref, error);
-          this.keyRefs[key] = updated;
-          this.props[key] = updated;
-        }
-      }
-    }
-  }
+  const { resolveComponent, resolveLayouts, recoverImportFailure } =
+    createPageComponentLoader(config);
 
   const _resourceDeferredRegistries = new WeakMap<PageNavigationResource, DeferredRegistry>();
   const _preservedDeferredResources = new WeakMap<DeferredRegistry, PageNavigationResource>();
 
-  /** Route id for a non-island page that static page data can serve, or null. */
-  function matchStaticPageId(fetchUrl: string): string | null {
-    const matchedId = matchRoute(fetchUrl || window.location.pathname + window.location.search);
-    return matchedId &&
-      !routeMeta[matchedId]?.island &&
-      routeMeta[matchedId]?.prerender !== false &&
-      components[matchedId]
-      ? matchedId
-      : null;
+  const staticPageData = createStaticPageDataLoader({ components, routeMeta, matchRoute });
+  const { fetchPrefetchPageData, isUncachedPayload, prefetch } = createPrefetchRequests({
+    cache: _prefetchCache,
+    components,
+    layoutTree,
+    routeMeta,
+    matchRoute,
+    staticPageData,
+    staticPageDataEnabled: STATIC_PAGE_DATA_ENABLED,
+    staticPageDataFastPath: STATIC_PAGE_DATA_FAST_PATH,
+    prefetchDefaultCacheFor: PREFETCH_DEFAULT_CACHE_FOR,
+  });
+  const { loadStaticPageDataFile, loadStaticPageData } = staticPageData;
+
+  installHtmlDeferredHandlers(() => _htmlDeferredRegistry);
+
+  /**
+   * The loader hands its visit to the document, and the shell resolves without a page.
+   * A document navigation that starts here is recorded, so that the visit is not also
+   * recovered as an entry that never rendered.
+   */
+  function loadDocument(id: number, url: string, context: NavigationContext): undefined {
+    // A traversal has moved the browser to the entry already, so the document to load
+    // is that entry: recovery reloads it. Assigning its URL here would start a second
+    // load, move only to a fragment, or put a redirect's URL over the entries after it.
+    if (context.kind !== 'traverse') {
+      documentVisitId = id;
+      window.location.href = url;
+    }
+    return undefined;
   }
 
-  async function loadStaticPageDataFile(
-    fetchUrl: string,
-    signal?: AbortSignal,
-  ): Promise<StaticPageDataResult | null> {
-    const matchedId = matchStaticPageId(fetchUrl);
-    if (!matchedId) {
-      return null;
+  /**
+   * Reload when the latest visit ends and the current entry's page was never rendered.
+   * Another visit's failure, such as a rejected action, leaves the entry to the
+   * visit that is rendering it. A visit the browser has cancelled recovers nothing:
+   * the navigation that replaced it owns the entry.
+   */
+  function recoverUnrenderedEntry(resource: PageNavigationResource): void {
+    const { id } = resource;
+    if (
+      id !== documentVisitId &&
+      !contextOf(resource).signal?.aborted &&
+      id === _nextNavigationId &&
+      entries.isUnrendered(id)
+    ) {
+      entries.settled();
+      window.location.reload();
     }
+  }
 
+  /**
+   * Runs the adapter for the resource it was handed and returns what a commit-mode visit
+   * settles with. An aborted GET resolves `undefined`, as a visit with no page does.
+   */
+  async function applyBrowserVisit(
+    apply: ApplyVisit,
+    resource: PageNavigationResource,
+  ): Promise<PageData | undefined> {
+    let result: PageData | undefined;
     try {
-      const pageDataResponse = await fetch(getStaticPageDataUrl(fetchUrl), {
-        headers: { Accept: 'application/json' },
-        signal,
-      });
-      if (pageDataResponse.ok) {
-        const pageData = decodePageData<PageData>(await pageDataResponse.json());
-        if (isUsablePageData(pageData, matchedId)) {
-          return { pageData, resolvedDeferred: true };
-        }
-      }
+      result = await apply(resource);
     } catch (error) {
-      if (signal?.aborted || isAbortError(error)) {
-        throw abortError();
+      if (
+        !isAbortError(error) ||
+        !abortedVisitResolvesUndefined(resource.method, resource.options)
+      ) {
+        recoverUnrenderedEntry(resource);
+        if (_pendingResource?.id === resource.id) {
+          abortPendingResource(_pendingResource);
+        }
+        throw error;
       }
     }
-
-    return null;
+    if (!result) {
+      recoverUnrenderedEntry(resource);
+    }
+    return result;
   }
 
-  async function loadStaticPageData(
-    fetchUrl: string,
-    response: Response,
-    signal?: AbortSignal,
-    verifyPageResponse = false,
-  ): Promise<StaticPageDataResult | null> {
-    if (!response.ok) {
-      return null;
-    }
-
-    const matchedId = matchStaticPageId(fetchUrl);
-    if (!matchedId) {
-      return null;
-    }
-
-    const contentType = response.headers.get('content-type') || '';
-    if (contentType && !contentType.includes('text/html')) {
-      return null;
-    }
-
-    if (verifyPageResponse) {
-      const pageData = parsePageDataFromHtml(await response.text());
-      if (!isUsablePageData(pageData, matchedId)) {
-        return null;
-      }
-      if (!pageData.deferredKeys) {
-        return { pageData, resolvedDeferred: false };
-      }
-      return loadStaticPageDataFile(fetchUrl, signal);
-    }
-
-    const filePageData = await loadStaticPageDataFile(fetchUrl, signal);
-    if (filePageData) {
-      return filePageData;
-    }
-
-    const pageData = parsePageDataFromHtml(await response.text());
-    if (!isUsablePageData(pageData, matchedId) || pageData.deferredKeys) {
-      return null;
-    }
-    return { pageData, resolvedDeferred: false };
-  }
-
-  /** Fetch page data for the prefetch cache; null means "fall back to a full page load". */
-  function fetchPrefetchPageData(url: string): Promise<unknown> {
-    const headers = {
-      'X-VoidPages': 'true',
-      'X-VoidPages-Version': PAGES_PROTOCOL_VERSION,
-      Accept: 'application/json',
-      Purpose: 'prefetch',
-    };
-    return (
-      STATIC_PAGE_DATA_ENABLED && STATIC_PAGE_DATA_FAST_PATH
-        ? loadStaticPageDataFile(url).then((result) => result?.pageData)
-        : Promise.resolve(undefined)
-    ).then((pageData) => {
-      if (pageData !== undefined) {
-        return pageData;
-      }
-      return fetchPageResponse(url, { method: 'GET', headers }).then(async (result) => {
-        const r = result?.response;
-        if (!r || result?.redirectedTo) {
-          return null;
-        }
-        if (!r.headers.get('X-VoidPages')) {
-          return (
-            (await loadStaticPageData(url, r, undefined, !STATIC_PAGE_DATA_FAST_PATH))?.pageData ??
-            null
-          );
-        }
-        const data = decodePageData<PageData>(await r.json());
-        if (!r.ok || /no-store/i.test(r.headers.get('Cache-Control') ?? '')) {
-          uncachedPayloads.add(data);
-        }
-        return data;
-      });
+  /**
+   * Starts a browser navigation. A caller awaits one of the two promises: a rejection
+   * of the other is not reported as unhandled, and a promise the browser did not
+   * return rejects.
+   */
+  function navigateEntry(
+    url: string,
+    history: 'push' | 'replace' | 'auto',
+    info: unknown,
+  ): Record<'committed' | 'finished', Promise<NavigationHistoryEntry>> {
+    const navigation = window.navigation.navigate(url, {
+      history,
+      ...(history === 'replace' && { state: window.navigation.currentEntry?.getState() }),
+      info,
     });
+    const guard = (promise: Promise<NavigationHistoryEntry> | undefined) => {
+      const guarded =
+        promise ?? Promise.reject(new Error('Void Router: browser did not start the navigation.'));
+      void guarded.catch(() => {});
+      return guarded;
+    };
+    return { committed: guard(navigation.committed), finished: guard(navigation.finished) };
   }
 
-  function restoreScroll(scrollPosition: VisitOptions['_scrollPosition'], hash: string): void {
-    if (scrollPosition) {
-      window.scrollTo(scrollPosition.x, scrollPosition.y);
-      return;
-    }
-    if (hash) {
-      const el = document.getElementById(hash.slice(1));
-      if (el) {
-        el.scrollIntoView();
-        return;
-      }
-    }
-    window.scrollTo(0, 0);
+  /** Whether the URL is the rendered page's, apart from its fragment. */
+  function isRenderedPageUrl(url: URL): boolean {
+    return isSameOrigin(url, documentBaseUrl()) && url.pathname + url.search === _currentFetchUrl;
   }
 
-  const deferredWindow = window as DeferredWindow;
-  deferredWindow.__resolveDeferred = (group: string, data: unknown, serialized?: boolean) =>
-    _htmlDeferredRegistry?.resolve(group, serialized ? decodePageData(data) : data, undefined);
-  deferredWindow.__rejectDeferred = (group: string, error: unknown) =>
-    _htmlDeferredRegistry?.resolve(group, undefined, error);
+  async function publishEntry(url: string, replace: boolean): Promise<string | undefined> {
+    const { committed } = navigateEntry(url, replace ? 'replace' : 'push', renderedPageNavigation);
+    const { key } = await committed;
+    // The entry is current, and its visit can still lose the commit to a navigation
+    // that a currententrychange listener started. The visit clears this when it commits.
+    entries.committed(key);
+    return key;
+  }
 
-  function commitHashNavigation(
-    effectiveFetchUrl: string,
-    hash: string,
-    options: VisitOptions,
-    writeHistory: boolean,
-  ): void {
-    if (writeHistory) {
-      scrollRestoration.writeHistory(effectiveFetchUrl + hash, !!options.replace);
+  /**
+   * An action runs on the page on screen. A visit it supersedes may already have moved
+   * the address to an entry whose page will now never render. Go back to the entry of
+   * the rendered page, so the action updates that page under its own URL and a failed
+   * action leaves the address and the page in agreement. Returns null when the current
+   * entry is the rendered one.
+   */
+  function returnToRenderedEntry(): Promise<void> | null {
+    const current = window.navigation.currentEntry;
+    if (!current || !entries.isUnrendered()) {
+      return null;
     }
-    _currentFetchUrl = effectiveFetchUrl;
-    scrollRestoration.commit();
-    restoreScroll(options._scrollPosition, hash);
+    const key = entries.renderedKey();
+    let returned: Promise<unknown>;
+    if (key && key !== current.key && window.navigation.entries().some((e) => e.key === key)) {
+      const traversal = window.navigation.traverseTo(key, { info: renderedPageNavigation });
+      void traversal.finished?.catch(() => {});
+      returned = Promise.resolve(traversal.committed);
+    } else {
+      // The superseded visit replaced the rendered page's entry: give it back its URL.
+      returned = publishEntry(_currentFetchUrl, true);
+    }
+    return returned.then(
+      () => entries.settled(),
+      // A newer navigation took over; the action still runs.
+      () => {},
+    );
   }
 
   async function loadNavigationShell(
@@ -678,25 +493,21 @@ export async function createPageNavigationEngine(
     signal: AbortSignal,
     commitTarget: NavigationCommitTarget,
     deferredRegistry: DeferredRegistry,
+    context: NavigationContext,
   ): Promise<PageNavigationResult | undefined> {
     // Page data only comes from this origin. Other http(s) URLs get a full page
     // load. Capacitor's iOS WebView uses capacitor: for local pages.
     // Unsafe schemes (javascript:, data:, ...) must never reach location.href.
     // Check the scheme first: a blob: URL reports the origin that created it.
-    const target = new URL(url, window.location.origin);
-    if (
-      target.protocol !== 'http:' &&
-      target.protocol !== 'https:' &&
-      target.protocol !== 'capacitor:'
-    ) {
+    const target = new URL(url, documentBaseUrl());
+    if (!isPageUrlProtocol(target)) {
       throw new Error(`Void Router: refusing to navigate to a ${target.protocol} URL.`);
     }
-    if (!isSameOrigin(target, window.location.origin)) {
+    if (!isSameOrigin(target, documentBaseUrl())) {
       if (method !== 'GET') {
         throw new Error('Void Router: non-GET visits must target the current origin.');
       }
-      window.location.href = url;
-      return undefined;
+      return loadDocument(id, url, context);
     }
 
     if (method !== 'GET') {
@@ -735,38 +546,55 @@ export async function createPageNavigationEngine(
 
     let pageData: PageData | undefined;
     if (options._refresh) {
-      _prefetchCache.flush(fetchUrl, method);
+      _prefetchCache.flush(fetchUrl);
     }
-    const cacheEntry = method === 'GET' ? _prefetchCache.get(fetchUrl, method) : null;
-
+    let cacheEntry = method === 'GET' ? _prefetchCache.get(fetchUrl) : null;
     // Prefetch JSON waits for every deferred prop. An unfinished prefetch must
     // not hold up the streamed shell from an ordinary navigation request.
-    if (cacheEntry && !cacheEntry.pending) {
-      const cachedPageData = await cacheEntry.response;
-      _prefetchCache.consume(fetchUrl, method);
+    if (cacheEntry?.pending) {
+      cacheEntry = null;
+    }
+    let cachedPageData: unknown;
+    if (cacheEntry) {
+      try {
+        cachedPageData = await Promise.race([cacheEntry.response, abortSignalPromise(signal)]);
+      } catch {
+        signal.throwIfAborted();
+        // A speculative request may fail while the user is already visiting.
+        // Retry the regular GET path rather than failing the navigation.
+        if (_prefetchCache.get(fetchUrl) === cacheEntry) {
+          _prefetchCache.flush(fetchUrl);
+        }
+        cacheEntry = null;
+      }
+    }
+
+    if (cacheEntry) {
+      signal.throwIfAborted();
+      _prefetchCache.consume(fetchUrl);
       if (cachedPageData === null) {
-        window.location.href = url;
-        return undefined;
+        return loadDocument(id, url, context);
+      }
+      if (isPrefetchRedirect(cachedPageData)) {
+        const target = new URL(cachedPageData.destination, documentBaseUrl());
+        commitTarget.fetchUrl = target.pathname + target.search;
+        commitTarget.hash = target.hash;
       }
       // Deferred initialization and adapters mutate props; retain the cached wire payload.
-      pageData = clonePageData(cachedPageData as PageData);
+      pageData = clonePageData(unwrapPrefetchedPageData(cachedPageData) as PageData);
       deferredRegistry.setup(pageData, true);
-      if (!_prefetchCache.isFresh(cacheEntry)) {
+      if (!cacheEntry.singleUse && !_prefetchCache.isFresh(cacheEntry)) {
+        const staleEntry = cacheEntry;
         void fetchPrefetchPageData(fetchUrl)
           .then((data) => {
             if (
               data &&
               typeof data === 'object' &&
-              !uncachedPayloads.has(data) &&
-              _prefetchCache.get(fetchUrl, method) === cacheEntry
+              !isUncachedPayload(data) &&
+              _prefetchCache.get(fetchUrl) === staleEntry
             ) {
-              _prefetchCache.flush(fetchUrl, method);
-              _prefetchCache.set(
-                fetchUrl,
-                method,
-                Promise.resolve(data),
-                PREFETCH_DEFAULT_CACHE_FOR,
-              );
+              _prefetchCache.flush(fetchUrl);
+              _prefetchCache.set(fetchUrl, Promise.resolve(data), PREFETCH_DEFAULT_CACHE_FOR);
             }
           })
           .catch(() => {});
@@ -778,7 +606,6 @@ export async function createPageNavigationEngine(
           pageData = staticPageData.pageData;
           _prefetchCache.set(
             fetchUrl,
-            method,
             Promise.resolve(clonePageData(pageData)),
             PREFETCH_DEFAULT_CACHE_FOR,
           );
@@ -794,16 +621,15 @@ export async function createPageNavigationEngine(
           : null;
       const response = fetched?.response ?? null;
 
+      signal.throwIfAborted();
       if (pageData === undefined && !response) {
-        window.location.href = url;
-        return undefined;
+        return loadDocument(id, url, context);
       }
 
       if (fetched?.redirectedTo) {
-        const redirectUrl = new URL(fetched.redirectedTo, window.location.origin);
-        if (!isSameOrigin(redirectUrl, window.location.origin)) {
-          window.location.href = fetched.redirectedTo;
-          return undefined;
+        const redirectUrl = new URL(fetched.redirectedTo, documentBaseUrl());
+        if (!isSameOrigin(redirectUrl, documentBaseUrl())) {
+          return loadDocument(id, fetched.redirectedTo, context);
         }
         // The fetch transport followed the redirect: treat the final response as the GET
         // result for the destination instead of fetching it a second time.
@@ -827,16 +653,15 @@ export async function createPageNavigationEngine(
             signal,
             !STATIC_PAGE_DATA_FAST_PATH,
           );
+          signal.throwIfAborted();
           if (staticPageData) {
             pageData = staticPageData.pageData;
             deferredRegistry.setup(pageData, staticPageData.resolvedDeferred);
           } else {
-            window.location.href = url;
-            return undefined;
+            return loadDocument(id, url, context);
           }
         } else {
-          window.location.href = url;
-          return undefined;
+          return loadDocument(id, url, context);
         }
       }
 
@@ -845,62 +670,7 @@ export async function createPageNavigationEngine(
       if (pageData !== undefined) {
         // Static page-data fallback already loaded the page object.
       } else if (contentType.includes('application/x-ndjson')) {
-        const reader = response!.body!.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let firstLine = true;
-
-        const processLines = () => {
-          let newlineIdx;
-          while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
-            const line = buffer.slice(0, newlineIdx);
-            buffer = buffer.slice(newlineIdx + 1);
-            if (!line) {
-              continue;
-            }
-
-            if (firstLine) {
-              pageData = deserializePageData<PageData>(line);
-              deferredRegistry.setup(pageData);
-              firstLine = false;
-            } else {
-              const msg = deserializePageData<{
-                __deferred?: string;
-                data?: unknown;
-                error?: unknown;
-              }>(line);
-              if (msg.__deferred) {
-                deferredRegistry.resolve(msg.__deferred, msg.data, msg.error);
-              }
-            }
-          }
-        };
-
-        while (firstLine) {
-          const { done, value } = await reader.read();
-          if (done) {
-            break;
-          }
-          buffer += decoder.decode(value, { stream: true });
-          processLines();
-        }
-
-        (async () => {
-          try {
-            while (!signal.aborted) {
-              const { done, value } = await reader.read();
-              if (done) {
-                break;
-              }
-              buffer += decoder.decode(value, { stream: true });
-              processLines();
-            }
-          } catch (e: unknown) {
-            if (!(e instanceof Error) || e.name !== 'AbortError') {
-              deferredRegistry.rejectPending('Stream closed before resolution');
-            }
-          }
-        })();
+        pageData = await readPageDataStream(response!, signal, deferredRegistry);
       } else {
         pageData = decodePageData<PageData>(await response!.json());
         deferredRegistry.setup(pageData);
@@ -917,7 +687,6 @@ export async function createPageNavigationEngine(
       ) {
         _prefetchCache.set(
           fetchUrl,
-          method,
           Promise.resolve(clonePageData(pageData)),
           PREFETCH_DEFAULT_CACHE_FOR,
         );
@@ -936,8 +705,7 @@ export async function createPageNavigationEngine(
     // Reuse the preload only if the response selects the matched page; redirects
     // or rewrites may select another. Cancellation stops waiting for the imports.
     if (!components[pageData.component]) {
-      window.location.href = url;
-      return undefined;
+      return loadDocument(id, url, context);
     }
     let component: unknown;
     let layouts: Array<unknown>;
@@ -978,11 +746,15 @@ export async function createPageNavigationEngine(
   function makeCommit(
     commitTarget: NavigationCommitTarget,
     options: VisitOptions,
+    context: NavigationContext,
     shell: Promise<PageNavigationResult | undefined>,
     deferredRegistry: DeferredRegistry,
     resourceId: number,
+    signal: AbortSignal,
     getResource: () => PageNavigationResource,
   ): () => Promise<boolean> {
+    const ownsCommit = () =>
+      _pendingResource?.id === resourceId && !signal.aborted && !context.signal?.aborted;
     let committed = false;
     return async () => {
       if (committed) {
@@ -993,9 +765,8 @@ export async function createPageNavigationEngine(
       if (!result) {
         return false;
       }
-      // A newer visit committed while this one was being applied. Committing now would put
-      // back this page's URL, head, scroll and Deferred ownership over the newer page.
-      if (resourceId < _urlNavigationId) {
+      // Losing ownership does not imply that the renderer has released the payload.
+      if (!ownsCommit()) {
         return false;
       }
       // Mutations that update the current page keep scroll. A redirect's GET
@@ -1007,7 +778,8 @@ export async function createPageNavigationEngine(
       // Write history before anything else changes. Disposing the previous page and handing
       // over its Deferred values cannot be undone, so a failed write must find them untouched.
       // preserveState only controls component state; back/forward traversal already moved history.
-      if (!options._popstate) {
+      let entryKey = context.entryKey;
+      if (context.kind === 'direct') {
         const historyUrl = commitTarget.fetchUrl + commitTarget.hash;
         const resource = getResource();
         const currentDocumentUrl = window.location.pathname + window.location.search;
@@ -1015,19 +787,29 @@ export async function createPageNavigationEngine(
           !!options.replace ||
           (resource.method !== 'GET' && historyUrl === currentDocumentUrl + commitTarget.hash);
         try {
-          scrollRestoration.writeHistory(historyUrl, replaceHistory);
+          const visibleUrl = currentDocumentUrl + window.location.hash;
+          // An action updating the current page has no new destination to publish.
+          entryKey =
+            resource.method !== 'GET' && replaceHistory && historyUrl === visibleUrl
+              ? window.navigation.currentEntry?.key
+              : await publishEntry(historyUrl, replaceHistory);
+          if (!ownsCommit()) {
+            return false;
+          }
         } catch (error) {
           if (_pendingResource?.id === resourceId) {
             _pendingResource = null;
           }
+          // No later visit supersedes this one: release its payload here.
+          exposedResources.delete(resource);
           resource.dispose();
           throw error;
         }
       }
-      _urlNavigationId = resourceId;
-      if (_pendingResource?.id === resourceId) {
-        _pendingResource = null;
-      }
+      // The adapter has applied this page: it is the one on screen.
+      entries.rendered(entryKey);
+      // ownsCommit() just confirmed that this visit is the pending one.
+      _pendingResource = null;
       const previousResource = _committedResource;
       const previousDeferredRegistry = _committedDeferredRegistry;
       const preservedDeferredRegistry = deferredRegistry.commitPreservedValues(
@@ -1035,6 +817,14 @@ export async function createPageNavigationEngine(
         result.pageData,
       );
       _committedResource = getResource();
+      exposedResources.delete(_committedResource);
+      retiredResources.delete(_committedResource);
+      for (const retired of retiredResources) {
+        if (retired.id < resourceId) {
+          retired.dispose();
+          retiredResources.delete(retired);
+        }
+      }
       const previousResourceOwnsPreservedRegistry = Boolean(
         previousResource &&
         preservedDeferredRegistry &&
@@ -1070,11 +860,10 @@ export async function createPageNavigationEngine(
       }
       applyClientHead(result.pageData.head as HeadDescriptor | undefined);
       _currentFetchUrl = commitTarget.fetchUrl;
-      scrollRestoration.commit();
 
       requestAnimationFrame(() => {
-        if (!preserveScroll) {
-          restoreScroll(options._scrollPosition, commitTarget.hash);
+        if (!preserveScroll && resourceId === _nextNavigationId && !context.signal?.aborted) {
+          restoreScroll(context.scrollPosition, commitTarget.hash);
         }
       });
       return true;
@@ -1111,16 +900,117 @@ export async function createPageNavigationEngine(
   ) {
     _prefetchCache.set(
       _currentFetchUrl,
-      'GET',
       Promise.resolve(clonePageData(initialPageData)),
       PREFETCH_DEFAULT_CACHE_FOR,
     );
   }
 
-  const initialDeferredRegistry = new DeferredRegistry();
+  const initialDeferredRegistry = new DeferredRegistry(adapter);
   initialDeferredRegistry.setup(initialPageData);
   _committedDeferredRegistry = initialDeferredRegistry;
   _htmlDeferredRegistry = initialDeferredRegistry;
+
+  function isClientPage(url: URL): boolean {
+    if (!isSameOriginPageUrl(url)) {
+      return false;
+    }
+    const id = matchRoute(url.href);
+    return !!id && !!components[id] && !routeMeta[id]?.island;
+  }
+
+  /** Outside the route table: the server may rewrite or redirect this URL to a page. */
+  function isServerRoutedUrl(url: URL): boolean {
+    return isSameOriginPageUrl(url) && !matchRoute(url.href);
+  }
+
+  function prepareVisit(
+    url: string,
+    options: VisitOptions,
+    context: NavigationContext,
+  ): PageNavigationResource {
+    if (context.kind !== 'traverse') {
+      // Capture the departing page before an adapter replaces or shrinks its DOM.
+      scrollRestoration.save();
+    }
+    const hashIndex = url.indexOf('#');
+    const hash = hashIndex !== -1 ? url.slice(hashIndex) : '';
+    const fetchUrl = hashIndex !== -1 ? url.slice(0, hashIndex) : url;
+    const currentPath = window.location.pathname + window.location.search;
+    const effectiveFetchUrl = fetchUrl || currentPath;
+    const method = (options.method || 'GET').toUpperCase();
+    const id = ++_nextNavigationId;
+
+    if (_pendingResource) {
+      supersedeResource(_pendingResource);
+    }
+    _pendingResource = null;
+
+    if (context.kind === 'traverse') {
+      // The browser has already moved to this entry.
+      entries.committed(context.entryKey ?? window.navigation.currentEntry?.key, id);
+    }
+
+    const controller = new AbortController();
+    const deferredRegistry = new DeferredRegistry(adapter);
+    const commitTarget = { fetchUrl: effectiveFetchUrl, hash, method };
+    const shell = loadNavigationShell(
+      id,
+      url,
+      effectiveFetchUrl,
+      method,
+      options,
+      controller.signal,
+      commitTarget,
+      deferredRegistry,
+      context,
+    );
+
+    let commitResource: () => Promise<boolean> = async () => false;
+    const browserSignal = context.signal;
+    const abortPending = () => abortPendingResource(resource);
+    const stop = () => {
+      browserSignal?.removeEventListener('abort', abortPending);
+      controller.abort(abortError());
+      deferredRegistry.dispose();
+    };
+    const resource: PageNavigationResource = {
+      id,
+      url,
+      fetchUrl: effectiveFetchUrl,
+      hash,
+      method,
+      options,
+      viewTransition: resolveViewTransition(options, context),
+      shell,
+      destination: () => commitTarget.fetchUrl + commitTarget.hash,
+      abort: stop,
+      commit() {
+        return commitResource().finally(() =>
+          browserSignal?.removeEventListener('abort', abortPending),
+        );
+      },
+      dispose: stop,
+    };
+    _resourceDeferredRegistries.set(resource, deferredRegistry);
+    navigationContexts.set(resource, context);
+    commitResource = makeCommit(
+      commitTarget,
+      options,
+      context,
+      shell,
+      deferredRegistry,
+      id,
+      controller.signal,
+      () => resource,
+    );
+    _pendingResource = resource;
+    if (browserSignal?.aborted) {
+      abortPending();
+    } else {
+      browserSignal?.addEventListener('abort', abortPending, { once: true });
+    }
+    return resource;
+  }
 
   const engine: PageNavigationEngine = {
     _hoverDelay: PREFETCH_HOVER_DELAY,
@@ -1129,227 +1019,373 @@ export async function createPageNavigationEngine(
     initialComponent,
     initialLayouts,
 
-    prepareVisit(url, options = {}) {
-      if (!options._popstate) {
-        // Capture the departing page before an adapter replaces or shrinks its DOM.
-        scrollRestoration.save();
-      }
-      const hashIndex = url.indexOf('#');
-      const hash = hashIndex !== -1 ? url.slice(hashIndex) : '';
-      const fetchUrl = hashIndex !== -1 ? url.slice(0, hashIndex) : url;
-      const currentPath = window.location.pathname + window.location.search;
-      const effectiveFetchUrl = fetchUrl || currentPath;
-      const method = (options.method || 'GET').toUpperCase();
-      const id = ++_nextNavigationId;
-      const hashNavigationBaseUrl = options._popstate ? _currentFetchUrl : currentPath;
+    prepareVisit: (url, options = {}) => prepareVisit(url, options, directNavigation),
 
-      _pendingResource?.abort();
-      _pendingResource = null;
-
-      const isSamePageHashNavigation =
+    async visit(url, options, apply) {
+      const target = new URL(url, documentBaseUrl());
+      const method = (options.method ?? 'GET').toUpperCase();
+      const get = !options.data && method === 'GET';
+      if (
+        get &&
         !options._refresh &&
-        effectiveFetchUrl === hashNavigationBaseUrl &&
-        method === 'GET' &&
-        !options.data &&
-        Boolean(hash || options._popstate);
-
-      if (isSamePageHashNavigation) {
-        // A failed history write ends this visit like any other failed visit: through its shell.
-        let shell: Promise<undefined> = Promise.resolve(undefined);
-        try {
-          commitHashNavigation(effectiveFetchUrl, hash, options, !options._popstate);
-        } catch (error) {
-          shell = Promise.reject(error);
+        Boolean(target.hash) &&
+        isRenderedPageUrl(target) &&
+        target.pathname + target.search === window.location.pathname + window.location.search
+      ) {
+        // A fragment of the page on screen: the browser navigates and scrolls to it.
+        // Without `replace` it adds an entry, unless the URL is already the current one.
+        const request: BrowserVisit = { options, apply };
+        browserVisits.add(request);
+        await navigateEntry(target.href, options.replace ? 'replace' : 'auto', request).finished;
+        return undefined;
+      }
+      if (!browserVisitHandler || !get || !isClientPage(target)) {
+        const resource = engine.prepareVisit(url, options);
+        const returned = resource.method === 'GET' ? null : returnToRenderedEntry();
+        const exposed = returned
+          ? // The adapter reads the address when the action settles.
+            exposeResource(
+              resource,
+              Promise.all([resource.shell, returned]).then(([result]) => result),
+            )
+          : exposeResource(resource);
+        const committed = applyBrowserVisit(apply, exposed);
+        if (!resolvesOnData(options)) {
+          return committed;
         }
-        return {
-          id,
-          url,
-          fetchUrl: effectiveFetchUrl,
-          hash,
-          method,
-          options,
-          immediate: true,
-          shell,
-          abort() {},
-          // Same-page hash visits commit right away. They do not stop an older visit
-          // whose page is already on screen from committing its URL.
-          async commit() {
-            return true;
+        const completion = dataCompletion(committed);
+        exposed.shell.then(
+          (result) => {
+            // A visit that lost the navigation while it loaded settles as an aborted one.
+            if (result && _pendingResource === resource) {
+              completion.ready(result.pageData);
+            }
           },
-          dispose() {},
-        };
+          () => {},
+        );
+        return completion.promise;
       }
-
-      if (options._popstate) {
-        // The browser has already moved to this entry. A same-page hash entry is left out
-        // above: it renders nothing, so an older page on screen still commits its URL.
-        _urlNavigationId = id;
+      let result: PageData | undefined;
+      const request: BrowserVisit = {
+        options,
+        async apply(resource) {
+          result = await apply(resource);
+          return result;
+        },
+      };
+      browserVisits.add(request);
+      const finished = navigateEntry(
+        target.href,
+        options.replace ? 'replace' : 'push',
+        request,
+      ).finished.then(
+        () => result,
+        (error: unknown) => {
+          // Only GET visits reach the browser visit handler.
+          if (isAbortError(error) && abortedVisitResolvesUndefined(method, options)) {
+            return undefined;
+          }
+          throw error;
+        },
+      );
+      if (!resolvesOnData(options)) {
+        return finished;
       }
-
-      const controller = new AbortController();
-      const deferredRegistry = new DeferredRegistry();
-      const commitTarget = { fetchUrl: effectiveFetchUrl, hash, method };
-      const shell = loadNavigationShell(
-        id,
-        url,
-        effectiveFetchUrl,
-        method,
-        options,
-        controller.signal,
-        commitTarget,
-        deferredRegistry,
-      );
-
-      let commitResource: () => Promise<boolean> = async () => false;
-      const stop = () => {
-        controller.abort(abortError());
-        deferredRegistry.dispose();
-      };
-      const resource: PageNavigationResource = {
-        id,
-        url,
-        fetchUrl: effectiveFetchUrl,
-        hash,
-        get resolvedUrl() {
-          return commitTarget.fetchUrl + commitTarget.hash;
-        },
-        method,
-        options,
-        immediate: false,
-        shell,
-        abort: stop,
-        commit() {
-          return commitResource();
-        },
-        dispose: stop,
-      };
-      _resourceDeferredRegistries.set(resource, deferredRegistry);
-      commitResource = makeCommit(
-        commitTarget,
-        options,
-        shell,
-        deferredRegistry,
-        id,
-        () => resource,
-      );
-      _pendingResource = resource;
-      return resource;
+      // The precommit handler reports the page data once it has loaded.
+      const completion = dataCompletion(finished);
+      request.dataReady = completion.ready;
+      return completion.promise;
     },
 
-    prefetch(url, options = {}) {
-      const method = (options.method || 'GET').toUpperCase();
-      if (method !== 'GET') {
-        throw new Error('Void Router: prefetch() only supports GET requests.');
-      }
-
-      const id = matchRoute(url);
-      if (!id) {
-        return Promise.resolve(undefined);
-      }
-
-      if (routeMeta[id]?.island) {
-        if (!document.querySelector('link[rel="prefetch"][href="' + url + '"]')) {
-          const link = document.createElement('link');
-          link.rel = 'prefetch';
-          link.href = url;
-          link.as = 'document';
-          document.head.appendChild(link);
-        }
-        return Promise.resolve(undefined);
-      }
-
-      if (components[id]) {
-        components[id]();
-      }
-      const layoutIds = layoutTree[id] || [];
-      for (const lid of layoutIds) {
-        if (components[lid]) {
-          components[lid]();
+    releaseRetiredResources(retainedIds) {
+      for (const resource of retiredResources) {
+        if (!retainedIds.has(resource.id) && resource !== _pendingResource) {
+          retiredResources.delete(resource);
+          resource.dispose();
         }
       }
-
-      const hashIdx = url.indexOf('#');
-      const prefetchUrl = hashIdx !== -1 ? url.slice(0, hashIdx) : url;
-      const existing = _prefetchCache.get(prefetchUrl, method);
-      if (existing) {
-        return existing.response;
-      }
-      const ttl = options.cacheFor ? parseCacheFor(options.cacheFor) : PREFETCH_DEFAULT_CACHE_FOR;
-      const fetchPromise = fetchPrefetchPageData(prefetchUrl).then((data) => {
-        if (
-          data &&
-          typeof data === 'object' &&
-          uncachedPayloads.has(data) &&
-          _prefetchCache.get(prefetchUrl, method)?.response === fetchPromise
-        ) {
-          _prefetchCache.flush(prefetchUrl, method);
-        }
-        return data;
-      });
-      _prefetchCache.set(prefetchUrl, method, fetchPromise, ttl);
-      return fetchPromise;
     },
 
-    flush(url, method = 'GET') {
+    setBrowserVisitHandler(handler) {
+      browserVisitHandler = handler;
+    },
+
+    setLocationHandler(handler) {
+      locationHandler = handler;
+    },
+
+    prefetch,
+
+    flush(url) {
       const hashIdx = url.indexOf('#');
-      _prefetchCache.flush(hashIdx !== -1 ? url.slice(0, hashIdx) : url, method);
+      _prefetchCache.flush(hashIdx !== -1 ? url.slice(0, hashIdx) : url);
     },
 
     flushAll() {
       _prefetchCache.flushAll();
     },
 
-    setPopStateHandler(handler) {
-      popStateHandler = handler;
-    },
-
     commitInitialRender() {
       const saved = initialScrollPosition;
       initialScrollPosition = null;
-      scrollRestoration.commit();
+      if (_nextNavigationId === 0) {
+        // App code may have moved the page to an entry of its own while it mounted.
+        entries.rendered(entries.renderedKey() ?? initialEntryKey);
+      }
       if (saved && _nextNavigationId === 0) {
         window.scrollTo(saved.x, saved.y);
       }
     },
 
     start() {
-      initialScrollPosition = scrollRestoration.start();
+      if (started) {
+        return;
+      }
+      started = true;
+      startAnchorPrefetch(engine);
+      scrollRestoration.start();
+      entries.start(scrollRestoration.forget);
+      initialScrollPosition = scrollRestoration.read(initialEntryKey);
 
       initClientHead(initialPageData.head as HeadDescriptor | undefined);
 
-      if (deferredWindow.__deferredQueue) {
-        for (const entry of deferredWindow.__deferredQueue) {
-          if (entry.length === 3) {
-            _htmlDeferredRegistry?.resolve(entry[0], undefined, entry[2]);
-          } else {
-            _htmlDeferredRegistry?.resolve(
-              entry[0],
-              entry.length === 4 ? decodePageData(entry[1]) : entry[1],
-              undefined,
-            );
-          }
-        }
-        delete deferredWindow.__deferredQueue;
-      }
-
-      window.addEventListener('popstate', (e) => {
-        const url = window.location.pathname + window.location.search + window.location.hash;
-        const saved = scrollRestoration.pop(e.state);
-        if (!scrollRestoration.ready && url === initialUrl) {
-          initialScrollPosition = saved;
-          return;
-        }
-        const options = {
-          preserveState: true,
-          _scrollPosition: saved,
-          _popstate: true,
-        };
-        if (popStateHandler) {
-          popStateHandler(url, options);
-        }
-      });
+      drainHtmlDeferredQueue(() => _htmlDeferredRegistry);
     },
   };
+
+  // Every visit starts here: one navigate event is one navigation. The browser owns its
+  // URL, history entry and cancellation, and this listener loads and renders the page.
+  // Register before the adapter mounts: an initial effect can publish an entry.
+  window.navigation.addEventListener('navigate', (event) => {
+    if (event.info === renderedPageNavigation) {
+      // The engine's own entry for a page that is on screen, or its return to that
+      // page's entry: there is nothing to load or scroll.
+      event.intercept({ scroll: 'manual', focusReset: 'manual' });
+      return;
+    }
+    const request = event.info as BrowserVisit | undefined;
+    const own = !!request && browserVisits.has(request);
+    const apply = own ? request.apply : browserVisitHandler;
+    const options = own ? request.options : {};
+    const traversal = event.navigationType === 'traverse';
+    if (!event.canIntercept || event.downloadRequest !== null || event.formData !== null) {
+      return;
+    }
+    // A traversal to another document is the browser's.
+    if (traversal && !event.destination.sameDocument) {
+      return;
+    }
+    const anchor = event.sourceElement?.closest('a[href],area[href]');
+    const link = !!anchor && isRouterLink(anchor);
+    // A classic history write also emits navigate. Only claim a link, a traversal,
+    // a visit initiated by this router, or a fragment of a URL whose page has yet
+    // to render. Decide before the URL is parsed and matched against the routes.
+    if (!own && !traversal && !link && !event.hashChange) {
+      return;
+    }
+    const target = new URL(event.destination.url);
+    // The browser owns a navigation to another fragment of the rendered page, or between
+    // two entries of that page: it commits the entry and scrolls to the fragment, and
+    // currententrychange updates the route. A link or a visit to the current URL and
+    // fragment is such a navigation too, though the browser reports hashChange as false.
+    if (
+      isRenderedPageUrl(target) &&
+      (traversal ||
+        (!options._refresh &&
+          (event.hashChange ||
+            ((own || link) &&
+              Boolean(target.hash) &&
+              event.destination.sameDocument &&
+              target.href === documentBaseUrl().href))))
+    ) {
+      if (_pendingResource) {
+        abortPendingResource(_pendingResource);
+      }
+      // A visit that has just committed must not scroll after the browser does. The
+      // navigation also retires the latest visit: it recovers no entry, a shell that
+      // was still loading is dropped, and the initial render restores no position.
+      _nextNavigationId++;
+      return;
+    }
+    if (!apply) {
+      return;
+    }
+    // A Link to a URL outside the route table is fetched and its response decides.
+    // A plain anchor to such a URL stays a document load: fetching it first could
+    // request the document twice. A same-document entry with such a URL is one that
+    // the router rendered, so a traversal renders it again.
+    const serverRouted =
+      (traversal || (link && anchor.hasAttribute(LINK_MARKER_ATTRIBUTE))) &&
+      isServerRoutedUrl(target);
+    if (!serverRouted && !isClientPage(target)) {
+      return;
+    }
+
+    const url = target.pathname + target.search + target.hash;
+    if (!traversal && !event.cancelable) {
+      return;
+    }
+    if (_pendingResource) {
+      abortPendingResource(_pendingResource);
+    }
+    if (traversal) {
+      event.intercept({
+        scroll: 'manual',
+        focusReset: 'manual',
+        handler: async () => {
+          scrollRestoration.save();
+          const key = event.destination.key;
+          // Back and forward have no link or caller: only the app default applies.
+          const resource = prepareVisit(
+            url,
+            { preserveState: true },
+            {
+              kind: 'traverse',
+              signal: event.signal,
+              entryKey: key,
+              scrollPosition: scrollRestoration.read(key),
+              visualTransitionDone: event.hasUAVisualTransition,
+            },
+          );
+          const result = await applyBrowserVisit(apply, exposeResource(resource));
+          event.signal.throwIfAborted();
+          if (!result) {
+            throw abortError();
+          }
+        },
+      });
+      return;
+    }
+
+    event.intercept({
+      scroll: 'manual',
+      focusReset: event.navigationType === 'push' ? 'after-transition' : 'manual',
+      async precommitHandler(controller) {
+        const context: NavigationContext = {
+          kind: 'precommit',
+          signal: event.signal,
+          linkViewTransition: link ? linkViewTransition(anchor) : undefined,
+          visualTransitionDone: event.hasUAVisualTransition,
+        };
+        const resource = prepareVisit(url, options, context);
+        let release!: (committed: boolean) => void;
+        const urlReady = new Promise<boolean>((resolve) => {
+          release = resolve;
+        });
+        const cancel = () => release(false);
+        event.signal.addEventListener('abort', cancel, { once: true });
+        // Notify the adapter about pending state immediately. It can only read
+        // the new page once the browser has committed the destination.
+        const shellAfterCommit = urlReady.then((committed) => {
+          if (!committed) {
+            throw abortError();
+          }
+          return resource.shell;
+        });
+        // The browser finishes this navigation when the adapter reports its commit, so the
+        // adapter renders every such visit as one that resolves on commit.
+        const exposed = exposeResource(resource, shellAfterCommit, {
+          ...resource.options,
+          resolveOn: 'commit',
+          _resolveOnShell: false,
+        });
+        const applied = apply(exposed);
+        void applied.catch(() => {});
+        try {
+          const shell = await resource.shell;
+          if (!shell) {
+            // The loader has handed this visit to a document navigation.
+            // Release the renderer without reporting a synthetic AbortError.
+            cancel();
+            abortPendingResource(resource);
+            return;
+          }
+          event.signal.throwIfAborted();
+          if (_pendingResource !== resource) {
+            throw abortError();
+          }
+          const finalUrl = resource.destination();
+          if (finalUrl !== url) {
+            controller.redirect(finalUrl);
+          }
+          if (own) {
+            request.dataReady?.(shell.pageData);
+          }
+          controller.addHandler(async () => {
+            // An abort has already released the renderer through `cancel`.
+            event.signal.throwIfAborted();
+            context.entryKey = window.navigation.currentEntry?.key;
+            entries.committed(context.entryKey, resource.id);
+            release(true);
+            const result = await applyBrowserVisit(() => applied, exposed);
+            event.signal.throwIfAborted();
+            if (!result) {
+              throw abortError();
+            }
+          });
+        } catch (error) {
+          cancel();
+          abortPendingResource(resource);
+          if (!own && !event.signal.aborted && !isAbortError(error)) {
+            // A native link still has its document response as a recovery path.
+            window.location.href = resource.destination();
+            return;
+          }
+          recoverUnrenderedEntry(resource);
+          throw error;
+        }
+      },
+    });
+  });
+  // The browser has committed an entry. Its visit, if it has one, started from the
+  // navigate event: this listener only records what the entry means for the page on screen.
+  // The router's idea of that page's URL changes here and when a visit commits.
+  window.navigation.addEventListener('currententrychange', (event) => {
+    const entry = window.navigation.currentEntry;
+    if (!entry?.url || entry === event.from) {
+      return;
+    }
+    const pending = _pendingResource;
+    if (pending) {
+      // A visit that loads its page before the browser commits owns this entry: any
+      // other navigation would have aborted it. Its handler has yet to run, and a
+      // navigation started from this event can supersede it first.
+      const context = contextOf(pending);
+      if (context.kind === 'precommit' && !context.signal?.aborted) {
+        entries.committed(entry.key);
+      }
+      return;
+    }
+    const target = new URL(entry.url);
+    // No visit is pending, so no router code pushed or replaced this entry: app code
+    // did, with history.pushState() or replaceState(). When it started from the entry of
+    // the page on screen, that page is now under this address. Until the initial render
+    // commits, the page on screen is the one of the initial entry.
+    const pageKey = entries.renderedKey() ?? (_nextNavigationId === 0 ? initialEntryKey : null);
+    if (
+      (event.navigationType === 'push' || event.navigationType === 'replace') &&
+      pageKey &&
+      event.from?.key === pageKey &&
+      isSameOrigin(target, documentBaseUrl())
+    ) {
+      _currentFetchUrl = target.pathname + target.search;
+    }
+    if (
+      !isRenderedPageUrl(target) ||
+      (entry.key === event.from?.key && entry.url === event.from.url)
+    ) {
+      return;
+    }
+    // The rendered page under another address: a fragment that the browser moved to
+    // and has yet to scroll to, or the URL that app code gave it.
+    scrollRestoration.save();
+    entries.moved(entry.key);
+    if (event.navigationType === 'traverse') {
+      // Entries keep their own positions: the browser restores none of them.
+      restoreScroll(scrollRestoration.read(entry.key), target.hash, false);
+    }
+    locationHandler?.();
+  });
 
   return engine;
 }

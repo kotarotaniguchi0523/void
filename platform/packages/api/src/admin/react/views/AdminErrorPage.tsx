@@ -21,7 +21,7 @@ export function AdminErrorPage({
         <p>{message}</p>
       </div>
       <Link
-        reloadDocument={status === 401}
+        {...(status === 401 ? { 'data-void-reload': '' } : {})}
         className="void-auth-button void-auth-button-primary"
         href={status === 401 ? '/admin/logout' : '/admin/'}
       >
