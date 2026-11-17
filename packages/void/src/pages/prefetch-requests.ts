@@ -19,7 +19,7 @@ export function isPrefetchRedirect(value: unknown): value is PrefetchRedirect {
   return typeof value === 'object' && value !== null && PREFETCH_REDIRECT in value;
 }
 
-/** Preserve the existing prefetch() data contract without exposing cache metadata. */
+/** The page data of a prefetch cache entry, without its redirect metadata. */
 export function unwrapPrefetchedPageData(value: unknown): unknown {
   return isPrefetchRedirect(value) ? value.pageData : value;
 }
@@ -64,7 +64,6 @@ export function createPrefetchRequests({
   staticPageDataFastPath: boolean;
   prefetchDefaultCacheFor: CacheForResult;
 }): {
-  /** Fetch page data for the prefetch cache; null means "fall back to a full page load". */
   fetchPrefetchPageData(url: string): Promise<unknown>;
   /** Whether the response of this payload asked not to be cached. */
   isUncachedPayload(data: object): boolean;

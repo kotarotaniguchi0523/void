@@ -345,17 +345,6 @@ function appReducer(state: AppState, action: AppAction): AppState {
         navigation: idleNavigationState(),
       };
     case 'fail':
-      if (state.pendingId !== action.resource.id) {
-        return state;
-      }
-      return {
-        ...state,
-        resource: state.rollbackResource || state.resource,
-        rollbackResource: null,
-        pendingId: null,
-        routeUrl: action.location,
-        navigation: idleNavigationState(),
-      };
     case 'abandon':
       if (state.pendingId !== action.resource.id) {
         return state;

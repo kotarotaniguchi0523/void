@@ -622,7 +622,6 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
     },
   };
 
-  // Keep the mutation-capable visit separate from the public GET-only facade.
   actionTransports.set(router, router);
   return {
     router,

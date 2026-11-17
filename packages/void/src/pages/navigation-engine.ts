@@ -223,7 +223,10 @@ export type PageNavigationEngine = {
   prepareVisit(url: string, options?: VisitOptions): PageNavigationResource;
   visit(url: string, options: VisitOptions, apply: ApplyVisit): Promise<PageData | undefined>;
   setBrowserVisitHandler(handler: ApplyVisit | null): void;
-  /** The handler runs when the browser moves to another fragment of the rendered page. */
+  /**
+   * The handler runs when the rendered page moves to another entry or URL: a fragment the
+   * browser moved to, or a URL app code gave it.
+   */
   setLocationHandler(handler: (() => void) | null): void;
   /** Called after a renderer commit identifies the resources still in its tree. */
   releaseRetiredResources(retainedIds: ReadonlySet<number>): void;
@@ -263,7 +266,10 @@ export async function createPageNavigationEngine(
   let _committedResource: PageNavigationResource | null = null;
   let _committedDeferredRegistry: DeferredRegistry | null = null;
   let _htmlDeferredRegistry: DeferredRegistry | null = null;
-  /** The registry of the page the adapter has applied: the only one that notifies it. */
+  /**
+   * The registry that notifies the adapter: the committed page's, or a direct visit's from
+   * the start of its commit.
+   */
   let _renderedDeferredRegistry: DeferredRegistry | null = null;
   let _currentFetchUrl = window.location.pathname + window.location.search;
   let browserVisitHandler: ApplyVisit | null = null;
@@ -598,14 +604,13 @@ export async function createPageNavigationEngine(
       pageData = clonePageData(unwrapPrefetchedPageData(cachedPageData) as PageData);
       deferredRegistry.setup(pageData, true);
       if (!cacheEntry.singleUse && !_prefetchCache.isFresh(cacheEntry)) {
-        const staleEntry = cacheEntry;
         void fetchPrefetchPageData(fetchUrl)
           .then((data) => {
             if (
               data &&
               typeof data === 'object' &&
               !isUncachedPayload(data) &&
-              _prefetchCache.get(fetchUrl) === staleEntry
+              _prefetchCache.get(fetchUrl) === cacheEntry
             ) {
               _prefetchCache.flush(fetchUrl);
               _prefetchCache.set(fetchUrl, Promise.resolve(data), PREFETCH_DEFAULT_CACHE_FOR);

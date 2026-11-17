@@ -170,9 +170,10 @@ export function linkCacheFor(anchor: Pick<Element, 'getAttribute'>): CacheForInp
  * Marks a link to the current page. Pathnames compare the way the server
  * matches pages: case-sensitive, trailing slash significant, decoded like Hono's
  * getPath. A link with a query also needs each of its params, with the same value,
- * in the current URL, which may have more params in any order. The hash is ignored. `prefix` also matches nested pages by whole
- * segment, except for `/`, comparing only the path, but only an exact match is
- * `aria-current`. Spread the result before the user's attributes so theirs win.
+ * in the current URL, which may have more params in any order. The hash is ignored.
+ * `prefix` also matches nested pages by whole segment, except for `/`, comparing only
+ * the path, but only an exact match is `aria-current`. Spread the result before the
+ * user's attributes so theirs win.
  */
 export function linkActiveAttributes(
   router: VoidRouter | null | undefined,

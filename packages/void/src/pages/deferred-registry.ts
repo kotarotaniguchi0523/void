@@ -52,8 +52,9 @@ export class DeferredRegistry {
   }
 
   /**
-   * Whether this registry's props are the page the adapter has applied. A registry that
-   * settled values while off screen notifies once when its page is applied.
+   * Whether this is the registry that notifies the adapter: the committed page's, or a
+   * direct visit's from the start of its commit. A registry that settled values while off
+   * screen notifies once when it comes on screen.
    */
   setOnScreen(onScreen: boolean): void {
     this.onScreen = onScreen;
