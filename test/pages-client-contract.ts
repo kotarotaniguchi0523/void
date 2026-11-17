@@ -2811,4 +2811,325 @@ export function registerSharedClientTests({
       }
     });
   });
+
+  /**
+   * A GET visit to B commits B's URL in
+   * the precommit handler and renders afterwards, so there is a window where the address
+   * shows B while the DOM still shows A. These tests start another navigation in that
+   * window. Two deterministic ways to hold it open:
+   * - the app's own `currententrychange` listener runs synchronously when B's entry
+   *   becomes current, before B's post-commit handler runs;
+   * - a link with `data-void-view-transition="true"` renders inside
+   *   `document.startViewTransition()`, whose callback runs on a later frame. The tests
+   *   replace that method with one that holds the callback until the test releases it.
+   *
+   * Tests named "policy" encode the decided behaviour: a pushed entry whose page never
+   * rendered leaves no entry behind, because a superseding push takes its place (as a
+   * superseding replace already replaces it). A superseded replace or traversal keeps the
+   * browser's history behaviour. Tests named "pinned" hold behaviour that already matched.
+   */
+  describe('history when a navigation starts before a committed page renders', () => {
+    type HeldWindow = Window & { __heldRenders?: Array<() => Promise<void>> };
+
+    async function open(path: string): Promise<Page> {
+      const page = await newPage();
+      await page.goto(BASE + path);
+      await waitForHydration(page);
+      return page;
+    }
+
+    /** Hold every view-transition update callback until `releaseRenders`. */
+    async function holdViewTransitionRenders(page: Page): Promise<void> {
+      await page.evaluate(() => {
+        const held: Array<() => Promise<void>> = [];
+        (window as HeldWindow).__heldRenders = held;
+        document.startViewTransition = ((
+          update?: ViewTransitionUpdateCallback | StartViewTransitionOptions,
+        ) => {
+          let done!: () => void;
+          let fail!: (error: unknown) => void;
+          const updateCallbackDone = new Promise<void>((resolve, reject) => {
+            done = resolve;
+            fail = reject;
+          });
+          updateCallbackDone.catch(() => {});
+          const callback = typeof update === 'function' ? update : update?.update;
+          held.push(() =>
+            Promise.resolve()
+              .then(() => callback?.())
+              .then(done, fail),
+          );
+          return {
+            ready: updateCallbackDone,
+            finished: updateCallbackDone,
+            updateCallbackDone,
+            skipTransition() {},
+            types: new Set<string>(),
+          } as unknown as ViewTransition;
+        }) as typeof document.startViewTransition;
+      });
+    }
+
+    async function releaseRenders(page: Page): Promise<void> {
+      await page.evaluate(() =>
+        Promise.all((window as HeldWindow).__heldRenders!.splice(0).map((render) => render())),
+      );
+    }
+
+    /** Add an anchor outside the app root, so it survives every render. */
+    async function addLink(
+      page: Page,
+      testId: string,
+      href: string,
+      viewTransition = false,
+    ): Promise<void> {
+      await page.evaluate(
+        ({ testId, href, viewTransition }) => {
+          const anchor = document.createElement('a');
+          anchor.href = href;
+          anchor.textContent = testId;
+          anchor.dataset.testid = testId;
+          if (viewTransition) {
+            anchor.setAttribute('data-void-view-transition', 'true');
+          }
+          document.body.insertBefore(anchor, document.body.firstChild);
+        },
+        { testId, href, viewTransition },
+      );
+    }
+
+    async function heading(page: Page, text: string): Promise<void> {
+      await page.waitForFunction(
+        (text) => document.querySelector('h1')?.textContent?.includes(text),
+        text,
+      );
+    }
+
+    async function settled(page: Page): Promise<void> {
+      await page.waitForFunction(() => !navigation.transition);
+    }
+
+    async function follow(page: Page, testId: string, href: string, text: string): Promise<void> {
+      await addLink(page, testId, href);
+      await page.getByTestId(testId).click();
+      await heading(page, text);
+      await settled(page);
+    }
+
+    function history(page: Page) {
+      return page.evaluate(() => ({
+        urls: navigation.entries().map((entry) => {
+          const url = new URL(entry.url!);
+          return url.pathname + url.search;
+        }),
+        index: navigation.currentEntry!.index,
+        key: navigation.currentEntry!.key,
+      }));
+    }
+
+    /** Click B's view-transition link and wait until B's URL commits with its render held. */
+    async function holdPushedPage(page: Page, href: string): Promise<void> {
+      await holdViewTransitionRenders(page);
+      await addLink(page, 'held-page', href, true);
+      await page.getByTestId('held-page').click({ noWaitAfter: true });
+      await page.waitForFunction(
+        (href) =>
+          location.pathname + location.search === href &&
+          (window as HeldWindow).__heldRenders!.length > 0,
+        href,
+      );
+    }
+
+    it('pinned: a superseded page whose render resumes later does not cover the newer page', async ({
+      expect,
+    }) => {
+      const page = await open('/');
+      try {
+        await holdPushedPage(page, '/users?history=held');
+        // The address shows B while the DOM still shows A.
+        expect(await page.locator('h1').textContent()).toContain('Welcome');
+
+        await follow(page, 'next-page', '/link-behavior', 'Link Behavior');
+        await releaseRenders(page);
+        await settled(page);
+
+        expect(page.url()).toBe(BASE + '/link-behavior');
+        expect(await page.locator('h1').textContent()).toContain('Link Behavior');
+      } finally {
+        await page.context().close();
+      }
+    });
+
+    it('policy: a link followed while a pushed page renders takes the entry of that page', async ({
+      expect,
+    }) => {
+      const page = await open('/');
+      try {
+        await holdPushedPage(page, '/users?history=held');
+        await follow(page, 'next-page', '/link-behavior', 'Link Behavior');
+        await releaseRenders(page);
+
+        // Today: ['/', '/users?history=held', '/link-behavior'], and Back loads and shows
+        // the Users page, which was never on screen. Chromium keeps the entry that the
+        // aborted navigation committed; the engine does not remove or reuse it.
+        expect(await history(page)).toMatchObject({ urls: ['/', '/link-behavior'], index: 1 });
+        await page.goBack();
+        await heading(page, 'Welcome');
+        expect(page.url()).toBe(BASE + '/');
+      } finally {
+        await page.context().close();
+      }
+    });
+
+    it('policy: a link that app code follows when a pushed entry becomes current takes its place', async ({
+      expect,
+    }) => {
+      const page = await open('/');
+      try {
+        await addLink(page, 'next-page', '/link-behavior');
+        await page.evaluate(() => {
+          navigation.addEventListener('currententrychange', function follow() {
+            if (location.search === '?history=reentry') {
+              navigation.removeEventListener('currententrychange', follow);
+              document.querySelector<HTMLAnchorElement>('[data-testid="next-page"]')!.click();
+            }
+          });
+        });
+        await addLink(page, 'reentry-page', '/users?history=reentry');
+        await page.getByTestId('reentry-page').click({ noWaitAfter: true });
+        await heading(page, 'Link Behavior');
+        await settled(page);
+
+        // Today: ['/', '/users?history=reentry', '/link-behavior'].
+        expect(await history(page)).toMatchObject({ urls: ['/', '/link-behavior'], index: 1 });
+      } finally {
+        await page.context().close();
+      }
+    });
+
+    it('pinned: a replace visit that app code starts when a pushed entry becomes current replaces it', async ({
+      expect,
+    }) => {
+      const page = await open('/native-anchor');
+      try {
+        await page.evaluate(() => {
+          navigation.addEventListener('currententrychange', function replace() {
+            if (location.search === '?history=reentry') {
+              navigation.removeEventListener('currententrychange', replace);
+              document.querySelector<HTMLAnchorElement>('[data-testid="anchor-replace"]')!.click();
+            }
+          });
+        });
+        await addLink(page, 'reentry-page', '/users?history=reentry');
+        await page.getByTestId('reentry-page').click({ noWaitAfter: true });
+        await page.waitForURL(BASE + '/native-anchor?replace=1');
+        await heading(page, 'Native anchor');
+        await settled(page);
+
+        expect(await history(page)).toMatchObject({
+          urls: ['/native-anchor', '/native-anchor?replace=1'],
+          index: 1,
+        });
+        await page.goBack();
+        await page.waitForURL(BASE + '/native-anchor');
+        expect(await page.locator('h1').textContent()).toContain('Native anchor');
+      } finally {
+        await page.context().close();
+      }
+    });
+
+    it('pinned: a replace visit started before another replace visit renders leaves one entry', async ({
+      expect,
+    }) => {
+      const page = await open('/link-behavior');
+      try {
+        await page.evaluate(() => {
+          navigation.addEventListener('currententrychange', function replace() {
+            if (location.pathname === '/users') {
+              navigation.removeEventListener('currententrychange', replace);
+              const anchor = document.querySelector<HTMLAnchorElement>(
+                '[data-testid="replace-link"]',
+              )!;
+              anchor.href = '/native-anchor';
+              anchor.click();
+            }
+          });
+        });
+        await page.getByTestId('replace-link').click({ noWaitAfter: true });
+        await heading(page, 'Native anchor');
+        await settled(page);
+
+        expect(await history(page)).toMatchObject({ urls: ['/native-anchor'], index: 0 });
+      } finally {
+        await page.context().close();
+      }
+    });
+
+    it('pinned: Back while a pushed page renders returns to the entry of the page on screen', async ({
+      expect,
+    }) => {
+      const page = await open('/');
+      try {
+        await follow(page, 'lab', '/link-behavior', 'Link Behavior');
+        const onScreen = await history(page);
+        await holdPushedPage(page, '/users?history=held');
+
+        await page.evaluate(() => navigation.back().finished?.catch(() => {}));
+        await page.waitForURL(BASE + '/link-behavior');
+        await settled(page);
+        await releaseRenders(page);
+        await settled(page);
+
+        expect(await page.locator('h1').textContent()).toContain('Link Behavior');
+        // The same entry, not a new one: Back went to the page that was on screen. The
+        // browser keeps the never-rendered page as a forward entry; only a push drops it.
+        expect(await history(page)).toEqual({
+          urls: ['/', '/link-behavior', '/users?history=held'],
+          index: 1,
+          key: onScreen.key,
+        });
+        await page.goForward();
+        await heading(page, 'Users');
+        expect(page.url()).toBe(BASE + '/users?history=held');
+      } finally {
+        await page.context().close();
+      }
+    });
+
+    it('pinned: an action submitted before a link renders returns to the page on screen and keeps the link as a forward entry', async ({
+      expect,
+    }) => {
+      const page = await open('/users');
+      try {
+        const before = await page.evaluate(() => {
+          const link = document.createElement('a');
+          link.href = '/users/2?action-return=2';
+          link.textContent = 'Other user';
+          document.body.insertBefore(link, document.body.firstChild);
+          navigation.addEventListener('currententrychange', function submit() {
+            if (location.search === '?action-return=2') {
+              navigation.removeEventListener('currententrychange', submit);
+              document.querySelector<HTMLButtonElement>('button[type="submit"]')!.click();
+            }
+          });
+          return navigation.currentEntry!.key;
+        });
+        await page.getByRole('link', { name: 'Other user' }).click({ noWaitAfter: true });
+        await page.waitForFunction(() => document.body.textContent?.includes('Name is required'));
+        await settled(page);
+
+        expect(await history(page)).toEqual({
+          urls: ['/users', '/users/2?action-return=2'],
+          index: 0,
+          key: before,
+        });
+        expect(await page.locator('h1').textContent()).toBe('Users');
+        // Forward reaches the entry whose page never rendered, and renders it.
+        await page.goForward();
+        await heading(page, 'Bob');
+      } finally {
+        await page.context().close();
+      }
+    });
+  });
 }

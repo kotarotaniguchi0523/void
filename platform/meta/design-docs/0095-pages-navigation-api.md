@@ -51,6 +51,9 @@ own rendering and framework-specific state, as in [Pages mode](./0013-pages.md).
   the page and navigates on the client when the response is a page.
 - **An entry whose address committed but whose page never rendered** is
   reloaded as a document. The platform does not roll a committed entry back.
+  A push that follows a pushed page before it renders takes that page's history
+  entry, so history ends as if the unrendered push had not happened. A replace or a
+  Back/Forward that has not rendered keeps the browser's history behaviour.
 
 Scroll positions remain under manual restoration
 ([scroll restoration](./0059-scroll-restoration.md)). Prefetch is delegated from

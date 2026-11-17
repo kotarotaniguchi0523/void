@@ -465,7 +465,7 @@ export async function createPageNavigationEngine(
     const { key } = await committed;
     // The entry is current, and its visit can still lose the commit to a navigation
     // that a currententrychange listener started. The visit clears this when it commits.
-    entries.committed(key);
+    entries.committed(key, undefined, replace ? 'replace' : 'push');
     return key;
   }
 
@@ -802,7 +802,9 @@ export async function createPageNavigationEngine(
         const currentDocumentUrl = window.location.pathname + window.location.search;
         const replaceHistory =
           !!options.replace ||
-          (resource.method !== 'GET' && historyUrl === currentDocumentUrl + commitTarget.hash);
+          (resource.method !== 'GET' && historyUrl === currentDocumentUrl + commitTarget.hash) ||
+          // A pushed entry whose page never rendered leaves no entry behind: take its place.
+          entries.isUnrenderedPush();
         try {
           const visibleUrl = currentDocumentUrl + window.location.hash;
           // An action updating the current page has no new destination to publish.
@@ -975,7 +977,7 @@ export async function createPageNavigationEngine(
 
     if (context.kind === 'traverse') {
       // The browser has already moved to this entry.
-      entries.committed(context.entryKey ?? window.navigation.currentEntry?.key, id);
+      entries.committed(context.entryKey ?? window.navigation.currentEntry?.key, id, 'traverse');
     }
 
     const controller = new AbortController();
@@ -1102,9 +1104,10 @@ export async function createPageNavigationEngine(
         },
       };
       browserVisits.add(request);
+      // A push from an entry whose pushed page never rendered takes that entry's place.
       const finished = navigateEntry(
         target.href,
-        options.replace ? 'replace' : 'push',
+        options.replace || entries.isUnrenderedPush() ? 'replace' : 'push',
         request,
       ).finished.then(
         () => result,
@@ -1253,6 +1256,9 @@ export async function createPageNavigationEngine(
     if (!traversal && !event.cancelable) {
       return false;
     }
+    // A push from an entry whose pushed page never rendered takes that entry's place, so
+    // history ends as if that push had not happened. Decide before the visit is aborted.
+    const takesEntry = event.navigationType === 'push' && entries.isUnrenderedPush();
     if (_pendingResource) {
       abortPendingResource(_pendingResource);
     }
@@ -1333,7 +1339,9 @@ export async function createPageNavigationEngine(
             throw abortError();
           }
           const finalUrl = resource.destination();
-          if (finalUrl !== url) {
+          if (takesEntry) {
+            controller.redirect(finalUrl, { history: 'replace' });
+          } else if (finalUrl !== url) {
             controller.redirect(finalUrl);
           }
           if (own) {
@@ -1343,7 +1351,11 @@ export async function createPageNavigationEngine(
             // An abort has already released the renderer through `cancel`.
             event.signal.throwIfAborted();
             context.entryKey = window.navigation.currentEntry?.key;
-            entries.committed(context.entryKey, resource.id);
+            entries.committed(
+              context.entryKey,
+              resource.id,
+              event.navigationType === 'replace' ? 'replace' : 'push',
+            );
             release(true);
             const result = await applyBrowserVisit(() => applied, exposed);
             event.signal.throwIfAborted();
@@ -1405,7 +1417,16 @@ export async function createPageNavigationEngine(
       // navigation started from this event can supersede it first.
       const context = contextOf(pending);
       if (context.kind === 'precommit' && !context.signal?.aborted) {
-        entries.committed(entry.key);
+        // Before its handler runs, the entry is the visit's own; after, app code wrote it.
+        entries.committed(
+          entry.key,
+          undefined,
+          context.entryKey !== undefined
+            ? undefined
+            : event.navigationType === 'replace'
+              ? 'replace'
+              : 'push',
+        );
       }
       return;
     }

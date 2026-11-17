@@ -3660,6 +3660,102 @@ describe('superseded navigation commits (#507)', () => {
       expect(window.location.pathname).toBe('/a');
     });
   });
+
+  /**
+   * A GET visit commits its URL in the
+   * precommit handler and renders afterwards, so there is a window where the address
+   * shows B while the DOM still shows the previous page. These tests start a navigation
+   * inside that window.
+   *
+   * Tests marked "policy" encode the decided behaviour: a pushed entry whose page never
+   * rendered leaves no entry behind, because a superseding push takes its place (as a
+   * superseding replace already replaces it). A superseded replace or traversal keeps the
+   * browser's history behaviour. Tests marked "pinned" hold behaviour that already matched.
+   */
+  describe('history when a navigation supersedes a page that has not rendered', () => {
+    async function start(page: ReturnType<typeof setup>) {
+      const browser = stubNavigationHistory();
+      const created = await createTestRouter({
+        adapter: {
+          applyUpdate: page.applyUpdate,
+          createDeferred: () => ({ loading: true }),
+          isLoading: () => true,
+          rejectDeferred: page.rejectDeferred,
+        },
+        components: { a: loadComponent, b: loadComponent, home: loadComponent },
+        matchRoute: (url) => (url.startsWith('/a') ? 'a' : url.startsWith('/b') ? 'b' : 'home'),
+      });
+      created.start();
+      created.commitInitialRender();
+      const reload = vi.fn();
+      Object.assign(window.location, { reload });
+      const urls = () =>
+        browser.entries().map((entry) => {
+          const url = new URL(entry.url);
+          return url.pathname + url.search;
+        });
+      return { browser, router: created.router, reload, urls };
+    }
+
+    it('policy: a push that supersedes a pushed page before it renders takes its entry', async () => {
+      const page = setup();
+      const { browser, router: r, reload, urls } = await start(page);
+      const b = gate();
+      page.updateGates.set('/b', b.promise);
+
+      const visitB = r.visit('/b');
+      await entered(page, '/b');
+      // The address shows /b; the renderer is still applying it.
+      expect(window.location.pathname).toBe('/b');
+      await r.visit('/c');
+      b.release();
+      await expect(visitB).resolves.toBeUndefined();
+
+      expect(page.rendered).toEqual(['/b', '/c']);
+      expect(reload).not.toHaveBeenCalled();
+      // Today: ['/', '/b', '/c'], an entry for /b whose page was never on screen.
+      expect(urls()).toEqual(['/', '/c']);
+      expect(browser.currentEntry.url).toBe('http://localhost/c');
+    });
+
+    it('pinned: a replace that supersedes a pushed page before it renders takes its entry', async () => {
+      const page = setup();
+      const { router: r, reload, urls } = await start(page);
+      const b = gate();
+      page.updateGates.set('/b', b.promise);
+
+      const visitB = r.visit('/b');
+      await entered(page, '/b');
+      await r.visit('/c', { replace: true });
+      b.release();
+      await expect(visitB).resolves.toBeUndefined();
+
+      expect(page.rendered).toEqual(['/b', '/c']);
+      expect(reload).not.toHaveBeenCalled();
+      expect(urls()).toEqual(['/', '/c']);
+    });
+
+    it('pinned: Back while a pushed page renders returns to the page on screen', async () => {
+      const page = setup();
+      const { browser, router: r, reload, urls } = await start(page);
+      const b = gate();
+      page.updateGates.set('/b', b.promise);
+
+      const visitB = r.visit('/b');
+      await entered(page, '/b');
+      await browser.traverseTo('initial-entry').finished;
+      b.release();
+      await expect(visitB).resolves.toBeUndefined();
+
+      expect(window.location.pathname).toBe('/');
+      // Nothing new loads: the client applies the page that was on screen again over the
+      // abandoned /b update (the initial page has no `url`, recorded as '').
+      expect(page.rendered).toEqual(['/b', '']);
+      expect(reload).not.toHaveBeenCalled();
+      // The browser keeps /b as a forward entry; only a later push removes it.
+      expect(urls()).toEqual(['/', '/b']);
+    });
+  });
 });
 
 describe('browser navigate events', () => {
