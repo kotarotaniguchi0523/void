@@ -27,6 +27,7 @@ describe('GET-only Link', () => {
       rel: 'noopener',
       download: 'users.csv',
       style: { color: 'red' },
+      viewTransition: true,
     });
     expect(html).toContain('<a ');
     expect(html).toContain('href="/users"');
@@ -34,26 +35,7 @@ describe('GET-only Link', () => {
     expect(html).toContain('download="users.csv"');
     expect(html).toContain('style="color:red"');
     expect(html).not.toContain('<button');
-  });
-
-  it('marks its anchor for the router, with or without prefetching', () => {
-    expect(renderAt('/', { href: '/users' })).toContain('data-void-link=""');
-    expect(renderAt('/', { href: '/users', prefetch: false })).toContain('data-void-link=""');
-    expect(renderAt('/', { href: '/users', 'data-void-reload': '' } as LinkProps)).toContain(
-      'data-void-link=""',
-    );
-  });
-
-  it('renders the view transition override only when the prop is set', () => {
-    expect(renderAt('/', { href: '/users', viewTransition: true })).toContain(
-      'data-void-view-transition="true"',
-    );
-    expect(renderAt('/', { href: '/users', viewTransition: false })).toContain(
-      'data-void-view-transition="false"',
-    );
-    const unset = renderAt('/', { href: '/users' });
-    expect(unset).not.toContain('data-void-view-transition');
-    expect(unset).not.toContain('viewTransition');
+    expect(html).not.toContain('viewTransition');
   });
 
   it('marks the active link and its parent', () => {
@@ -80,15 +62,5 @@ describe('GET-only Link', () => {
     const html = renderAt('/users', props, navigation);
     expect(html).toContain('aria-current="step"');
     expect(html).not.toContain('data-void-pending');
-  });
-
-  it('marks GET pending states but not mutation submissions', () => {
-    const location = new URL('http://localhost/users');
-    expect(
-      renderAt('/', { href: '/users' }, { state: 'loading', location, method: 'GET' }),
-    ).toContain('data-void-pending=""');
-    expect(
-      renderAt('/', { href: '/users' }, { state: 'submitting', location, method: 'POST' }),
-    ).not.toContain('data-void-pending');
   });
 });

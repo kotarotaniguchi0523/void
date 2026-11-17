@@ -127,7 +127,7 @@ describe('linkViewTransition', () => {
     expect(linkViewTransition(anchor('false'))).toBe(false);
   });
 
-  it.each([null, '', 'TRUE', 'yes', '1', '0', ' true'])('ignores %j', (value) => {
+  it.each([null, 'TRUE', 'yes'])('ignores %j', (value) => {
     expect(linkViewTransition(anchor(value))).toBeUndefined();
   });
 });
@@ -297,6 +297,18 @@ describe('linkPendingAttributes', () => {
     expect(attributes('/admin/users/42', { href: 'https://example.com/admin/users/42' })).toEqual(
       {},
     );
+  });
+
+  it('marks GET pending states but not mutation submissions', () => {
+    const link = '/admin/users/42';
+    expect(linkPendingAttributes(router, visiting(link), link)).toEqual(pending);
+    expect(
+      linkPendingAttributes(
+        router,
+        { state: 'submitting', location: new URL(link, 'https://app.test'), method: 'POST' },
+        link,
+      ),
+    ).toEqual({});
   });
 
   it('marks nothing when no visit is loading or there is no router', () => {

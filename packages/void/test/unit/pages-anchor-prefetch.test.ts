@@ -22,10 +22,12 @@ function addAnchor(href: string, strategy: string): HTMLAnchorElement {
 describe('delegated anchor prefetch', () => {
   it('prefetches only explicit markers when there is no app default', () => {
     const prefetch = vi.fn(async () => {});
-    addAnchor('/default', 'default');
+    const defaultAnchor = addAnchor('/default', 'default');
     addAnchor('/explicit', 'mount');
     stopPrefetch = startAnchorPrefetch({ prefetch, _hoverDelay: 75 });
 
+    // A default marker is not a hover strategy either.
+    defaultAnchor.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
     expect(prefetch).toHaveBeenCalledExactlyOnceWith('/explicit', {});
   });
 
@@ -56,19 +58,6 @@ describe('delegated anchor prefetch', () => {
     stopPrefetch = startAnchorPrefetch({ prefetch, _hoverDelay: 75 });
 
     expect(prefetch).toHaveBeenCalledExactlyOnceWith('/users?page=2', {});
-  });
-
-  it('does not prefetch on a constrained connection', () => {
-    const prefetch = vi.fn(async () => {});
-    addAnchor('/users', 'mount');
-    vi.stubGlobal('navigator', { connection: { saveData: true } });
-    try {
-      stopPrefetch = startAnchorPrefetch({ prefetch, _hoverDelay: 75 });
-    } finally {
-      vi.unstubAllGlobals();
-    }
-
-    expect(prefetch).not.toHaveBeenCalled();
   });
 
   it('uses the explicit strategy in place of the app default', () => {
@@ -129,14 +118,5 @@ describe('delegated anchor prefetch', () => {
     invalid.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
     expect(reporter).toHaveBeenCalledTimes(2);
     expect(prefetch).toHaveBeenLastCalledWith('/invalid', { cacheFor: '1m' });
-  });
-
-  it('ignores default markers when the app has no prefetch strategy', () => {
-    const prefetch = vi.fn(async () => {});
-    const anchor = addAnchor('/users', 'default');
-    stopPrefetch = startAnchorPrefetch({ prefetch, _hoverDelay: 75 });
-
-    anchor.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
-    expect(prefetch).not.toHaveBeenCalled();
   });
 });

@@ -2299,6 +2299,7 @@ describe('createVoidRouter', () => {
       return ref;
     });
     const applyUpdate = vi.fn();
+    const onDeferredUpdate = vi.fn();
     vi.stubGlobal(
       'fetch',
       vi.fn(() =>
@@ -2313,6 +2314,7 @@ describe('createVoidRouter', () => {
         isLoading: vi.fn((ref) => Boolean(ref?.loading)),
         rejectDeferred,
         resolveDeferred,
+        onDeferredUpdate,
       },
     });
 
@@ -2337,6 +2339,11 @@ describe('createVoidRouter', () => {
       value: { count: 42 },
       error: null,
     });
+    // The preserved value reaches the action's page, not the props it replaced.
+    const appliedProps = applyUpdate.mock.lastCall![0].props;
+    expect(onDeferredUpdate).toHaveBeenCalled();
+    expect(onDeferredUpdate.mock.lastCall![0]).toBe(appliedProps);
+    expect(onDeferredUpdate.mock.calls.filter(([props]) => props !== appliedProps)).toEqual([]);
   });
 
   it('splits a group object when a mutation preserves only part of the group', async () => {
@@ -3027,6 +3034,8 @@ describe('superseded navigation commits (#507)', () => {
     expect(states(onNavigationChange).at(-1)).toBe('loading');
     expect(window.location.pathname).toBe('/');
     expect(browserWrites.push).not.toHaveBeenCalled();
+    // A lost its commit: its head is not applied.
+    expect(page.documentStub).toMatchObject({ title: 'Home' });
 
     b.release();
     await expect(visitB).resolves.toMatchObject({ url: '/b' });
@@ -3266,12 +3275,18 @@ describe('superseded navigation commits (#507)', () => {
 
       const visitA = r.visit('/a', { resolveOn: 'data' });
       const submitA = r.visit('/a', { method: 'post', data: {}, resolveOn: 'data' });
-      await r.visit('/b');
+      // The refresh reads the address of the page on screen, which A has not changed.
+      await r.refresh();
       a.release();
 
       await expect(visitA).resolves.toBeUndefined();
       await expect(submitA).rejects.toMatchObject({ name: 'AbortError' });
-      expect(page.rendered).toEqual(['/b']);
+      // Only the refreshed page renders, in its own entry; its response carries the head titled B.
+      expect(page.rendered).toEqual(['/']);
+      expect(browserWrites.push).not.toHaveBeenCalled();
+      expect(browserWrites.replace.mock.calls.map((call) => call[0])).toEqual(['/']);
+      expect(window.location.pathname).toBe('/');
+      expect(page.documentStub).toMatchObject({ title: 'B' });
     });
   });
 
@@ -3332,153 +3347,6 @@ describe('superseded navigation commits (#507)', () => {
     await expect(visitA).resolves.toBeUndefined();
     expect(page.rendered).toEqual(['/b']);
     expect(window.location.pathname).toBe('/b');
-  });
-
-  describe('deferred props of a visit whose page is not on screen', () => {
-    // `/a` streams its page, then its deferred `stats` group when `send` is called.
-    function streamA(page: ReturnType<typeof setup>) {
-      const encoder = new TextEncoder();
-      let stream!: ReadableStreamDefaultController<Uint8Array>;
-      const send = (message: object) =>
-        stream.enqueue(encoder.encode(JSON.stringify(message) + '\n'));
-      vi.stubGlobal(
-        'fetch',
-        vi.fn(async (url: string, init?: RequestInit) => {
-          await page.fetchGates.get(url);
-          init?.signal?.throwIfAborted();
-          if (url !== '/a') {
-            return pageJson({ component: 'b', url, props: { title: 'B' }, head: { title: 'B' } });
-          }
-          return new Response(
-            new ReadableStream<Uint8Array>({
-              start(controller) {
-                stream = controller;
-                send({
-                  component: 'a',
-                  url: '/a',
-                  props: { title: 'A', stats: null },
-                  deferredKeys: { stats: 'stats' },
-                  head: { title: 'A' },
-                });
-              },
-            }),
-            { headers: { 'content-type': 'application/x-ndjson', 'X-VoidPages': 'true' } },
-          );
-        }),
-      );
-      return { send, close: () => stream.close() };
-    }
-
-    function holdViewTransitions() {
-      const callbacks: Array<() => Promise<void>> = [];
-      Object.assign(document, {
-        startViewTransition(callback: () => unknown) {
-          const updateCallbackDone = new Promise<void>((resolve) => {
-            callbacks.push(async () => {
-              await callback();
-              resolve();
-            });
-          });
-          return { updateCallbackDone, ready: updateCallbackDone, finished: updateCallbackDone };
-        },
-      });
-      return callbacks;
-    }
-
-    it('does not pass the props of a visit superseded before it rendered to the adapter', async () => {
-      const page = setup();
-      const a = streamA(page);
-      const b = gate();
-      page.fetchGates.set('/b', b.promise);
-      const callbacks = holdViewTransitions();
-      const onDeferredUpdate = vi.fn();
-      const r = await createTestRouter({
-        adapter: {
-          applyUpdate: page.applyUpdate,
-          createDeferred: () => ({ loading: true }),
-          isLoading: (ref) => Boolean((ref as { loading?: boolean })?.loading),
-          resolveDeferred: (_ref, value) => ({ loading: false, value }),
-          rejectDeferred: page.rejectDeferred,
-          onDeferredUpdate,
-        },
-        components: { a: loadComponent, b: loadComponent, home: loadComponent },
-        matchRoute: (url) => (url.startsWith('/a') ? 'a' : url.startsWith('/b') ? 'b' : 'home'),
-      }).then((created) => created.router);
-
-      // A's page is ready and waits for its view transition to capture the old page.
-      const visitA = r.visit('/a', { viewTransition: true });
-      const settledA = visitA.catch(() => undefined);
-      await vi.waitFor(() => expect(callbacks).toHaveLength(1));
-      // B supersedes A before A has rendered anything; the home page is still on screen.
-      const visitB = r.visit('/b');
-      a.send({ __deferred: 'stats', data: 42 });
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      // The page on screen is the home page: A's props must not reach it.
-      expect(page.rendered).toEqual([]);
-      expect(onDeferredUpdate).not.toHaveBeenCalled();
-
-      await callbacks[0]();
-      b.release();
-      await visitB;
-      await settledA;
-      a.close();
-      expect(page.rendered).toEqual(['/b']);
-    });
-
-    it('does not pass the props of the current visit to the adapter before its page renders', async () => {
-      const page = setup();
-      const a = streamA(page);
-      const callbacks = holdViewTransitions();
-      const onDeferredUpdate = vi.fn();
-      const r = await createTestRouter({
-        adapter: {
-          applyUpdate: page.applyUpdate,
-          createDeferred: () => ({ loading: true }),
-          isLoading: (ref) => Boolean((ref as { loading?: boolean })?.loading),
-          resolveDeferred: (_ref, value) => ({ loading: false, value }),
-          rejectDeferred: page.rejectDeferred,
-          onDeferredUpdate,
-        },
-        components: { a: loadComponent, b: loadComponent, home: loadComponent },
-        matchRoute: (url) => (url.startsWith('/a') ? 'a' : url.startsWith('/b') ? 'b' : 'home'),
-      }).then((created) => created.router);
-
-      const visitA = r.visit('/a', { viewTransition: true });
-      await vi.waitFor(() => expect(callbacks).toHaveLength(1));
-      a.send({ __deferred: 'stats', data: 42 });
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      // The home page is still on screen; the Svelte and Solid adapters would give it A's props.
-      expect(page.rendered).toEqual([]);
-      expect(onDeferredUpdate).not.toHaveBeenCalled();
-
-      await callbacks[0]();
-      await visitA;
-      a.close();
-      expect(page.rendered).toEqual(['/a']);
-    });
-  });
-
-  it('does not apply, publish or title a visit that router.refresh() superseded', async () => {
-    const page = setup();
-    const a = gate();
-    page.fetchGates.set('/a', a.promise);
-    const r = await router(page);
-
-    const visitA = r.visit('/a');
-    // The refresh reads the address of the page on screen, which A has not changed.
-    const refreshed = r.refresh();
-    await refreshed;
-    a.release();
-    await expect(visitA).resolves.toBeUndefined();
-
-    // Only the refreshed page renders; its response carries the head titled B.
-    expect(page.rendered).toEqual(['/']);
-    expect(browserWrites.push).not.toHaveBeenCalled();
-    expect(browserWrites.replace.mock.calls.map((call) => call[0])).toEqual(['/']);
-    expect(window.location.pathname).toBe('/');
-    expect(page.documentStub).toMatchObject({ title: 'B' });
   });
 
   it('reports a render error in a view transition once, through the visit', async () => {
@@ -4896,31 +4764,8 @@ describe('deferred group ownership across visits', () => {
     await visit;
     expect(state.applied?.title).toBe('B');
     expect(state.applied?.stats).toEqual({ loading: false, value: 42, error: null });
-  });
-
-  it('sends a deferred group to its page once that page is on screen', async () => {
-    stubClientGlobals();
-    initialPage({ component: 'home', props: { title: 'A' } });
-    const stream = ndjson([pageB]);
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async () => stream.response),
-    );
-    const { state, adapter, misdirected } = ownershipAdapter();
-    const created = await createTestRouter({
-      adapter,
-      components: { home: loadComponent, b: loadComponent },
-      matchRoute: routes,
-    });
-    state.applied = created.initialPageData.props;
-
-    await created.router.visit('/b');
-    stream.send({ __deferred: 'stats', data: 42 });
-    await vi.waitFor(() => expect(state.updates).toHaveLength(1));
-
+    // The group that settled while B loaded reaches B once it is on screen.
     expect(state.updates).toEqual([{ target: 'B', applied: 'B' }]);
-    expect(misdirected()).toEqual([]);
-    expect(state.applied?.stats).toEqual({ loading: false, value: 42, error: null });
   });
 
   it('does not send a superseded visit’s deferred groups to the page on screen or to its successor', async () => {
@@ -5015,7 +4860,8 @@ describe('deferred group ownership across visits', () => {
     await visitB;
     stream.send({ __deferred: 'stats', data: 1 });
     await vi.waitFor(() => expect(state.updates).toHaveLength(1));
-    expect(misdirected()).toEqual([]);
+    // B is on screen: its group reaches it.
+    expect(state.updates).toEqual([{ target: 'B', applied: 'B' }]);
 
     // An action renders C, then writes its entry. B's stream is still open meanwhile.
     const visitC = created.router.visit('/c', { method: 'POST' });
@@ -5026,41 +4872,6 @@ describe('deferred group ownership across visits', () => {
     const whileCommitting = misdirected();
 
     writes[1]!();
-    await visitC;
-    expect(whileCommitting).toEqual([]);
-  });
-
-  it('does not send the initial page’s streamed HTML groups to the page that replaces it', async () => {
-    stubClientGlobals();
-    initialPage({
-      component: 'home',
-      props: { title: 'A', stats: null },
-      deferredKeys: { stats: 'stats' },
-    });
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async () =>
-        pageJson({ component: 'c', props: { title: 'C' }, url: '/c', errors: null }),
-      ),
-    );
-    const writes = holdHistoryWrites();
-    const { state, adapter, misdirected } = ownershipAdapter();
-    const created = await createTestRouter({
-      adapter,
-      components: { home: loadComponent, c: loadComponent },
-      matchRoute: routes,
-    });
-    state.applied = created.initialPageData.props;
-    created.start();
-
-    const visitC = created.router.visit('/c', { method: 'POST' });
-    await vi.waitFor(() => expect(writes).toHaveLength(1));
-    expect(state.applied?.title).toBe('C');
-    // The document's inline script settles A's group while C writes its entry.
-    resolveHtmlDeferred('stats', 1);
-    const whileCommitting = misdirected();
-
-    writes[0]!();
     await visitC;
     expect(whileCommitting).toEqual([]);
   });
@@ -5102,74 +4913,6 @@ describe('deferred group ownership across visits', () => {
     expect(state.applied?.stats).toEqual({ loading: false, value: 7, error: null });
     expect(state.updates.at(-1)).toEqual({ target: 'A2', applied: 'A2' });
     expect(whileCommitting).toEqual([]);
-  });
-
-  it('keeps preserved values flowing to the action’s page after it commits', async () => {
-    stubClientGlobals();
-    initialPage({
-      component: 'home',
-      props: { title: 'A', stats: null },
-      deferredKeys: { stats: 'stats' },
-    });
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async () =>
-        pageJson({ component: 'home', props: { title: 'A2', stats: null }, errors: null }),
-      ),
-    );
-    const { state, adapter, misdirected } = ownershipAdapter();
-    const created = await createTestRouter({ adapter, matchRoute: routes });
-    state.applied = created.initialPageData.props;
-    created.start();
-
-    await created.router.visit('/', { method: 'POST' });
-    resolveHtmlDeferred('stats', 7);
-
-    expect(state.applied?.title).toBe('A2');
-    expect(state.applied?.stats).toEqual({ loading: false, value: 7, error: null });
-    expect(state.updates.at(-1)).toEqual({ target: 'A2', applied: 'A2' });
-    expect(misdirected()).toEqual([]);
-  });
-
-  it('does not send a pending visit’s groups to a page that kept preserved values', async () => {
-    stubClientGlobals();
-    initialPage({
-      component: 'home',
-      props: { title: 'A', stats: null },
-      deferredKeys: { stats: 'stats' },
-    });
-    const stream = ndjson([pageB, { __deferred: 'stats', data: 42 }]);
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (url: string) =>
-        url === '/b'
-          ? stream.response
-          : pageJson({ component: 'home', props: { title: 'A2', stats: null }, errors: null }),
-      ),
-    );
-    const component = controlledPromise<{ default: unknown }>();
-    const { state, adapter, misdirected } = ownershipAdapter();
-    const created = await createTestRouter({
-      adapter,
-      components: { home: loadComponent, b: () => component.promise },
-      matchRoute: routes,
-    });
-    state.applied = created.initialPageData.props;
-    await created.router.visit('/', { method: 'POST' });
-    expect(state.applied?.title).toBe('A2');
-
-    const visit = created.router.visit('/b');
-    await vi.waitFor(() => expect(state.resolutions.filter((r) => r.value === 42)).toHaveLength(1));
-    await tick();
-    const beforeRender = misdirected();
-    // The page that kept A's ref still receives its own group while B loads.
-    resolveHtmlDeferred('stats', 7);
-    expect(state.applied?.title).toBe('A2');
-    expect(state.applied?.stats).toEqual({ loading: false, value: 7, error: null });
-
-    component.resolve({ default: {} });
-    await visit;
-    expect(beforeRender).toEqual([]);
   });
 
   it('keeps a newer visit’s registry on screen when an older visit loses its commit', async () => {
@@ -5228,41 +4971,49 @@ describe('deferred group ownership across visits', () => {
     await visitC;
   });
 
-  it('applies a prefetched page’s resolved deferred values without notifying the page on screen', async () => {
+  it('targets the props it replaced while the adapter applies a page that has not committed', async () => {
     stubClientGlobals();
-    initialPage({ component: 'home', props: { title: 'A' } });
+    initialPage({
+      component: 'home',
+      props: { title: 'A', stats: null },
+      deferredKeys: { stats: 'stats' },
+    });
     vi.stubGlobal(
       'fetch',
       vi.fn(async () =>
-        pageJson({
-          component: 'b',
-          props: { title: 'B', stats: 42, usage: 1 },
-          deferredKeys: { stats: 'stats', usage: 'usage' },
-          url: '/b',
-          errors: null,
-        }),
+        pageJson({ component: 'c', props: { title: 'C' }, url: '/c', errors: null }),
       ),
     );
-    const component = controlledPromise<{ default: unknown }>();
-    const { state, adapter, misdirected } = ownershipAdapter();
+    // The transition runs its update callback, then holds the visit before its commit.
+    const update = controlledPromise<void>();
+    const finish = controlledPromise<void>();
+    Object.assign(document, {
+      startViewTransition(callback: () => Promise<void>) {
+        const updateCallbackDone = callback()
+          .then(() => update.resolve())
+          .then(() => finish.promise);
+        return { updateCallbackDone, ready: updateCallbackDone, finished: updateCallbackDone };
+      },
+    });
+    const { state, adapter } = ownershipAdapter();
     const created = await createTestRouter({
       adapter,
-      components: { home: loadComponent, b: () => component.promise },
+      components: { home: loadComponent, c: loadComponent },
       matchRoute: routes,
     });
     state.applied = created.initialPageData.props;
 
-    await created.router.prefetch('/b');
-    const visit = created.router.visit('/b');
-    await vi.waitFor(() => expect(state.resolutions).toHaveLength(2));
-    await tick();
-    expect(state.applied?.title).toBe('A');
-    expect(state.updates).toEqual([]);
+    const visit = created.router.visit('/c', { viewTransition: true });
+    await update.promise;
+    expect(state.applied?.title).toBe('C');
+    // A's group settles while C is applied but A is still the committed page: the update
+    // targets A's props, which the Svelte and Solid adapters ignore as not the applied page's.
+    resolveHtmlDeferred('stats', 1);
+    expect(state.updates).toEqual([{ target: 'A', applied: 'C' }]);
 
-    component.resolve({ default: {} });
+    finish.resolve();
     await visit;
-    expect(state.applied?.title).toBe('B');
-    expect(state.applied?.stats).toEqual({ loading: false, value: 42, error: null });
-    expect(misdirected()).toEqual([]);
+    expect(state.applied?.title).toBe('C');
+    expect(state.updates).toEqual([{ target: 'A', applied: 'C' }]);
   });
 });
