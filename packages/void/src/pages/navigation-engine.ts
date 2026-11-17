@@ -811,12 +811,17 @@ export async function createPageNavigationEngine(
               ? window.navigation.currentEntry?.key
               : await publishEntry(historyUrl, replaceHistory);
           if (!ownsCommit()) {
-            // The adapter puts the committed page back, or renders the newer visit.
-            showDeferredRegistry(_committedDeferredRegistry);
+            // The adapter puts the committed page back, or renders the newer visit. A newer
+            // visit that has applied its page meanwhile keeps its registry on screen.
+            if (_renderedDeferredRegistry === deferredRegistry) {
+              showDeferredRegistry(_committedDeferredRegistry);
+            }
             return false;
           }
         } catch (error) {
-          showDeferredRegistry(_committedDeferredRegistry);
+          if (_renderedDeferredRegistry === deferredRegistry) {
+            showDeferredRegistry(_committedDeferredRegistry);
+          }
           if (_pendingResource?.id === resourceId) {
             _pendingResource = null;
           }

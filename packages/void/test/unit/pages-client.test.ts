@@ -5076,6 +5076,62 @@ describe('deferred group ownership across visits', () => {
     expect(beforeRender).toEqual([]);
   });
 
+  it('keeps a newer visit’s registry on screen when an older visit loses its commit', async () => {
+    stubClientGlobals();
+    initialPage({
+      component: 'home',
+      props: { title: 'A', stats: null },
+      deferredKeys: { stats: 'stats' },
+    });
+    const streamC = ndjson([
+      {
+        component: 'c',
+        props: { title: 'C', usage: null },
+        deferredKeys: { usage: 'usage' },
+        url: '/c',
+        errors: null,
+      },
+    ]);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) =>
+        url === '/b'
+          ? pageJson({ component: 'b', props: { title: 'B' }, url: '/b', errors: null })
+          : streamC.response,
+      ),
+    );
+    const writes = holdHistoryWrites();
+    const { state, adapter, misdirected } = ownershipAdapter();
+    const created = await createTestRouter({
+      adapter,
+      components: { home: loadComponent, b: loadComponent, c: loadComponent },
+      matchRoute: routes,
+    });
+    state.applied = created.initialPageData.props;
+    created.start();
+
+    // B renders and writes its entry; the write is held.
+    const visitB = created.router.visit('/b', { method: 'POST' }).catch(() => undefined);
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    // C supersedes B, renders, and writes its own entry: C is the page on screen.
+    const visitC = created.router.visit('/c', { method: 'POST' });
+    await vi.waitFor(() => expect(writes).toHaveLength(2));
+    expect(state.applied?.title).toBe('C');
+
+    // B's write completes after it lost the navigation.
+    writes[0]!();
+    await visitB;
+    streamC.send({ __deferred: 'usage', data: 5 });
+    await vi.waitFor(() => expect(state.updates).toContainEqual({ target: 'C', applied: 'C' }));
+    // The committed page's group does not reach the page on screen.
+    resolveHtmlDeferred('stats', 1);
+    await tick();
+    expect(misdirected()).toEqual([]);
+
+    writes[1]!();
+    await visitC;
+  });
+
   it('applies a prefetched page’s resolved deferred values without notifying the page on screen', async () => {
     stubClientGlobals();
     initialPage({ component: 'home', props: { title: 'A' } });
