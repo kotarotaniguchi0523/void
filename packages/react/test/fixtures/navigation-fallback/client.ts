@@ -1,5 +1,6 @@
 import React from 'react';
-import type { NavigationState, VoidRouter } from 'void/pages-client';
+import type { NavigationState, VisitOptions, VoidRouter } from 'void/pages-client';
+import { action } from '../../../src/runtime/action.ts';
 import { startReactPages } from '../../../src/runtime/pages-client.ts';
 import { useNavigation } from '../../../src/runtime/use-navigation.ts';
 
@@ -10,12 +11,15 @@ declare global {
     >;
     __navigateInAction(destination: string, method: string): void;
     __finishAction?: () => void;
+    __visit(url: string, options?: VisitOptions): Promise<unknown>;
   }
 }
 
 window.__navigationSnapshots = [];
 
 let router: VoidRouter;
+// The public overload only accepts generated action URLs; this fixture uses plain paths.
+const submit = action as unknown as (url: string, options: { method: string }) => Promise<unknown>;
 let nextLayoutInstance = 0;
 
 const scrollReady = new Promise<void>((resolve) => {
@@ -81,6 +85,10 @@ function Dashboard() {
   );
 }
 
+function About() {
+  return React.createElement('main', null, React.createElement('h1', null, 'About'));
+}
+
 function NavigationFallback() {
   useRecordNavigation();
   React.useLayoutEffect(() => {
@@ -96,11 +104,15 @@ void startReactPages({
     home: async () => ({ default: Home }),
     dashboard: async () => ({ default: Dashboard }),
     scroll: async () => ({ default: ScrollPage }),
+    about: async () => ({ default: About }),
   },
-  layoutTree: { home: ['layout'], dashboard: ['layout'] },
+  layoutTree: { home: ['layout'], dashboard: ['layout'], about: ['layout'] },
   routeMeta: {},
   matchRoute: (url) => {
     const path = new URL(url, location.origin).pathname;
+    if (path === '/about') {
+      return 'about';
+    }
     return path === '/dashboard' ? 'dashboard' : path === '/scroll.html' ? 'scroll' : 'home';
   },
   staticPageData: false,
@@ -112,19 +124,24 @@ void startReactPages({
   navigationFallback: location.search.includes('fallback=off') ? undefined : NavigationFallback,
 }).then((client) => {
   router = client.router;
+  window.__visit = (url, options) => router.visit(url, options);
   window.__navigateInAction = (destination, method) => {
     React.startTransition(async () => {
       // This fixture exercises the data-ready reveal. Hold its frame until the shell arrives,
       // so network latency cannot select the separate network-bound fallback path.
       const frames: Array<FrameRequestCallback> = [];
       const requestFrame = window.requestAnimationFrame;
-      let navigation: ReturnType<VoidRouter['visit']>;
+      let navigation: Promise<unknown>;
       try {
         window.requestAnimationFrame = (callback) => {
           frames.push(callback);
           return 0;
         };
-        navigation = router.visit(destination, { method, _resolveOnShell: true });
+        // The public router only issues GET visits; other methods are page actions.
+        navigation =
+          method === 'GET'
+            ? router.visit(destination, { resolveOn: 'data' })
+            : submit(destination, { method });
       } finally {
         window.requestAnimationFrame = requestFrame;
       }

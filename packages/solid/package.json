@@ -22,6 +22,10 @@
       "types": "./dist/runtime/index.d.mts",
       "default": "./src/runtime/index.ts"
     },
+    "./internal": {
+      "types": "./dist/runtime/internal.d.mts",
+      "default": "./src/runtime/internal.ts"
+    },
     "./plugin": {
       "types": "./dist/plugin.d.mts",
       "import": "./dist/plugin.mjs"

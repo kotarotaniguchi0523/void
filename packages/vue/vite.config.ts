@@ -6,6 +6,7 @@ export default defineConfig({
       'src/runtime/PageErrorBoundary.ts',
       'src/index.ts',
       'src/plugin.ts',
+      'src/runtime/internal.ts',
       'src/runtime/use-deferred.ts',
     ],
     format: 'esm',

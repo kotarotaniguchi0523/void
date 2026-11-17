@@ -22,6 +22,10 @@
       "svelte": "./src/runtime/index.ts",
       "default": "./src/runtime/index.ts"
     },
+    "./internal": {
+      "svelte": "./src/runtime/internal.ts",
+      "default": "./src/runtime/internal.ts"
+    },
     "./plugin": {
       "types": "./dist/plugin.d.mts",
       "import": "./dist/plugin.mjs"

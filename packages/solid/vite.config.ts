@@ -7,6 +7,7 @@ export default defineConfig({
       'src/plugin.ts',
       'src/runtime/index.ts',
       'src/runtime/context.ts',
+      'src/runtime/internal.ts',
     ],
     format: 'esm',
     dts: true,

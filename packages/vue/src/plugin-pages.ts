@@ -349,11 +349,11 @@ function generateClientEntry(
 ): string {
   const { defaultStrategy, hoverDelay, cacheFor } = resolvePrefetchConfig(prefetch);
   return `
-import { createApp, createSSRApp, h, reactive, provide, shallowRef, nextTick, ref } from "vue";
+import { createApp, createSSRApp, h, reactive, provide, shallowRef, nextTick, onErrorCaptured, ref } from "vue";
 import { createDeferred, resolveDeferred, rejectDeferred } from "@void/vue/deferred";
-import { setActionRouter } from "@void/vue";
+import { setActionRouter } from "@void/vue/internal";
 import { PageErrorBoundary } from "@void/vue/pages-boundary";
-import { pageBoundarySlots, showTerminalPageError, createRouterFacade, createVoidRouter, idleNavigationState } from "void/pages-client";
+import { hasPageBoundaries, pageBoundarySlots, showTerminalPageError, createRouterFacade, createVoidRouter, idleNavigationState } from "void/pages-client";
 import { parseCacheFor } from "void/pages-prefetch";
 
 ${generateComponentManifest(scan, pagesDir)}
@@ -368,6 +368,8 @@ const boundaryGeneration = ref(0);
 let currentPageId = "";
 const routeUrl = ref(window.location.pathname + window.location.search + window.location.hash);
 const navigation = reactive(idleNavigationState());
+let captureRenderError;
+const hasBoundaries = hasPageBoundaries(boundaryManifest);
 
 ${PATCH_PROPS_RUNTIME}
 
@@ -383,16 +385,26 @@ const { router, initialPageData, initialComponent, initialLayouts, start, commit
       resolveDeferred(ref, value) { resolveDeferred(ref, value); return ref; },
       rejectDeferred(ref, error) { rejectDeferred(ref, error); return ref; },
       isLoading: (ref) => ref.loading,
-      applyUpdate(pageData, comp, layouts, options) {
-        currentPageId = pageData.component;
-        boundaryGeneration.value++;
-        if (!options?.preserveState) currentPageKey.value++;
-        replaceRecord(shared, pageData.shared || {});
-        replaceRecord(params, pageData.params || {});
-        currentProps.value = pageData.props;
-        currentLayouts.value = layouts;
-        currentComponent.value = comp;
-        return nextTick();
+      async applyUpdate(pageData, comp, layouts, options) {
+        let failure;
+        const capture = (error) => { failure ??= { error }; };
+        // Page boundaries own render failures when the app declares any; what
+        // escapes them reaches the terminal error handler.
+        if (!hasBoundaries) captureRenderError = capture;
+        try {
+          currentPageId = pageData.component;
+          boundaryGeneration.value++;
+          if (!options?.preserveState) currentPageKey.value++;
+          replaceRecord(shared, pageData.shared || {});
+          replaceRecord(params, pageData.params || {});
+          currentProps.value = pageData.props;
+          currentLayouts.value = layouts;
+          currentComponent.value = comp;
+          await nextTick();
+          if (failure) throw failure.error;
+        } finally {
+          if (captureRenderError === capture) captureRenderError = undefined;
+        }
       },
     },
     components, layoutTree, routeMeta, matchRoute, boundaryManifest, dev: import.meta.env.DEV,
@@ -410,11 +422,11 @@ const { router, initialPageData, initialComponent, initialLayouts, start, commit
       navigation.location = next.location;
       navigation.method = next.method;
     },
-  }).catch(error => { if (Object.keys(boundaryManifest.plans).length) showTerminalPageError(); throw error; });
+  }).catch(error => { if (hasBoundaries) showTerminalPageError(); throw error; });
 
 const reactiveRouter = createRouterFacade(router, () => routeUrl.value, () => params);
 
-setActionRouter(reactiveRouter);
+setActionRouter(router);
 
 Object.assign(shared, initialPageData.shared || {});
 replaceRecord(params, initialPageData.params || {});
@@ -432,6 +444,17 @@ const app = createVoidApp({
     provide("__void_params", params);
     provide("__void_router", reactiveRouter);
     provide("__void_navigation", navigation);
+    onErrorCaptured((error, _instance, info) => {
+      // Vue may finish nextTick after reporting an error. Only forward setup
+      // and render failures from the route update to the router.
+      if (captureRenderError && (
+        info === "setup function" || info === "render function" ||
+        info.endsWith("#runtime-0") || info.endsWith("#runtime-1")
+      )) {
+        captureRenderError(error);
+        return false;
+      }
+    });
 
     return () => {
       if (!currentComponent.value) return null;
@@ -447,7 +470,7 @@ const app = createVoidApp({
     };
   }
 });
-if (Object.keys(boundaryManifest.plans).length) app.config.errorHandler = () => showTerminalPageError(routeUrl.value);
+if (hasBoundaries) app.config.errorHandler = () => showTerminalPageError(routeUrl.value);
 
 app.mount(appEl);
 appEl.setAttribute("data-hydrated", "true");

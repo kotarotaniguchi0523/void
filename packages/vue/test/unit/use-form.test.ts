@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
-import type { VoidRouter } from 'void/pages-client';
+import { createActionClient, type RuntimeVoidRouter, type VoidRouter } from 'void/pages-client';
 import { createSSRApp, defineComponent, h, nextTick } from 'vue';
 import { renderToString } from 'vue/server-renderer';
 import { useForm as typedUseForm } from '../../src/runtime/use-form.ts';
@@ -30,7 +30,8 @@ async function renderForm(url: string, params: Record<string, string>) {
       visits.push(target);
       return {};
     },
-  } as unknown as VoidRouter;
+  } as unknown as RuntimeVoidRouter;
+  createActionClient().setActionRouter(router);
   let form!: ReturnType<typeof useForm>;
   const app = createSSRApp(
     defineComponent({
@@ -51,6 +52,7 @@ async function mountForm(
   options?: { resetOnSuccess?: boolean },
   router = { visit: async () => ({}) } as unknown as VoidRouter,
 ): Promise<TestForm> {
+  createActionClient().setActionRouter(router as unknown as RuntimeVoidRouter);
   let form!: TestForm;
   const app = createSSRApp(
     defineComponent({

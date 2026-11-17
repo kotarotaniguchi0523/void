@@ -13,6 +13,7 @@ export function checkLinkPassThroughAttributes(): void {
     onClick: track,
     onMouseenter: () => {},
     activeMatch: 'prefix',
+    viewTransition: false,
   };
   void h(Link, props);
   // @ts-expect-error href is required
@@ -21,5 +22,21 @@ export function checkLinkPassThroughAttributes(): void {
   const badPrefetch: LinkProps = { href: '/users', prefetch: 'sometimes' };
   // @ts-expect-error activeMatch is exact or prefix
   const badActiveMatch: LinkProps = { href: '/users', activeMatch: 'nested' };
-  void [missingHref, badPrefetch, badActiveMatch];
+  // @ts-expect-error Link is an anchor, not a mutation button
+  const mutation: LinkProps = { href: '/users', method: 'POST' };
+  // @ts-expect-error query data belongs in routeUrl(), not Link
+  const queryData: LinkProps = { href: '/users', data: { page: 2 } };
+  // @ts-expect-error use a named strategy
+  const booleanPrefetch: LinkProps = { href: '/users', prefetch: true };
+  // @ts-expect-error viewTransition is a boolean
+  const badViewTransition: LinkProps = { href: '/users', viewTransition: 'fade' };
+  void [
+    missingHref,
+    badPrefetch,
+    badActiveMatch,
+    mutation,
+    queryData,
+    booleanPrefetch,
+    badViewTransition,
+  ];
 }

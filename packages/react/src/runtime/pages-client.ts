@@ -3,7 +3,6 @@ import React, {
   startTransition,
   use,
   useCallback,
-  useEffect,
   useInsertionEffect,
   useLayoutEffect,
   useMemo,
@@ -17,23 +16,26 @@ import { createRoot, hydrateRoot } from 'react-dom/client';
 import {
   createRouterFacade,
   createPageNavigationEngine,
+  documentBaseUrl,
   idleNavigationState,
+  navigationStateFor,
   isAbortError,
   isCallSiteActionError,
   refreshPage,
+  normalizePageUrl,
+  abortError,
+  hasPageBoundaries,
   pageBoundarySlots,
   showTerminalPageError,
   type BoundaryManifest,
-  toUrlString,
   type PageNavigationResource,
   type PageNavigationResult,
   type NavigationState,
-  type VisitOptions,
   type VoidRouter,
+  type RuntimeVoidRouter,
 } from 'void/pages-client';
 import type { CacheForResult, LinkPrefetchValue } from 'void/pages-prefetch';
 import type { PageObject } from 'void/pages-protocol';
-import type { RouteUrlInput } from 'void/routes';
 import { setActionRouter } from './action.ts';
 import {
   ErrorsContext,
@@ -88,6 +90,10 @@ type ReactPageResource = PageNavigationResource & {
   shell: Promise<PageNavigationResult | undefined>;
 };
 
+/**
+ * Reports a visit's commit to the engine, which settles the promise of the visit: the page
+ * data once the page has committed, or the error. An aborted visit rejects with an AbortError.
+ */
 type VisitSettler = {
   resolve(pageData: ReactPageData | undefined): void;
   reject(error: unknown): void;
@@ -110,21 +116,119 @@ type AppAction =
   | { type: 'reveal'; resource: ReactPageResource }
   | { type: 'finish'; resource: ReactPageResource; location: string }
   | { type: 'fail'; resource: ReactPageResource; location: string }
-  | { type: 'abandon'; resource: ReactPageResource; location: string };
+  | { type: 'abandon'; resource: ReactPageResource; location: string }
+  | { type: 'location'; location: string };
+
+/**
+ * The visit `schedule` began last, and what is still owed to it. `schedule` ends the previous
+ * visit before it begins the next, so one record is enough. Every method takes the id of the
+ * visit the caller is working for and does nothing for any other visit.
+ */
+class ActiveVisit {
+  /**
+   * The resource of the visit begun last. It stays after that visit ends: an uncaught render
+   * error names it as the page that failed.
+   */
+  resource: ReactPageResource | null = null;
+  private pending = false;
+  private settler: VisitSettler | null = null;
+  private viewTransitionWaiter: (() => void) | null = null;
+  // With a navigation fallback, React reads a shell that stays pending until the browser has
+  // captured the screen the view transition animates from. The gate settles that shell: with the
+  // destination once the capture is done, or with nothing when the visit ends first.
+  private viewTransitionGate: ((reveal: boolean) => void) | null = null;
+
+  /** The id of the visit that is still pending, or null. */
+  get id(): number | null {
+    return this.pending && this.resource ? this.resource.id : null;
+  }
+
+  isActive(id: number): boolean {
+    return this.id === id;
+  }
+
+  private owns(id: number): boolean {
+    return this.resource !== null && this.resource.id === id;
+  }
+
+  begin(
+    resource: ReactPageResource,
+    settler: VisitSettler,
+    viewTransitionGate: ((reveal: boolean) => void) | null,
+  ): void {
+    this.resource = resource;
+    this.settler = settler;
+    this.viewTransitionWaiter = null;
+    this.viewTransitionGate = viewTransitionGate;
+    this.pending = true;
+  }
+
+  /** Hands over the visit's settler, once. A visit that resolved on its data has none left. */
+  takeSettler(id: number): VisitSettler | undefined {
+    if (!this.owns(id) || !this.settler) {
+      return undefined;
+    }
+    const settler = this.settler;
+    this.settler = null;
+    return settler;
+  }
+
+  /** Keeps the browser's view transition waiting until the visit releases it. */
+  holdViewTransition(id: number, resolve: () => void): void {
+    if (this.owns(id)) {
+      this.viewTransitionWaiter = resolve;
+    }
+  }
+
+  settleViewTransitionGate(id: number, reveal: boolean): void {
+    const settle = this.viewTransitionGate;
+    if (this.owns(id) && settle) {
+      this.viewTransitionGate = null;
+      settle(reveal);
+    }
+  }
+
+  /**
+   * Ends the visit's part in a view transition. A destination still waiting for the browser's
+   * capture is dropped, and a transition waiting for React's commit continues.
+   */
+  releaseViewTransition(id: number): void {
+    this.settleViewTransitionGate(id, false);
+    const resolveViewTransition = this.viewTransitionWaiter;
+    if (this.owns(id) && resolveViewTransition) {
+      this.viewTransitionWaiter = null;
+      resolveViewTransition();
+    }
+  }
+
+  /** Marks the visit as no longer pending. Returns whether it was the pending visit. */
+  end(id: number): boolean {
+    if (!this.isActive(id)) {
+      return false;
+    }
+    this.pending = false;
+    return true;
+  }
+
+  reset(): void {
+    this.resource = null;
+    this.pending = false;
+    this.settler = null;
+    this.viewTransitionWaiter = null;
+    this.viewTransitionGate = null;
+  }
+}
 
 const deferredState = new WeakMap<DeferredResource, DeferredResourceState>();
-const viewTransitionWaiters = new Map<number, () => void>();
-const pendingVisitSettlers = new Map<number, VisitSettler>();
-const committedResources = new Set<number>();
+const activeVisit = new ActiveVisit();
+let committedResources = new WeakSet<ReactPageResource>();
 const EMPTY_PARAMS: Record<string, string> = {};
 
-let terminalResource: ReactPageResource | null = null;
-let activePendingNavigationId: number | null = null;
 // The URL the prerendered HTML was rendered with, while it differs from the browser URL. The
 // hydration commit clears it before effects run, so effects and later renders read the browser URL.
 let prerenderedUrl: string | null = null;
 let scheduleVisit:
-  | ((url: string, options?: VisitOptions) => Promise<ReactPageData | undefined>)
+  | ((resource: PageNavigationResource) => Promise<ReactPageData | undefined>)
   | null = null;
 
 function createDeferredResource(): DeferredResource {
@@ -165,22 +269,12 @@ function currentUrl(): string {
   return window.location.pathname + window.location.search + window.location.hash;
 }
 
-function normalizeUrl(value: RouteUrlInput): string {
-  const urlString = toUrlString(value);
-  if (urlString.startsWith('#')) {
-    return urlString;
-  }
-  // Relative URLs such as `?page=2` resolve against the current page, as in an anchor.
-  const url = new URL(urlString, window.location.href);
-  return url.origin === window.location.origin ? url.pathname + url.search + url.hash : url.href;
-}
-
 /** Page data holds a decoded path. Compare it with browser URLs in their encoded form. */
 function encodedPageUrl(url: string): string {
   if (!url) {
     return url;
   }
-  const parsed = new URL(url, window.location.origin);
+  const parsed = new URL(url, documentBaseUrl());
   return parsed.pathname + parsed.search;
 }
 
@@ -220,19 +314,6 @@ function prerenderedRouteUrl(pageData: ReactPageData): string | null {
   return query ? pageUrl + window.location.hash : null;
 }
 
-function navigationForResource(resource: PageNavigationResource): NavigationState {
-  const method = resource.method.toUpperCase();
-  const isSubmitting = method !== 'GET';
-  return {
-    state: isSubmitting ? 'submitting' : 'loading',
-    location: new URL(resource.fetchUrl + resource.hash, window.location.origin),
-    method:
-      method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE'
-        ? method
-        : 'GET',
-  };
-}
-
 function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case 'begin':
@@ -256,7 +337,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
         return state;
       }
       return {
-        resource: action.resource.immediate ? state.resource : action.resource,
+        resource: action.resource,
         rollbackResource: null,
         pendingId: null,
         routeUrl: action.location,
@@ -285,15 +366,17 @@ function appReducer(state: AppState, action: AppAction): AppState {
         routeUrl: action.location,
         navigation: idleNavigationState(),
       };
+    case 'location':
+      return { ...state, routeUrl: action.location };
   }
 }
 
-function createRouter(engine: Awaited<ReturnType<typeof createPageNavigationEngine>>): VoidRouter {
-  const router: VoidRouter = {
-    _hoverDelay: engine._hoverDelay,
-    _prefetchDefaultStrategy: engine._prefetchDefaultStrategy,
+function createRouter(
+  engine: Awaited<ReturnType<typeof createPageNavigationEngine>>,
+): RuntimeVoidRouter {
+  const router: RuntimeVoidRouter = {
     get url() {
-      return new URL(currentUrl(), window.location.origin);
+      return new URL(currentUrl(), documentBaseUrl());
     },
     get path() {
       return this.url.pathname;
@@ -308,16 +391,16 @@ function createRouter(engine: Awaited<ReturnType<typeof createPageNavigationEngi
       if (!scheduleVisit) {
         return Promise.reject(new Error('router.visit() called before router initialized'));
       }
-      return scheduleVisit(normalizeUrl(url), options);
+      return engine.visit(normalizePageUrl(url), options, scheduleVisit);
     },
     refresh(options = {}) {
       return refreshPage(router, options);
     },
     prefetch(url, options = {}) {
-      return engine.prefetch(normalizeUrl(url), options);
+      return engine.prefetch(normalizePageUrl(url), options);
     },
-    flush(url, method = 'GET') {
-      engine.flush(normalizeUrl(url), method);
+    flush(url) {
+      engine.flush(normalizePageUrl(url));
     },
     flushAll() {
       engine.flushAll();
@@ -397,9 +480,7 @@ function RouteResource({
               dev: config.dev,
               onFailure: () => {
                 onFailure(resource.fetchUrl);
-                if (resource.resolvedUrl) {
-                  onFailure(resource.resolvedUrl);
-                }
+                onFailure(resource.destination());
               },
             },
             child,
@@ -428,12 +509,46 @@ function RouteResource({
   );
 }
 
-function startViewTransition(
-  resource: ReactPageResource,
-  reveal: () => void,
-  enabled: boolean,
-): void {
-  if (!enabled || typeof document.startViewTransition !== 'function') {
+class RouteRenderBoundary extends React.Component<
+  {
+    resourceId: number;
+    pending: boolean;
+    onError(error: unknown): void;
+    children?: React.ReactNode;
+  },
+  { resourceId: number; failure: { error: unknown } | null }
+> {
+  state: { resourceId: number; failure: { error: unknown } | null } = {
+    resourceId: this.props.resourceId,
+    failure: null,
+  };
+
+  static getDerivedStateFromProps(
+    { resourceId }: { resourceId: number },
+    state: { resourceId: number },
+  ) {
+    return resourceId === state.resourceId ? null : { resourceId, failure: null };
+  }
+
+  static getDerivedStateFromError(error: unknown) {
+    return { failure: { error } };
+  }
+
+  componentDidCatch(error: unknown) {
+    this.props.onError(error);
+  }
+
+  render() {
+    const failure = this.state.failure;
+    if (failure && !this.props.pending) {
+      throw failure.error;
+    }
+    return failure ? null : this.props.children;
+  }
+}
+
+function startViewTransition(resource: ReactPageResource, reveal: () => void): void {
+  if (!resource.viewTransition || typeof document.startViewTransition !== 'function') {
     reveal();
     return;
   }
@@ -442,7 +557,7 @@ function startViewTransition(
   const readyForCapture = new Promise<void>((resolve) => {
     resolveViewTransition = resolve;
   });
-  viewTransitionWaiters.set(resource.id, resolveViewTransition);
+  activeVisit.holdViewTransition(resource.id, resolveViewTransition);
   document.startViewTransition(() => {
     reveal();
     return readyForCapture;
@@ -453,13 +568,11 @@ function App({
   config,
   engine,
   router,
-  viewTransitions,
   navigationFallback: NavigationFallback,
 }: {
   config: ReactPagesConfig;
   engine: Awaited<ReturnType<typeof createPageNavigationEngine>>;
-  router: VoidRouter;
-  viewTransitions: boolean;
+  router: RuntimeVoidRouter;
   navigationFallback?: ComponentType<{ initialPageData: PageObject }>;
 }): React.ReactNode {
   const initialPageData = engine.initialPageData as ReactPageData;
@@ -472,12 +585,13 @@ function App({
       hash: window.location.hash,
       method: 'GET',
       options: {},
-      immediate: false,
+      viewTransition: false,
       shell: Promise.resolve({
         pageData: initialPageData,
         component: engine.initialComponent,
         layouts: engine.initialLayouts,
       }),
+      destination: currentUrl,
       abort() {},
       async commit() {
         engine.commitInitialRender();
@@ -526,59 +640,53 @@ function App({
     navigationStore.getSnapshot,
   );
 
+  // A failed batched visit can restore the same resource identities. Its state
+  // commit still acknowledges that the abandoned render has left the tree.
+  useLayoutEffect(() => {
+    engine.releaseRetiredResources(
+      new Set([state.resource.id, ...(state.rollbackResource ? [state.rollbackResource.id] : [])]),
+    );
+  }, [engine, state]);
+
   const finishNavigation = useCallback(
     (resource: ReactPageResource, result: PageNavigationResult) => {
-      if (committedResources.has(resource.id)) {
+      if (committedResources.has(resource)) {
         return;
       }
-      committedResources.add(resource.id);
+      committedResources.add(resource);
       resource
         .commit()
         .then((committed) => {
-          const resolveViewTransition = viewTransitionWaiters.get(resource.id);
-          if (resolveViewTransition) {
-            viewTransitionWaiters.delete(resource.id);
-            resolveViewTransition();
-          }
-          const visitSettler = pendingVisitSettlers.get(resource.id);
+          activeVisit.releaseViewTransition(resource.id);
+          const visitSettler = activeVisit.takeSettler(resource.id);
           if (visitSettler) {
-            pendingVisitSettlers.delete(resource.id);
             if (committed) {
               visitSettler.resolve(result.pageData);
-            } else if (resource.method.toUpperCase() === 'GET') {
-              // A newer visit committed first. Settle like any abandoned visit.
-              visitSettler.resolve(undefined);
             } else {
-              visitSettler.reject(new DOMException('Navigation aborted', 'AbortError'));
+              // A newer visit committed first: report this one as aborted, like any abandoned
+              // visit. A visit that resolves on its shell has dropped its settler by now.
+              visitSettler.reject(abortError());
             }
           }
-          if (!committed) {
-            return;
+          const active = activeVisit.end(resource.id);
+          if (committed) {
+            dispatch({ type: 'finish', resource, location: currentUrl() });
+          } else if (active) {
+            dispatch({ type: 'abandon', resource, location: currentUrl() });
           }
-          if (activePendingNavigationId === resource.id) {
-            activePendingNavigationId = null;
-          }
-          dispatch({ type: 'finish', resource, location: currentUrl() });
         })
         .catch((error) => {
           // The history write failed, so the address bar still shows the committed page.
           // End this visit and show that page again; a newer visit keeps its own state.
-          const resolveViewTransition = viewTransitionWaiters.get(resource.id);
-          if (resolveViewTransition) {
-            viewTransitionWaiters.delete(resource.id);
-            resolveViewTransition();
-          }
-          const visitSettler = pendingVisitSettlers.get(resource.id);
+          activeVisit.releaseViewTransition(resource.id);
+          const visitSettler = activeVisit.takeSettler(resource.id);
           if (visitSettler) {
-            pendingVisitSettlers.delete(resource.id);
             visitSettler.reject(error);
           } else {
             // A data-ready visit has already settled with its result.
             reportError(error);
           }
-          if (activePendingNavigationId === resource.id) {
-            activePendingNavigationId = null;
-          }
+          activeVisit.end(resource.id);
           dispatch({ type: 'fail', resource, location: currentUrl() });
         });
     },
@@ -586,35 +694,15 @@ function App({
   );
 
   const schedule = useCallback(
-    (url: string, options: VisitOptions = {}) => {
-      const prepared = engine.prepareVisit(url, options) as ReactPageResource;
+    (resource: PageNavigationResource) => {
+      const supersededId = activeVisit.id;
+      if (supersededId !== null) {
+        activeVisit.takeSettler(supersededId)?.reject(abortError());
+        activeVisit.releaseViewTransition(supersededId);
+      }
+      const prepared = resource as ReactPageResource;
       const resolveOnData =
         prepared.options.resolveOn === 'data' || prepared.options._resolveOnShell;
-      if (prepared.immediate) {
-        const navigation = navigationForResource(prepared);
-        navigationStore.set(navigation);
-
-        activePendingNavigationId = prepared.id;
-        dispatch({ type: 'begin', resource: prepared, navigation });
-
-        return prepared.shell.then(
-          (result) => {
-            if (activePendingNavigationId === prepared.id) {
-              activePendingNavigationId = null;
-            }
-            dispatch({ type: 'finish', resource: prepared, location: currentUrl() });
-            return result?.pageData;
-          },
-          (error) => {
-            if (activePendingNavigationId === prepared.id) {
-              activePendingNavigationId = null;
-            }
-            dispatch({ type: 'fail', resource: prepared, location: currentUrl() });
-            throw error;
-          },
-        );
-      }
-
       let resolveVisit!: (pageData: ReactPageData | undefined) => void;
       let rejectVisit!: (error: unknown) => void;
       const pagePromise = new Promise<ReactPageData | undefined>((resolve, reject) => {
@@ -622,79 +710,72 @@ function App({
         rejectVisit = reject;
       });
 
+      const shell = prepared.shell.then(
+        (result) => {
+          if (!result) {
+            activeVisit.releaseViewTransition(prepared.id);
+            activeVisit.takeSettler(prepared.id);
+            activeVisit.end(prepared.id);
+            // The browser is leaving or downloading a file: keep the current page.
+            dispatch({ type: 'abandon', resource: prepared, location: currentUrl() });
+            resolveVisit(undefined);
+          } else if (resolveOnData) {
+            // The engine has resolved the visit with this data and nothing waits for the
+            // commit: the report ends here, and a failure after it is reported as an error.
+            activeVisit.takeSettler(prepared.id);
+            resolveVisit(result.pageData);
+          }
+          return result;
+        },
+        (error) => {
+          activeVisit.releaseViewTransition(prepared.id);
+          activeVisit.takeSettler(prepared.id);
+          rejectVisit(error);
+          activeVisit.end(prepared.id);
+          if (
+            NavigationFallback ||
+            resolveOnData ||
+            isAbortError(error) ||
+            isCallSiteActionError(error)
+          ) {
+            dispatch({ type: 'abandon', resource: prepared, location: currentUrl() });
+            return undefined;
+          }
+          dispatch({ type: 'fail', resource: prepared, location: currentUrl() });
+          throw error;
+        },
+      );
+      // The fallback is on screen while the shell loads, so a view transition has to capture it
+      // before React renders the destination. React reads a shell that waits for that capture.
+      const gated =
+        Boolean(NavigationFallback) &&
+        prepared.viewTransition &&
+        typeof document.startViewTransition === 'function';
+      let settleCapture: ((reveal: boolean) => void) | null = null;
+      const captured = gated
+        ? new Promise<boolean>((resolve) => {
+            settleCapture = resolve;
+          })
+        : null;
       const next: ReactPageResource = {
         ...prepared,
-        get resolvedUrl() {
-          return prepared.resolvedUrl;
-        },
-        shell: prepared.shell.then(
-          (result) => {
-            if (!result) {
-              const resolveViewTransition = viewTransitionWaiters.get(prepared.id);
-              if (resolveViewTransition) {
-                viewTransitionWaiters.delete(prepared.id);
-                resolveViewTransition();
-              }
-              pendingVisitSettlers.delete(prepared.id);
-              if (activePendingNavigationId === prepared.id) {
-                activePendingNavigationId = null;
-              }
-              // The browser is leaving or downloading a file: keep the current page.
-              dispatch({ type: 'abandon', resource: prepared, location: currentUrl() });
-              resolveVisit(undefined);
-            } else if (resolveOnData) {
-              pendingVisitSettlers.delete(prepared.id);
-              resolveVisit(result.pageData);
-            }
-            return result;
-          },
-          (error) => {
-            const resolveViewTransition = viewTransitionWaiters.get(prepared.id);
-            if (resolveViewTransition) {
-              viewTransitionWaiters.delete(prepared.id);
-              resolveViewTransition();
-            }
-            pendingVisitSettlers.delete(prepared.id);
-            // Public data completion keeps the usual cancellation behavior for GETs.
-            const abortingGetVisit =
-              prepared.method.toUpperCase() === 'GET' &&
-              !prepared.options._resolveOnShell &&
-              isAbortError(error);
-            if (abortingGetVisit) {
-              resolveVisit(undefined);
-            } else {
-              rejectVisit(error);
-            }
-            if (activePendingNavigationId === prepared.id) {
-              activePendingNavigationId = null;
-            }
-            if (
-              NavigationFallback ||
-              resolveOnData ||
-              isAbortError(error) ||
-              isCallSiteActionError(error)
-            ) {
-              dispatch({ type: 'abandon', resource: prepared, location: currentUrl() });
-              return undefined;
-            }
-            dispatch({ type: 'fail', resource: prepared, location: currentUrl() });
-            throw error;
-          },
-        ),
+        shell: captured
+          ? shell.then(
+              (result) => result && captured.then((reveal) => (reveal ? result : undefined)),
+            )
+          : shell,
       };
-      const navigation = navigationForResource(next);
+      const navigation = navigationStateFor(next.fetchUrl + next.hash, next.method);
       navigationStore.set(navigation);
 
-      terminalResource = next;
-      pendingVisitSettlers.set(next.id, { resolve: resolveVisit, reject: rejectVisit });
-      activePendingNavigationId = next.id;
+      activeVisit.begin(next, { resolve: resolveVisit, reject: rejectVisit }, settleCapture);
       dispatch({ type: 'begin', resource: next, navigation });
 
       if (NavigationFallback) {
         let shellSettled = false;
         let revealed = false;
         const reveal = (settled: boolean) => {
-          if (revealed || activePendingNavigationId !== next.id) {
+          if (revealed || !activeVisit.isActive(next.id)) {
             return;
           }
           revealed = true;
@@ -704,10 +785,29 @@ function App({
             dispatch({ type: 'reveal', resource: next });
           }
         };
-        next.shell.then((result) => {
+        shell.then((result) => {
           shellSettled = true;
-          if (result) {
+          if (!result) {
+            return;
+          }
+          if (!gated) {
             reveal(true);
+            return;
+          }
+          if (!activeVisit.isActive(next.id)) {
+            return;
+          }
+          // The browser captures the old page, or the fallback when it is already committed,
+          // before this callback runs. A visit superseded in between has been released.
+          const update = () => {
+            activeVisit.settleViewTransitionGate(next.id, true);
+            reveal(true);
+          };
+          try {
+            startViewTransition(next, update);
+          } catch {
+            update();
+            activeVisit.releaseViewTransition(next.id);
           }
         });
         // A cached shell settles before the next paint. Avoid committing the fallback
@@ -726,33 +826,31 @@ function App({
         });
       };
 
-      next.shell.then(
+      shell.then(
         (result) => {
-          if (result && activePendingNavigationId === next.id) {
-            startViewTransition(next, reveal, options.viewTransition ?? viewTransitions);
+          if (result && activeVisit.isActive(next.id)) {
+            startViewTransition(next, reveal);
           }
         },
         () => {},
       );
       return pagePromise;
     },
-    [engine, NavigationFallback, navigationStore, startTransition, viewTransitions],
+    [NavigationFallback, navigationStore, startTransition],
   );
 
   useInsertionEffect(() => {
     scheduleVisit = schedule;
+    engine.setBrowserVisitHandler(schedule);
+    engine.setLocationHandler(() => dispatch({ type: 'location', location: currentUrl() }));
     return () => {
+      engine.setBrowserVisitHandler(null);
+      engine.setLocationHandler(null);
       if (scheduleVisit === schedule) {
         scheduleVisit = null;
       }
     };
-  }, [schedule]);
-
-  useEffect(() => {
-    engine.setPopStateHandler((url, options) => {
-      router.visit(url, options);
-    });
-  }, [engine, router]);
+  }, [engine, schedule]);
 
   const navigationValue = useMemo<NavigationState>(() => {
     if (state.navigation.state !== 'idle' || !isTransitionPending) {
@@ -765,6 +863,13 @@ function App({
       state: 'loading',
     };
   }, [isTransitionPending, lastNavigation, state.navigation]);
+
+  const routeResource = React.createElement(RouteResource, {
+    resource: state.resource,
+    onCommit: finishNavigation,
+    config,
+    onFailure: (url: string) => engine.flush(url),
+  });
 
   const routerValue = useMemo(
     () =>
@@ -788,23 +893,40 @@ function App({
               ? React.createElement(NavigationFallback, { initialPageData })
               : null,
         },
-        React.createElement(RouteResource, {
-          resource: state.resource,
-          onCommit: finishNavigation,
-          config,
-          onFailure: (url: string) => engine.flush(url),
-        }),
+        // Page boundaries own render failures when the app declares any; what
+        // escapes them reaches the root's terminal error handler.
+        hasPageBoundaries(config.boundaryManifest)
+          ? routeResource
+          : React.createElement(
+              RouteRenderBoundary,
+              {
+                resourceId: state.resource.id,
+                pending: state.pendingId === state.resource.id,
+                onError(error) {
+                  const resource = state.resource;
+                  if (!activeVisit.end(resource.id)) {
+                    return;
+                  }
+                  activeVisit.releaseViewTransition(resource.id);
+                  const settler = activeVisit.takeSettler(resource.id);
+                  if (settler) {
+                    settler.reject(error);
+                  } else {
+                    reportError(error);
+                  }
+                  dispatch({ type: 'fail', resource, location: currentUrl() });
+                },
+              },
+              routeResource,
+            ),
       ),
     ),
   );
 }
 
 export async function startReactPages(config: ReactPagesConfig): Promise<ReactPagesClient> {
-  terminalResource = null;
-  viewTransitionWaiters.clear();
-  pendingVisitSettlers.clear();
-  committedResources.clear();
-  activePendingNavigationId = null;
+  activeVisit.reset();
+  committedResources = new WeakSet();
   prerenderedUrl = null;
 
   const engine = await createPageNavigationEngine({
@@ -828,7 +950,7 @@ export async function startReactPages(config: ReactPagesConfig): Promise<ReactPa
     boundaryManifest: config.boundaryManifest,
     dev: config.dev,
   }).catch((error) => {
-    if (config.boundaryManifest && Object.keys(config.boundaryManifest.plans).length) {
+    if (hasPageBoundaries(config.boundaryManifest)) {
       showTerminalPageError();
     }
     throw error;
@@ -849,7 +971,6 @@ export async function startReactPages(config: ReactPagesConfig): Promise<ReactPa
     config,
     engine,
     router,
-    viewTransitions: config.viewTransitions,
     navigationFallback: config.navigationFallback,
   });
   startTransition(() => {
@@ -868,34 +989,23 @@ export async function startReactPages(config: ReactPagesConfig): Promise<ReactPa
         console.error(error);
       }
     };
-    const rootOptions =
-      config.boundaryManifest && Object.keys(config.boundaryManifest.plans).length
-        ? {
-            onRecoverableError,
-            onUncaughtError: (error: unknown) => {
-              const resource = terminalResource;
-              if (resource) {
-                resource.dispose();
-                engine.flush(resource.fetchUrl);
-                engine.flush(resource.resolvedUrl ?? resource.fetchUrl);
-              }
-              for (const settler of pendingVisitSettlers.values()) {
-                settler.reject(error);
-              }
-              pendingVisitSettlers.clear();
-              for (const resolve of viewTransitionWaiters.values()) {
-                resolve();
-              }
-              viewTransitionWaiters.clear();
-              activePendingNavigationId = null;
-              showTerminalPageError(
-                resource
-                  ? (resource.resolvedUrl ?? resource.fetchUrl + resource.hash)
-                  : currentUrl(),
-              );
-            },
-          }
-        : { onRecoverableError };
+    const rootOptions = hasPageBoundaries(config.boundaryManifest)
+      ? {
+          onRecoverableError,
+          onUncaughtError: (error: unknown) => {
+            const resource = activeVisit.resource;
+            if (resource) {
+              resource.dispose();
+              engine.flush(resource.fetchUrl);
+              engine.flush(resource.destination());
+              activeVisit.takeSettler(resource.id)?.reject(error);
+              activeVisit.releaseViewTransition(resource.id);
+              activeVisit.end(resource.id);
+            }
+            showTerminalPageError(resource ? resource.destination() : currentUrl());
+          },
+        }
+      : { onRecoverableError };
     if (!isSsr) {
       createRoot(appEl, rootOptions).render(appRoot);
     } else {
@@ -904,5 +1014,5 @@ export async function startReactPages(config: ReactPagesConfig): Promise<ReactPa
   });
   engine.start();
 
-  return { router };
+  return { router: createRouterFacade(router, currentUrl) };
 }

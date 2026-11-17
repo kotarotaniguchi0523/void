@@ -155,7 +155,8 @@ import { createSignal, createComponent, createMemo, mergeProps, untrack, batch }
 import { createMutable } from "solid-js/store";
 import { hydrate, render } from "solid-js/web";
 import { PageErrorBoundary } from "@void/solid/pages-boundary";
-import { SharedContext, ErrorsContext, ParamsContext, RouterContext, NavigationContext, setActionRouter } from "@void/solid";
+import { SharedContext, ErrorsContext, ParamsContext, RouterContext, NavigationContext } from "@void/solid";
+import { setActionRouter } from "@void/solid/internal";
 import { pageBoundarySlots, showTerminalPageError, createRouterFacade, createVoidRouter, idleNavigationState } from "void/pages-client";
 import { parseCacheFor } from "void/pages-prefetch";
 
@@ -234,7 +235,7 @@ const { router, initialPageData, initialComponent, initialLayouts, start, commit
 
 const reactiveRouter = createRouterFacade(router, () => routeUrl(), () => routeParams());
 
-setActionRouter(reactiveRouter);
+setActionRouter(router);
 
 batch(() => {
   setPage({ component: initialComponent, id: initialPageData.component });

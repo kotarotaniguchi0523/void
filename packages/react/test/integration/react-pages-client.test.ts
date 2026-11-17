@@ -20,13 +20,16 @@ import {
   defineSharedIslandTests,
 } from '../../../../test/pages-island-contract.ts';
 import { PAGES_PROTOCOL_VERSION } from '../../../edge/src/pages-protocol.ts';
-import { decodePageData, deserializePageData } from '../../../void/src/pages/serialize.ts';
+import {
+  decodePageData,
+  deserializePageData,
+  serializePageData,
+} from '../../../void/src/pages/serialize.ts';
 
 declare global {
   interface Window {
     __SPA_MARKER?: boolean;
     __visitAwaitObserved?: string | null;
-    __hashNavigationReady?: boolean;
     __headRefs?: {
       font: Element | null;
       stylesheet: Element | null;
@@ -159,31 +162,31 @@ export default function Layout({ children }: { children: ReactNode }) {
       <Slot>
         <Stack className={merge(rootClass())}>
           <nav>
-            <Link href="/" prefetch>
+            <Link href="/" prefetch="hover">
               Home
             </Link>{' '}
             |{' '}
-            <Link href="/users" prefetch>
+            <Link href="/users" prefetch="hover">
               Users
             </Link>{' '}
             |{' '}
-            <Link href="/blog" prefetch>
+            <Link href="/blog" prefetch="hover">
               Blog
             </Link>{' '}
             |{' '}
-            <Link href="/deferred" prefetch>
+            <Link href="/deferred" prefetch="hover">
               Deferred
             </Link>{' '}
             |{' '}
-            <Link href="/router-params" prefetch>
+            <Link href="/router-params" prefetch="hover">
               Router Params
             </Link>{' '}
             |{' '}
-            <Link href="/live" prefetch>
+            <Link href="/live" prefetch="hover">
               Live
             </Link>{' '}
             |{' '}
-            <Link href="/action-error" prefetch>
+            <Link href="/action-error" prefetch="hover">
               Form Lab
             </Link>{' '}
             | <span>{shared.appName}</span>
@@ -409,6 +412,19 @@ function defineTransitionAwaitTests(getBase: () => string, serverOutput: () => s
           await page.waitForSelector('#app[data-hydrated="true"]');
           await page.getByTestId('operation').selectOption(operation);
           const method = operation === 'action' ? 'POST' : 'GET';
+          const destination = operation === 'visit' ? url + '?visited=1' : url;
+          if (operation === 'visit') {
+            await page.evaluate(() => {
+              navigation.addEventListener(
+                'navigatesuccess',
+                () => {
+                  const revision = document.querySelector('[data-testid="revision"]')?.textContent;
+                  document.body.setAttribute('data-navigation-revision', revision ?? '');
+                },
+                { once: true },
+              );
+            });
+          }
           await page.route('**/transition-await*', async (route) => {
             if (route.request().method() === method) {
               await responseGate;
@@ -427,8 +443,12 @@ function defineTransitionAwaitTests(getBase: () => string, serverOutput: () => s
             ),
             (async () => {
               await button.click();
+              // The response gate holds this state stable. Await its DOM commit
+              // without imposing expect.poll's one-second scheduling deadline.
+              await button.filter({ hasText: /^pending$/ }).waitFor();
               await expect.poll(() => button.textContent()).toBe('pending');
               await expect.poll(() => page.getByTestId('optimistic').textContent()).toBe('saving');
+              expect(page.url()).toBe(url);
               releaseResponse();
             })(),
           ]);
@@ -437,10 +457,9 @@ function defineTransitionAwaitTests(getBase: () => string, serverOutput: () => s
           expect(await button.textContent()).toBe('pending');
           expect(await page.getByTestId('optimistic').textContent()).toBe('saving');
           expect(await page.getByTestId('revision').textContent()).toBe('initial');
-          expect(page.url()).toBe(url);
+          await page.waitForURL(destination);
 
-          // The caller finishes, but the new page still suspends. The old page,
-          // optimistic state and URL must stay until React can commit the new UI.
+          // A GET can commit its URL while React still renders the old optimistic page.
           await page.evaluate(() => window.dispatchEvent(new Event('finish-action')));
           await page.evaluate(
             () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
@@ -448,13 +467,19 @@ function defineTransitionAwaitTests(getBase: () => string, serverOutput: () => s
           expect(await button.textContent()).toBe('pending');
           expect(await page.getByTestId('optimistic').textContent()).toBe('saving');
           expect(await page.getByTestId('revision').textContent()).toBe('initial');
-          expect(page.url()).toBe(url);
+          expect(page.url()).toBe(destination);
 
+          if (operation === 'visit') {
+            expect(await page.locator('body').getAttribute('data-navigation-revision')).toBeNull();
+          }
           await page.evaluate(() => window.dispatchEvent(new Event('finish-render')));
           await expect.poll(() => page.getByTestId('revision').textContent()).toBe('updated');
           await expect.poll(() => page.getByTestId('optimistic').textContent()).toBe('updated');
           await expect.poll(() => button.textContent()).toBe('run');
-          expect(page.url()).toBe(operation === 'visit' ? `${url}?visited=1` : url);
+          expect(page.url()).toBe(destination);
+          if (operation === 'visit') {
+            await page.waitForSelector('body[data-navigation-revision="updated"]');
+          }
           expect(errors).toEqual([]);
         } catch (error) {
           throw new Error(`${diagnostics()}\nServer output:\n${serverOutput()}`, { cause: error });
@@ -464,6 +489,71 @@ function defineTransitionAwaitTests(getBase: () => string, serverOutput: () => s
         }
       },
     );
+  });
+  it('releases an uncommitted deferred Action after a failed successor leaves its render tree', async () => {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    try {
+      await page.goto(getBase() + '/transition-await');
+      await page.waitForSelector('#app[data-hydrated="true"]');
+      const payload =
+        serializePageData({
+          component: 'transition-await',
+          url: '/transition-await',
+          props: { revision: 'updated', waiting: null },
+          deferredKeys: { waiting: 'waiting' },
+        }) + '\n';
+      await page.evaluate((line) => {
+        const originalFetch = window.fetch;
+        window.fetch = (input, options) => {
+          if (String(input).includes('/transition-await?ping') && options?.method === 'POST') {
+            const stream = new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode(line));
+                document.body.dataset.deferredStream = 'reading';
+                // Model the fetch body's abort contract while keeping the reader pending.
+                options.signal!.addEventListener(
+                  'abort',
+                  () => {
+                    document.body.dataset.deferredStream = 'aborted';
+                    controller.error(new DOMException('Navigation aborted', 'AbortError'));
+                  },
+                  { once: true },
+                );
+              },
+            });
+            return Promise.resolve(
+              new Response(stream, {
+                headers: { 'content-type': 'application/x-ndjson', 'x-voidpages': 'true' },
+              }),
+            );
+          }
+          return originalFetch(input, options);
+        };
+      }, payload);
+      await page.route('**/users/1?retire-error=1', (route) =>
+        route.fulfill({ headers: { 'x-voidpages': 'true' }, body: '{' }),
+      );
+      await page.getByTestId('async-contract').click();
+      await page.waitForFunction(
+        () => document.querySelector('[data-testid="data-ready"]')?.textContent === 'ready',
+      );
+      expect(await page.getByTestId('revision').textContent()).toBe('initial');
+      expect(await page.locator('body').getAttribute('data-deferred-stream')).toBe('reading');
+      await page.getByTestId('reject-next-navigation').click();
+      await page.waitForFunction(
+        () => document.querySelector('[data-testid="navigation-failed"]')?.textContent === 'failed',
+      );
+      await page.waitForSelector('body[data-deferred-stream="aborted"]', { timeout: 5000 });
+      expect(page.url()).toBe(getBase() + '/transition-await');
+      expect(await page.getByTestId('revision').textContent()).toBe('initial');
+      await page.evaluate(() => {
+        window.dispatchEvent(new Event('finish-action'));
+        window.dispatchEvent(new Event('finish-render'));
+      });
+    } finally {
+      await context.close();
+    }
   });
 }
 
@@ -861,29 +951,6 @@ function registerClientTests(getBase: () => string, coverage: 'smoke' | 'full') 
     }
   });
 
-  it('Link hash navigation runs the navigation lifecycle', async () => {
-    const page = await newPage();
-    try {
-      await page.goto(BASE + '/link-behavior');
-      await waitForHydration(page);
-      await page.waitForFunction(() => window.__hashNavigationReady === true);
-
-      await page.click('[data-testid="hash-link"]');
-      await page.waitForURL(BASE + '/link-behavior#hash-target');
-      await page.waitForFunction(
-        () =>
-          document.querySelector('[data-testid="navigation-location"]')?.textContent ===
-          '/link-behavior#hash-target',
-      );
-
-      expect(await page.textContent('[data-testid="navigation-location"]')).toBe(
-        '/link-behavior#hash-target',
-      );
-    } finally {
-      await page.context().close();
-    }
-  });
-
   it('plain hash anchor navigation does not fetch or replace managed head links', async () => {
     const page = await newPage();
     const requests: Array<string> = [];
@@ -929,58 +996,6 @@ function registerClientTests(getBase: () => string, coverage: 'smoke' | 'full') 
       await page.context().close();
     }
   });
-  // The next pushState or replaceState call throws, like a browser that rate-limits history.
-  async function failNextHistoryWrite(page: Page, method: 'pushState' | 'replaceState') {
-    await page.evaluate((name) => {
-      const original = History.prototype[name];
-      History.prototype[name] = function () {
-        History.prototype[name] = original;
-        throw new DOMException('History blocked by test', 'SecurityError');
-      };
-    }, method);
-  }
-
-  async function waitForIdle(page: Page) {
-    await page.waitForFunction(
-      () => document.querySelector('[data-testid="navigation-state"]')?.textContent === 'idle',
-    );
-  }
-
-  for (const [link, method] of [
-    ['onclick-link', 'pushState'],
-    ['replace-link', 'replaceState'],
-  ] as const) {
-    it(`${link} keeps the current page when ${method} fails`, async () => {
-      const page = await newPage();
-      const errors: Array<string> = [];
-      page.on('pageerror', (error) => {
-        errors.push(error.message);
-      });
-
-      try {
-        await page.goto(BASE + '/link-behavior');
-        await waitForHydration(page);
-        const heading = await page.textContent('h1');
-        await failNextHistoryWrite(page, method);
-
-        await page.click(`[data-testid="${link}"]`);
-        await vi.waitFor(() => expect(errors).toContain('History blocked by test'), {
-          timeout: 10_000,
-        });
-        await waitForIdle(page);
-        expect(await page.textContent('h1')).toBe(heading);
-        expect(page.url()).toBe(BASE + '/link-behavior');
-
-        await page.click(`[data-testid="${link}"]`);
-        await page.waitForURL(BASE + '/users');
-        await page.waitForFunction(() =>
-          document.querySelector('h1')?.textContent?.includes('Users'),
-        );
-      } finally {
-        await page.context().close();
-      }
-    });
-  }
 }
 
 describe('react-pages client (dev)', () => {

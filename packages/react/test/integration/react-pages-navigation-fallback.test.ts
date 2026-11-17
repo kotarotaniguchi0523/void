@@ -339,3 +339,255 @@ it('shows a visited page without remounting the fallback while refreshing it', a
     await page.close();
   }
 });
+
+type TransitionRecord = { atStart: Array<string>; atEnd: Array<string> | null };
+type TransitionWindow = Window & {
+  __transitions: Array<TransitionRecord>;
+  __headingsSeen: Array<string>;
+  __navigationFallbackMounts?: number;
+  __onStartViewTransition?: () => void;
+};
+
+/**
+ * Opens the fixture with page data served by the test. `gates` holds a page's response until
+ * the test releases it. The page records every view transition with the headings on screen when
+ * its update callback starts and when the callback's promise resolves.
+ */
+async function openTransitionPage(gates: Record<string, Promise<void>> = {}) {
+  const page = await browser.newPage();
+  await page.route('**/*', async (route) => {
+    if (route.request().headers()['x-voidpages'] !== 'true') {
+      await route.continue();
+      return;
+    }
+    const path = new URL(route.request().url()).pathname;
+    if (route.request().headers()['purpose'] !== 'prefetch') {
+      await gates[path];
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      headers: { 'X-VoidPages': 'true', 'X-VoidPages-Version': PAGES_PROTOCOL_VERSION },
+      body: JSON.stringify({
+        component: path === '/dashboard' ? 'dashboard' : path === '/about' ? 'about' : 'home',
+        props: {},
+        params: {},
+        shared: {},
+        url: path,
+        errors: null,
+      }),
+    });
+  });
+  await page.goto(base);
+  await page.locator('#app[data-hydrated="true"]').waitFor();
+  await page.evaluate(() => {
+    const state = window as unknown as TransitionWindow;
+    // React keeps a suspended page in the document, hidden, while the fallback is shown.
+    const headings = () =>
+      Array.from(document.querySelectorAll('h1'))
+        .filter((heading) => heading.checkVisibility())
+        .map((heading) => heading.textContent ?? '');
+    state.__transitions = [];
+    state.__headingsSeen = headings();
+    new MutationObserver(() => {
+      for (const heading of headings()) {
+        if (!state.__headingsSeen.includes(heading)) {
+          state.__headingsSeen.push(heading);
+        }
+      }
+    }).observe(document.body, {
+      attributes: true,
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    const start = document.startViewTransition.bind(document);
+    document.startViewTransition = ((update: () => Promise<void> | void) => {
+      const record: TransitionRecord = { atStart: [], atEnd: null };
+      state.__transitions.push(record);
+      state.__onStartViewTransition?.();
+      return start(async () => {
+        record.atStart = headings();
+        await update();
+        record.atEnd = headings();
+      });
+    }) as typeof document.startViewTransition;
+  });
+  return page;
+}
+
+function transitions(page: Awaited<ReturnType<typeof openTransitionPage>>) {
+  return page.evaluate(() => (window as unknown as TransitionWindow).__transitions);
+}
+
+function headingsSeen(page: Awaited<ReturnType<typeof openTransitionPage>>) {
+  return page.evaluate(() => (window as unknown as TransitionWindow).__headingsSeen);
+}
+
+function gate() {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
+it.each([{ viewTransition: true }, { viewTransition: false }])(
+  'animates the old page to a cached destination (view transition: $viewTransition)',
+  async ({ viewTransition }) => {
+    const page = await openTransitionPage();
+    try {
+      // Visit the destination once so its shell is cached, then return.
+      await page.evaluate(() => window.__visit('/dashboard'));
+      await page.getByRole('heading', { name: 'Dashboard loaded' }).waitFor();
+      await page.evaluate(() => window.__visit('/'));
+      await page.getByRole('heading', { name: 'Home' }).waitFor();
+      const fallbackMounts = await page.evaluate(
+        () => (window as unknown as TransitionWindow).__navigationFallbackMounts ?? 0,
+      );
+      expect(await transitions(page)).toEqual([]);
+
+      await page.evaluate(
+        (viewTransition) => window.__visit('/dashboard', { viewTransition }),
+        viewTransition,
+      );
+      await page.getByRole('heading', { name: 'Dashboard loaded' }).waitFor();
+      await expect
+        .poll(() => page.evaluate(() => window.__navigationSnapshots.at(-1)?.state))
+        .toBe('idle');
+      expect(await transitions(page)).toEqual(
+        viewTransition ? [{ atStart: ['Home'], atEnd: ['Dashboard loaded'] }] : [],
+      );
+      expect(
+        await page.evaluate(
+          () => (window as unknown as TransitionWindow).__navigationFallbackMounts ?? 0,
+        ),
+      ).toBe(fallbackMounts);
+    } finally {
+      await page.close();
+    }
+  },
+);
+
+it.each([{ viewTransition: true }, { viewTransition: false }])(
+  'animates the fallback to a network-bound destination (view transition: $viewTransition)',
+  async ({ viewTransition }) => {
+    const response = gate();
+    const page = await openTransitionPage({ '/dashboard': response.promise });
+    try {
+      const visit = page.evaluate(
+        (viewTransition) => window.__visit('/dashboard', { viewTransition }),
+        viewTransition,
+      );
+      await page.getByRole('heading', { name: 'Loading dashboard' }).waitFor();
+      // The fallback gives immediate feedback: it replaces the old page without a transition.
+      expect(await transitions(page)).toEqual([]);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      response.release();
+      await page.getByRole('heading', { name: 'Dashboard loaded' }).waitFor();
+      await visit;
+      await expect
+        .poll(() => page.evaluate(() => window.__navigationSnapshots.at(-1)?.state))
+        .toBe('idle');
+      expect(await transitions(page)).toEqual(
+        viewTransition ? [{ atStart: ['Loading dashboard'], atEnd: ['Dashboard loaded'] }] : [],
+      );
+      expect(await headingsSeen(page)).toEqual(['Home', 'Loading dashboard', 'Dashboard loaded']);
+      expect(page.url()).toBe(new URL('/dashboard', base).href);
+    } finally {
+      response.release();
+      await page.close();
+    }
+  },
+);
+
+it('never shows a superseded destination while its response is pending', async () => {
+  const response = gate();
+  const page = await openTransitionPage({ '/dashboard': response.promise });
+  try {
+    await page.evaluate(() => void window.__visit('/dashboard', { viewTransition: true }));
+    await page.getByRole('heading', { name: 'Loading dashboard' }).waitFor();
+    await page.evaluate(() => window.__visit('/about', { viewTransition: true }));
+    await page.getByRole('heading', { name: 'About' }).waitFor();
+    response.release();
+    await expect
+      .poll(() => page.evaluate(() => window.__navigationSnapshots.at(-1)?.state))
+      .toBe('idle');
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+    expect(await headingsSeen(page)).not.toContain('Dashboard loaded');
+    expect(await page.getByRole('heading', { name: 'About' }).count()).toBe(1);
+    expect(page.url()).toBe(new URL('/about', base).href);
+    // Only the visit that won ran its transition to completion.
+    const records = await transitions(page);
+    expect(records.at(-1)?.atEnd).toEqual(['About']);
+    expect(records.flatMap((record) => record.atEnd ?? [])).not.toContain('Dashboard loaded');
+  } finally {
+    response.release();
+    await page.close();
+  }
+});
+
+it('does not reveal a visit superseded before its view transition callback starts', async () => {
+  const response = gate();
+  const page = await openTransitionPage({ '/dashboard': response.promise });
+  try {
+    await page.evaluate(() => void window.__visit('/dashboard', { viewTransition: true }));
+    await page.getByRole('heading', { name: 'Loading dashboard' }).waitFor();
+    await page.evaluate(() => {
+      const state = window as unknown as TransitionWindow;
+      // Supersede the dashboard visit between startViewTransition() and its update callback.
+      state.__onStartViewTransition = () => {
+        state.__onStartViewTransition = undefined;
+        void window.__visit('/about');
+      };
+    });
+    response.release();
+    await page.getByRole('heading', { name: 'About' }).waitFor();
+    await expect
+      .poll(() => page.evaluate(() => window.__navigationSnapshots.at(-1)?.state))
+      .toBe('idle');
+    const records = await transitions(page);
+    expect(records).toHaveLength(1);
+    await expect.poll(async () => (await transitions(page))[0].atEnd).not.toBeNull();
+    expect(await headingsSeen(page)).not.toContain('Dashboard loaded');
+    expect(page.url()).toBe(new URL('/about', base).href);
+  } finally {
+    response.release();
+    await page.close();
+  }
+});
+
+it('restores the previous page when a view transition visit fails to load', async () => {
+  const response = gate();
+  const page = await openTransitionPage();
+  await page.route('**/dashboard', async (route) => {
+    await response.promise;
+    await route.fulfill({
+      status: 500,
+      contentType: 'application/json',
+      headers: { 'X-VoidPages': 'true', 'X-VoidPages-Version': PAGES_PROTOCOL_VERSION },
+      body: 'invalid json',
+    });
+  });
+  try {
+    await page.evaluate(
+      () => void window.__visit('/dashboard', { viewTransition: true }).catch(() => {}),
+    );
+    await page.getByRole('heading', { name: 'Loading dashboard' }).waitFor();
+    response.release();
+    await page.getByRole('heading', { name: 'Home' }).waitFor();
+    await expect
+      .poll(() => page.evaluate(() => window.__navigationSnapshots.at(-1)?.state))
+      .toBe('idle');
+    expect(await transitions(page)).toEqual([]);
+    expect(page.url()).toBe(base);
+  } finally {
+    response.release();
+    await page.close();
+  }
+});

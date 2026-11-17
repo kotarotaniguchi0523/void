@@ -1,16 +1,9 @@
 import type { Snippet } from 'svelte';
+import type { HTMLAnchorAttributes } from 'svelte/elements';
 import type { BaseLinkProps } from 'void/pages-client';
 
-type EventHandler<T extends Event> = (event: T) => void;
-
-export type LinkProps = BaseLinkProps & {
-  children?: Snippet;
-  onclick?: EventHandler<MouseEvent>;
-  onmouseenter?: EventHandler<MouseEvent>;
-  onmouseleave?: EventHandler<MouseEvent>;
-  onfocus?: EventHandler<FocusEvent>;
-  onmousedown?: EventHandler<MouseEvent>;
-  ontouchstart?: EventHandler<TouchEvent>;
-  style?: string;
-  [key: string]: unknown;
-};
+/** Native anchor attributes only; mutations and URL construction are not Link props. */
+export type LinkProps = BaseLinkProps &
+  Omit<HTMLAnchorAttributes, keyof BaseLinkProps> & {
+    children?: Snippet;
+  };
