@@ -20,6 +20,7 @@ type TestWindow = Window & {
   __linkOnClick?: boolean;
   __preventedClick?: boolean;
   __viewTransitions?: number;
+  __armOwnership?: () => void;
 };
 
 /**
@@ -2320,5 +2321,494 @@ export function registerSharedClientTests({
     } finally {
       await page.context().close();
     }
+  });
+
+  // Commit ownership: a visit that is no longer the current one must not change the URL,
+  // the page on screen, its head or scroll once a newer navigation has begun.
+  describe('commit ownership', () => {
+    /** Two anchors that the router follows, inserted at the top of the page. */
+    async function addLinks(page: Page, links: ReadonlyArray<[href: string, text: string]>) {
+      await page.evaluate((links) => {
+        for (const [href, text] of links) {
+          const link = document.createElement('a');
+          link.href = href;
+          link.textContent = text;
+          link.setAttribute('data-void-view-transition', 'true');
+          document.body.insertBefore(link, document.body.firstChild);
+        }
+      }, links);
+    }
+
+    /**
+     * Sets `marker` on the body, to the document title, when the text appears in the app
+     * after `window.__armOwnership()` has run: when the newer navigation begins. Text that
+     * an adapter rendered before then belongs to a visit that was still current.
+     */
+    async function watchText(page: Page, marker: string, text: string) {
+      await page.evaluate(
+        ({ marker, text }) => {
+          const app = document.getElementById('app')!;
+          let armed = false;
+          (window as TestWindow).__armOwnership = () => {
+            armed = !app.textContent?.includes(text);
+          };
+          new MutationObserver(() => {
+            if (armed && app.textContent?.includes(text)) {
+              document.body.setAttribute(marker, document.title);
+            }
+          }).observe(app, { childList: true, subtree: true, characterData: true });
+        },
+        { marker, text },
+      );
+    }
+
+    // `before`: the newer link starts before the older page is handed to the renderer.
+    // `after`: it starts once the adapter has been given the older page, before it is on screen.
+    it.each(['before', 'after'] as const)(
+      'does not render a superseded page when a link starts in its view transition update callback, %s the update',
+      async (when) => {
+        const page = await newPage();
+        const { ready: requested, release: markRequested } = gate();
+        const { ready: canLoad, release: releaseLoader } = gate();
+        try {
+          await page.route('**/users/2?vt-callback-b=1', async (route) => {
+            markRequested();
+            await canLoad;
+            await route.continue().catch(() => {});
+          });
+          await page.goto(BASE + '/');
+          await waitForHydration(page);
+          await addLinks(page, [
+            ['/users/1?vt-callback-a=1', 'Older link'],
+            ['/users/2?vt-callback-b=1', 'Newer link'],
+          ]);
+          await watchText(page, 'data-stale-render', 'alice@example.com');
+          const homeTitle = await page.title();
+          await page.evaluate((when) => {
+            const start = document.startViewTransition.bind(document);
+            let calls = 0;
+            const startNewer = () => {
+              (window as TestWindow).__armOwnership!();
+              document
+                .querySelector<HTMLAnchorElement>('a[href="/users/2?vt-callback-b=1"]')!
+                .click();
+            };
+            document.startViewTransition = ((update: () => unknown) => {
+              const first = ++calls === 1;
+              return start(() => {
+                if (first && when === 'before') {
+                  startNewer();
+                }
+                const result = update();
+                if (first && when === 'after') {
+                  startNewer();
+                }
+                return result;
+              });
+            }) as typeof document.startViewTransition;
+          }, when);
+          await page
+            .getByRole('link', { name: 'Older link' })
+            .evaluate((link) => (link as HTMLElement).click());
+          await requested;
+          // Give the renderer frames to commit anything the older visit handed to it.
+          await page.evaluate(
+            () =>
+              new Promise((resolve) =>
+                requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 100))),
+              ),
+          );
+          expect(await page.locator('body').getAttribute('data-stale-render')).toBeNull();
+          expect(await page.title()).toBe(homeTitle);
+          releaseLoader();
+          await page.getByText('bob@example.com').waitFor();
+          expect(page.url()).toBe(BASE + '/users/2?vt-callback-b=1');
+          expect(await page.getByText('alice@example.com').count()).toBe(0);
+        } finally {
+          releaseLoader();
+          await page.context().close();
+        }
+      },
+    );
+
+    it('does not give the page on screen the deferred props of a visit superseded before it rendered', async () => {
+      const page = await newPage();
+      const { ready: requested, release: markRequested } = gate();
+      const { ready: canLoad, release: releaseLoader } = gate();
+      try {
+        await page.route('**/users/2?deferred-b=1', async (route) => {
+          markRequested();
+          await canLoad;
+          await route.continue().catch(() => {});
+        });
+        await page.goto(BASE + '/');
+        await waitForHydration(page);
+        await addLinks(page, [
+          ['/deferred', 'Older link'],
+          ['/users/2?deferred-b=1', 'Newer link'],
+        ]);
+        await page.evaluate(() => {
+          const headings: Array<string> = [];
+          (window as Window & { __headings?: Array<string> }).__headings = headings;
+          new MutationObserver(() => {
+            const heading = document.querySelector('h1')?.textContent ?? '';
+            if (headings.at(-1) !== heading) {
+              headings.push(heading);
+            }
+          }).observe(document.getElementById('app')!, {
+            childList: true,
+            subtree: true,
+            characterData: true,
+          });
+          // Deliver the page line of /deferred, and hold its deferred lines until released.
+          const fetchPage = window.fetch.bind(window);
+          let releaseDeferred!: () => void;
+          const deferredHeld = new Promise<void>((resolve) => {
+            releaseDeferred = resolve;
+          });
+          (window as Window & { __releaseDeferred?: () => void }).__releaseDeferred =
+            releaseDeferred;
+          window.fetch = async (input, init) => {
+            const response = await fetchPage(input, init);
+            const url =
+              typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+            if (
+              !url.includes('/deferred') ||
+              !response.headers.get('content-type')?.includes('application/x-ndjson')
+            ) {
+              return response;
+            }
+            const text = await response.text();
+            const pageLine = text.indexOf('\n') + 1;
+            const encoder = new TextEncoder();
+            return new Response(
+              new ReadableStream<Uint8Array>({
+                async start(controller) {
+                  controller.enqueue(encoder.encode(text.slice(0, pageLine)));
+                  await deferredHeld;
+                  controller.enqueue(encoder.encode(text.slice(pageLine)));
+                  controller.close();
+                },
+              }),
+              { status: response.status, headers: response.headers },
+            );
+          };
+          // The newer link is followed while the older page waits for its transition.
+          const start = document.startViewTransition.bind(document);
+          let calls = 0;
+          document.startViewTransition = ((update: () => unknown) => {
+            if (++calls === 1) {
+              document.querySelector<HTMLAnchorElement>('a[href="/users/2?deferred-b=1"]')!.click();
+            }
+            return start(update);
+          }) as typeof document.startViewTransition;
+        });
+        const homeHeading = await page.locator('h1').textContent();
+        await page
+          .getByRole('link', { name: 'Older link' })
+          .evaluate((link) => (link as HTMLElement).click());
+        await requested;
+        await page.evaluate(() =>
+          (window as Window & { __releaseDeferred?: () => void }).__releaseDeferred!(),
+        );
+        await page.evaluate(
+          () =>
+            new Promise((resolve) =>
+              requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 100))),
+            ),
+        );
+        // The home page stays on screen, with its own props, while the newer visit loads.
+        expect(await page.locator('h1').textContent()).toBe(homeHeading);
+        releaseLoader();
+        await page.getByText('bob@example.com').waitFor();
+        const headings = await page.evaluate(
+          () => (window as Window & { __headings?: Array<string> }).__headings,
+        );
+        expect(headings?.filter((heading) => heading.includes('Deferred Page'))).toEqual([]);
+      } finally {
+        releaseLoader();
+        await page.context().close();
+      }
+    });
+
+    it('reports no unhandled rejection when a newer visit skips an older view transition', async () => {
+      const page = await newPage();
+      try {
+        await page.goto(BASE + '/');
+        await waitForHydration(page);
+        await addLinks(page, [
+          ['/users/1?vt-skip-a=1', 'Older link'],
+          ['/users/2?vt-skip-b=1', 'Newer link'],
+        ]);
+        await page.evaluate(() => {
+          const rejections: Array<string> = [];
+          (window as Window & { __rejections?: Array<string> }).__rejections = rejections;
+          window.addEventListener('unhandledrejection', (event) => {
+            const reason = event.reason as { name?: string; message?: string } | undefined;
+            rejections.push(`${reason?.name}: ${reason?.message}`);
+          });
+          const start = document.startViewTransition.bind(document);
+          let calls = 0;
+          let newerStarted!: () => void;
+          const newer = new Promise<void>((resolve) => {
+            newerStarted = resolve;
+          });
+          // The older visit's update callback is still running, as a slow render keeps it,
+          // when the newer visit starts its own transition.
+          document.startViewTransition = ((update: () => unknown) => {
+            const call = ++calls;
+            if (call === 2) {
+              newerStarted();
+            }
+            if (call !== 1) {
+              return start(update);
+            }
+            return start(async () => {
+              document.querySelector<HTMLAnchorElement>('a[href="/users/2?vt-skip-b=1"]')!.click();
+              await newer;
+              return update();
+            });
+          }) as typeof document.startViewTransition;
+        });
+        await page
+          .getByRole('link', { name: 'Older link' })
+          .evaluate((link) => (link as HTMLElement).click());
+        await page.getByText('bob@example.com').waitFor();
+        await page.waitForFunction(() => !navigation.transition);
+        await page.evaluate(
+          () => new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 300))),
+        );
+        expect(page.url()).toBe(BASE + '/users/2?vt-skip-b=1');
+        expect(
+          await page.evaluate(
+            () => (window as Window & { __rejections?: Array<string> }).__rejections,
+          ),
+        ).toEqual([]);
+      } finally {
+        await page.context().close();
+      }
+    });
+
+    it('does not publish an action redirect after a link starts a document navigation', async () => {
+      const page = await newPage();
+      const { ready: actionRequested, release: markActionRequested } = gate();
+      const { ready: actionCanFinish, release: releaseAction } = gate();
+      const { ready: documentRequested, release: markDocumentRequested } = gate();
+      const { ready: documentCanLoad, release: releaseDocument } = gate();
+      try {
+        await page.goto(BASE + '/scroll-restoration');
+        await waitForHydration(page);
+        await page.route(
+          (url) => url.pathname === '/scroll-restoration',
+          async (route) => {
+            if (route.request().method() !== 'POST') {
+              return route.continue();
+            }
+            markActionRequested();
+            await actionCanFinish;
+            await route.continue().catch(() => {});
+          },
+        );
+        // An island page is outside the client route table: following it loads a document.
+        await page.route('**/blog', async (route) => {
+          if (!route.request().isNavigationRequest()) {
+            return route.continue();
+          }
+          markDocumentRequested();
+          await documentCanLoad;
+          await route.continue().catch(() => {});
+        });
+        await page.evaluate(() => {
+          const link = document.createElement('a');
+          link.href = '/blog';
+          link.textContent = 'Blog document';
+          document.body.insertBefore(link, document.body.firstChild);
+        });
+        await page.getByRole('button', { name: 'Redirect action' }).click({ noWaitAfter: true });
+        await actionRequested;
+        await page.getByRole('link', { name: 'Blog document' }).click({ noWaitAfter: true });
+        await documentRequested;
+        const actionResponse = page.waitForResponse(
+          (response) =>
+            response.request().method() === 'POST' &&
+            new URL(response.url()).pathname === '/scroll-restoration',
+        );
+        const urls: Array<string> = [];
+        page.on('framenavigated', (frame) => {
+          if (frame === page.mainFrame()) {
+            urls.push(frame.url());
+          }
+        });
+        releaseAction();
+        await actionResponse;
+        // Script in the page can stall while its document is being replaced: wait from here.
+        await page.waitForTimeout(500);
+        // The user has left this page: the older action does not move the address.
+        expect(urls).toEqual([]);
+        expect(page.url()).toBe(BASE + '/scroll-restoration');
+        releaseDocument();
+        await page.waitForURL(BASE + '/blog');
+        const entries = await page.evaluate(() =>
+          navigation
+            .entries()
+            .map((entry) => new URL(entry.url!).pathname + new URL(entry.url!).search),
+        );
+        expect(entries).not.toContain('/scroll-restoration?redirected=1');
+      } finally {
+        releaseAction();
+        releaseDocument();
+        await page.context().close();
+      }
+    });
+
+    it('does not render, title or scroll a visit that a currententrychange listener superseded', async () => {
+      const page = await newPage();
+      const { ready: requested, release: markRequested } = gate();
+      const { ready: canLoad, release: releaseLoader } = gate();
+      try {
+        await page.route('**/users/2?cec-b=1', async (route) => {
+          markRequested();
+          await canLoad;
+          await route.continue().catch(() => {});
+        });
+        await page.goto(BASE + '/scroll-restoration');
+        await waitForHydration(page);
+        // Insert the links first: scroll anchoring would move a position taken before.
+        await addLinks(page, [
+          ['/users/1?cec-a=1', 'Older link'],
+          ['/users/2?cec-b=1', 'Newer link'],
+        ]);
+        await page.evaluate(() => window.scrollTo(0, 600));
+        await page.waitForFunction(() => window.scrollY === 600);
+        await watchText(page, 'data-stale-render', 'alice@example.com');
+        const title = await page.title();
+        await page.evaluate(() => {
+          (window as TestWindow).__armOwnership!();
+          navigation.addEventListener('currententrychange', function startNewer() {
+            if (location.search === '?cec-a=1') {
+              navigation.removeEventListener('currententrychange', startNewer);
+              document.querySelector<HTMLAnchorElement>('a[href="/users/2?cec-b=1"]')!.click();
+            }
+          });
+          document.querySelector<HTMLAnchorElement>('a[href="/users/1?cec-a=1"]')!.click();
+        });
+        await requested;
+        await page.evaluate(
+          () =>
+            new Promise((resolve) =>
+              requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 100))),
+            ),
+        );
+        expect(await page.locator('body').getAttribute('data-stale-render')).toBeNull();
+        expect(await page.title()).toBe(title);
+        expect(await page.evaluate(() => window.scrollY)).toBe(600);
+        releaseLoader();
+        await page.getByText('bob@example.com').waitFor();
+        expect(page.url()).toBe(BASE + '/users/2?cec-b=1');
+        expect(await page.getByText('alice@example.com').count()).toBe(0);
+      } finally {
+        releaseLoader();
+        await page.context().close();
+      }
+    });
+
+    it('does not title a page whose commit a link supersedes during its DOM update', async () => {
+      const page = await newPage();
+      const { ready: requested, release: markRequested } = gate();
+      const { ready: canLoad, release: releaseLoader } = gate();
+      try {
+        await page.route('**/users/2?dom-b=1', async (route) => {
+          markRequested();
+          await canLoad;
+          await route.continue().catch(() => {});
+        });
+        await page.goto(BASE + '/');
+        await waitForHydration(page);
+        await addLinks(page, [
+          ['/users/1?dom-a=1', 'Older link'],
+          ['/users/2?dom-b=1', 'Newer link'],
+        ]);
+        const title = await page.title();
+        await page.evaluate(() => {
+          const app = document.getElementById('app')!;
+          // Runs after the adapter has put the page in the DOM, before its commit resumes.
+          const observer = new MutationObserver(() => {
+            if (app.textContent?.includes('alice@example.com')) {
+              observer.disconnect();
+              document.body.dataset.titleAtRender = document.title;
+              document.querySelector<HTMLAnchorElement>('a[href="/users/2?dom-b=1"]')!.click();
+            }
+          });
+          observer.observe(app, { childList: true, subtree: true, characterData: true });
+          document.querySelector<HTMLAnchorElement>('a[href="/users/1?dom-a=1"]')!.click();
+        });
+        await requested;
+        await page.evaluate(
+          () =>
+            new Promise((resolve) =>
+              requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 100))),
+            ),
+        );
+        expect(await page.locator('body').getAttribute('data-title-at-render')).toBe(title);
+        // The older visit lost its commit: its head is not applied.
+        expect(await page.title()).toBe(title);
+        releaseLoader();
+        await page.getByText('bob@example.com').waitFor();
+        expect(page.url()).toBe(BASE + '/users/2?dom-b=1');
+      } finally {
+        releaseLoader();
+        await page.context().close();
+      }
+    });
+
+    it('does not scroll for a visit after a navigatesuccess listener starts a newer one', async () => {
+      const page = await newPage();
+      const { ready: requested, release: markRequested } = gate();
+      const { ready: canLoad, release: releaseLoader } = gate();
+      try {
+        await page.route('**/users/2?success-b=1', async (route) => {
+          markRequested();
+          await canLoad;
+          await route.continue().catch(() => {});
+        });
+        await page.goto(BASE + '/scroll-restoration');
+        await waitForHydration(page);
+        await addLinks(page, [
+          ['/scroll-restoration?success-a=1', 'Older link'],
+          ['/users/2?success-b=1', 'Newer link'],
+        ]);
+        await page.evaluate(() => window.scrollTo(0, 600));
+        await page.waitForFunction(() => window.scrollY === 600);
+        await page.evaluate(() => {
+          navigation.addEventListener('navigatesuccess', function startNewer() {
+            if (location.search === '?success-a=1') {
+              navigation.removeEventListener('navigatesuccess', startNewer);
+              document.body.dataset.successScroll = String(window.scrollY);
+              document.querySelector<HTMLAnchorElement>('a[href="/users/2?success-b=1"]')!.click();
+            }
+          });
+          document
+            .querySelector<HTMLAnchorElement>('a[href="/scroll-restoration?success-a=1"]')!
+            .click();
+        });
+        await requested;
+        await page.evaluate(
+          () =>
+            new Promise((resolve) =>
+              requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 100))),
+            ),
+        );
+        const scrollAtSuccess = await page.locator('body').getAttribute('data-success-scroll');
+        expect(scrollAtSuccess).not.toBeNull();
+        // The older visit's scroll would have run on the next frame; the newer visit owns it now.
+        expect(String(await page.evaluate(() => window.scrollY))).toBe(scrollAtSuccess);
+        releaseLoader();
+        await page.getByText('bob@example.com').waitFor();
+        expect(page.url()).toBe(BASE + '/users/2?success-b=1');
+      } finally {
+        releaseLoader();
+        await page.context().close();
+      }
+    });
   });
 }

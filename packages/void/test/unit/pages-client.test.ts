@@ -3334,6 +3334,153 @@ describe('superseded navigation commits (#507)', () => {
     expect(window.location.pathname).toBe('/b');
   });
 
+  describe('deferred props of a visit whose page is not on screen', () => {
+    // `/a` streams its page, then its deferred `stats` group when `send` is called.
+    function streamA(page: ReturnType<typeof setup>) {
+      const encoder = new TextEncoder();
+      let stream!: ReadableStreamDefaultController<Uint8Array>;
+      const send = (message: object) =>
+        stream.enqueue(encoder.encode(JSON.stringify(message) + '\n'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string, init?: RequestInit) => {
+          await page.fetchGates.get(url);
+          init?.signal?.throwIfAborted();
+          if (url !== '/a') {
+            return pageJson({ component: 'b', url, props: { title: 'B' }, head: { title: 'B' } });
+          }
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                stream = controller;
+                send({
+                  component: 'a',
+                  url: '/a',
+                  props: { title: 'A', stats: null },
+                  deferredKeys: { stats: 'stats' },
+                  head: { title: 'A' },
+                });
+              },
+            }),
+            { headers: { 'content-type': 'application/x-ndjson', 'X-VoidPages': 'true' } },
+          );
+        }),
+      );
+      return { send, close: () => stream.close() };
+    }
+
+    function holdViewTransitions() {
+      const callbacks: Array<() => Promise<void>> = [];
+      Object.assign(document, {
+        startViewTransition(callback: () => unknown) {
+          const updateCallbackDone = new Promise<void>((resolve) => {
+            callbacks.push(async () => {
+              await callback();
+              resolve();
+            });
+          });
+          return { updateCallbackDone, ready: updateCallbackDone, finished: updateCallbackDone };
+        },
+      });
+      return callbacks;
+    }
+
+    it('does not pass the props of a visit superseded before it rendered to the adapter', async () => {
+      const page = setup();
+      const a = streamA(page);
+      const b = gate();
+      page.fetchGates.set('/b', b.promise);
+      const callbacks = holdViewTransitions();
+      const onDeferredUpdate = vi.fn();
+      const r = await createTestRouter({
+        adapter: {
+          applyUpdate: page.applyUpdate,
+          createDeferred: () => ({ loading: true }),
+          isLoading: (ref) => Boolean((ref as { loading?: boolean })?.loading),
+          resolveDeferred: (_ref, value) => ({ loading: false, value }),
+          rejectDeferred: page.rejectDeferred,
+          onDeferredUpdate,
+        },
+        components: { a: loadComponent, b: loadComponent, home: loadComponent },
+        matchRoute: (url) => (url.startsWith('/a') ? 'a' : url.startsWith('/b') ? 'b' : 'home'),
+      }).then((created) => created.router);
+
+      // A's page is ready and waits for its view transition to capture the old page.
+      const visitA = r.visit('/a', { viewTransition: true });
+      const settledA = visitA.catch(() => undefined);
+      await vi.waitFor(() => expect(callbacks).toHaveLength(1));
+      // B supersedes A before A has rendered anything; the home page is still on screen.
+      const visitB = r.visit('/b');
+      a.send({ __deferred: 'stats', data: 42 });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // The page on screen is the home page: A's props must not reach it.
+      expect(page.rendered).toEqual([]);
+      expect(onDeferredUpdate).not.toHaveBeenCalled();
+
+      await callbacks[0]();
+      b.release();
+      await visitB;
+      await settledA;
+      a.close();
+      expect(page.rendered).toEqual(['/b']);
+    });
+
+    it('does not pass the props of the current visit to the adapter before its page renders', async () => {
+      const page = setup();
+      const a = streamA(page);
+      const callbacks = holdViewTransitions();
+      const onDeferredUpdate = vi.fn();
+      const r = await createTestRouter({
+        adapter: {
+          applyUpdate: page.applyUpdate,
+          createDeferred: () => ({ loading: true }),
+          isLoading: (ref) => Boolean((ref as { loading?: boolean })?.loading),
+          resolveDeferred: (_ref, value) => ({ loading: false, value }),
+          rejectDeferred: page.rejectDeferred,
+          onDeferredUpdate,
+        },
+        components: { a: loadComponent, b: loadComponent, home: loadComponent },
+        matchRoute: (url) => (url.startsWith('/a') ? 'a' : url.startsWith('/b') ? 'b' : 'home'),
+      }).then((created) => created.router);
+
+      const visitA = r.visit('/a', { viewTransition: true });
+      await vi.waitFor(() => expect(callbacks).toHaveLength(1));
+      a.send({ __deferred: 'stats', data: 42 });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // The home page is still on screen; the Svelte and Solid adapters would give it A's props.
+      expect(page.rendered).toEqual([]);
+      expect(onDeferredUpdate).not.toHaveBeenCalled();
+
+      await callbacks[0]();
+      await visitA;
+      a.close();
+      expect(page.rendered).toEqual(['/a']);
+    });
+  });
+
+  it('does not apply, publish or title a visit that router.refresh() superseded', async () => {
+    const page = setup();
+    const a = gate();
+    page.fetchGates.set('/a', a.promise);
+    const r = await router(page);
+
+    const visitA = r.visit('/a');
+    // The refresh reads the address of the page on screen, which A has not changed.
+    const refreshed = r.refresh();
+    await refreshed;
+    a.release();
+    await expect(visitA).resolves.toBeUndefined();
+
+    // Only the refreshed page renders; its response carries the head titled B.
+    expect(page.rendered).toEqual(['/']);
+    expect(browserWrites.push).not.toHaveBeenCalled();
+    expect(browserWrites.replace.mock.calls.map((call) => call[0])).toEqual(['/']);
+    expect(window.location.pathname).toBe('/');
+    expect(page.documentStub).toMatchObject({ title: 'B' });
+  });
+
   it('reports a render error in a view transition once, through the visit', async () => {
     const page = setup();
     const error = new Error('render failed');

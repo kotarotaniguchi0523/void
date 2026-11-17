@@ -369,6 +369,8 @@ let currentPageId = "";
 const routeUrl = ref(window.location.pathname + window.location.search + window.location.hash);
 const navigation = reactive(idleNavigationState());
 let captureRenderError;
+// Puts back the state that the update in progress replaced, until Vue renders it.
+let revertPendingUpdate;
 const hasBoundaries = hasPageBoundaries(boundaryManifest);
 
 ${PATCH_PROPS_RUNTIME}
@@ -388,6 +390,22 @@ const { router, initialPageData, initialComponent, initialLayouts, start, commit
       async applyUpdate(pageData, comp, layouts, options) {
         let failure;
         const capture = (error) => { failure ??= { error }; };
+        const previous = {
+          id: currentPageId, generation: boundaryGeneration.value, key: currentPageKey.value,
+          shared: { ...shared }, params: { ...params },
+          props: currentProps.value, layouts: currentLayouts.value, component: currentComponent.value,
+        };
+        const revert = () => {
+          currentPageId = previous.id;
+          boundaryGeneration.value = previous.generation;
+          currentPageKey.value = previous.key;
+          replaceRecord(shared, previous.shared);
+          replaceRecord(params, previous.params);
+          currentProps.value = previous.props;
+          currentLayouts.value = previous.layouts;
+          currentComponent.value = previous.component;
+        };
+        revertPendingUpdate = revert;
         // Page boundaries own render failures when the app declares any; what
         // escapes them reaches the terminal error handler.
         if (!hasBoundaries) captureRenderError = capture;
@@ -403,8 +421,15 @@ const { router, initialPageData, initialComponent, initialLayouts, start, commit
           await nextTick();
           if (failure) throw failure.error;
         } finally {
+          if (revertPendingUpdate === revert) revertPendingUpdate = undefined;
           if (captureRenderError === capture) captureRenderError = undefined;
         }
+      },
+      discardUpdate() {
+        // Vue renders on the next tick: the page a newer visit superseded never reaches the DOM.
+        const revert = revertPendingUpdate;
+        revertPendingUpdate = undefined;
+        revert?.();
       },
     },
     components, layoutTree, routeMeta, matchRoute, boundaryManifest, dev: import.meta.env.DEV,

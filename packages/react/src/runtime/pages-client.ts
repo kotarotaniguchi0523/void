@@ -117,6 +117,7 @@ type AppAction =
   | { type: 'finish'; resource: ReactPageResource; location: string }
   | { type: 'fail'; resource: ReactPageResource; location: string }
   | { type: 'abandon'; resource: ReactPageResource; location: string }
+  | { type: 'supersede'; resource: ReactPageResource }
   | { type: 'location'; location: string };
 
 /**
@@ -366,6 +367,12 @@ function appReducer(state: AppState, action: AppAction): AppState {
         routeUrl: action.location,
         navigation: idleNavigationState(),
       };
+    case 'supersede':
+      // A newer visit has begun: the page it supersedes gives way to the committed page.
+      if (state.resource !== action.resource || !state.rollbackResource) {
+        return state;
+      }
+      return { ...state, resource: state.rollbackResource };
     case 'location':
       return { ...state, routeUrl: action.location };
   }
@@ -558,10 +565,12 @@ function startViewTransition(resource: ReactPageResource, reveal: () => void): v
     resolveViewTransition = resolve;
   });
   activeVisit.holdViewTransition(resource.id, resolveViewTransition);
-  document.startViewTransition(() => {
+  const transition = document.startViewTransition(() => {
     reveal();
     return readyForCapture;
   });
+  // A newer visit can skip this transition, which rejects `ready`.
+  void Promise.allSettled([transition.ready, transition.finished]);
 }
 
 function App({
@@ -653,6 +662,12 @@ function App({
       if (committedResources.has(resource)) {
         return;
       }
+      if (resource !== initialResource && !activeVisit.isActive(resource.id)) {
+        // React rebased a superseded visit's reveal onto a newer visit's begin. Its page
+        // will not commit: replace it before the browser paints it.
+        dispatch({ type: 'supersede', resource });
+        return;
+      }
       committedResources.add(resource);
       resource
         .commit()
@@ -690,7 +705,7 @@ function App({
           dispatch({ type: 'fail', resource, location: currentUrl() });
         });
     },
-    [],
+    [initialResource],
   );
 
   const schedule = useCallback(

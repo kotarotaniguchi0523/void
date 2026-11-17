@@ -137,6 +137,11 @@ export type VoidRouterAdapter = PageNavigationAdapter & {
     layouts: Array<unknown>,
     options: { preserveState: boolean },
   ): void | Promise<void>;
+  /**
+   * A newer visit has begun before the visit update in progress settled. A renderer that
+   * shows that page on a later tick puts back what it showed before.
+   */
+  discardUpdate?(): void;
 };
 
 export type VoidRouterConfig = Omit<PageNavigationEngineConfig, 'adapter'> & {
@@ -438,6 +443,8 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
   // Set when the page on screen is one whose commit failed; the last visit to settle puts
   // the committed page back.
   let failedRender: { preserveState: boolean } | null = null;
+  // Whether the adapter is applying a visit's page, which a newer visit discards as it begins.
+  let updating = false;
   const setRouteState = (url: string, params: Record<string, string> = routeParams) => {
     routeUrl = url;
     routeParams = params;
@@ -453,6 +460,10 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
    */
   async function applyNavigationResource(resource: ReturnType<typeof engine.prepareVisit>) {
     activeNavigationId = resource.id;
+    if (updating) {
+      updating = false;
+      config.adapter.discardUpdate?.();
+    }
     setNavigation(navigationStateFor(resource.fetchUrl + resource.hash, resource.method));
     try {
       const result = await resource.shell;
@@ -477,6 +488,7 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
         }
         renderedPage = result;
         failedRender = null;
+        updating = true;
         try {
           await config.adapter.applyUpdate(result.pageData, result.component, result.layouts, {
             preserveState,
@@ -486,6 +498,10 @@ export async function createVoidRouter(config: VoidRouterConfig): Promise<{
             failedRender = { preserveState };
           }
           throw error;
+        } finally {
+          if (activeNavigationId === resource.id) {
+            updating = false;
+          }
         }
       };
 

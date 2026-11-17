@@ -321,6 +321,9 @@ export async function createPageNavigationEngine(
         context.signal?.throwIfAborted();
         if (result && _pendingResource === resource) {
           exposedResources.add(resource);
+        } else if (result && retiredResources.has(resource)) {
+          // A document navigation took over while this visit loaded.
+          throw abortError();
         }
         return result;
       }),
@@ -1176,12 +1179,12 @@ export async function createPageNavigationEngine(
   // Every visit starts here: one navigate event is one navigation. The browser owns its
   // URL, history entry and cancellation, and this listener loads and renders the page.
   // Register before the adapter mounts: an initial effect can publish an entry.
-  window.navigation.addEventListener('navigate', (event) => {
+  function routeNavigation(event: NavigateEvent): boolean {
     if (event.info === renderedPageNavigation) {
       // The engine's own entry for a page that is on screen, or its return to that
       // page's entry: there is nothing to load or scroll.
       event.intercept({ scroll: 'manual', focusReset: 'manual' });
-      return;
+      return true;
     }
     const request = event.info as BrowserVisit | undefined;
     const own = !!request && browserVisits.has(request);
@@ -1189,11 +1192,11 @@ export async function createPageNavigationEngine(
     const options = own ? request.options : {};
     const traversal = event.navigationType === 'traverse';
     if (!event.canIntercept || event.downloadRequest !== null || event.formData !== null) {
-      return;
+      return false;
     }
     // A traversal to another document is the browser's.
     if (traversal && !event.destination.sameDocument) {
-      return;
+      return false;
     }
     const anchor = event.sourceElement?.closest('a[href],area[href]');
     const link = !!anchor && isRouterLink(anchor);
@@ -1201,7 +1204,7 @@ export async function createPageNavigationEngine(
     // a visit initiated by this router, or a fragment of a URL whose page has yet
     // to render. Decide before the URL is parsed and matched against the routes.
     if (!own && !traversal && !link && !event.hashChange) {
-      return;
+      return false;
     }
     const target = new URL(event.destination.url);
     // The browser owns a navigation to another fragment of the rendered page, or between
@@ -1225,10 +1228,10 @@ export async function createPageNavigationEngine(
       // navigation also retires the latest visit: it recovers no entry, a shell that
       // was still loading is dropped, and the initial render restores no position.
       _nextNavigationId++;
-      return;
+      return false;
     }
     if (!apply) {
-      return;
+      return false;
     }
     // A Link to a URL outside the route table is fetched and its response decides.
     // A plain anchor to such a URL stays a document load: fetching it first could
@@ -1238,12 +1241,12 @@ export async function createPageNavigationEngine(
       (traversal || (link && anchor.hasAttribute(LINK_MARKER_ATTRIBUTE))) &&
       isServerRoutedUrl(target);
     if (!serverRouted && !isClientPage(target)) {
-      return;
+      return false;
     }
 
     const url = target.pathname + target.search + target.hash;
     if (!traversal && !event.cancelable) {
-      return;
+      return false;
     }
     if (_pendingResource) {
       abortPendingResource(_pendingResource);
@@ -1274,7 +1277,7 @@ export async function createPageNavigationEngine(
           }
         },
       });
-      return;
+      return true;
     }
 
     event.intercept({
@@ -1355,6 +1358,31 @@ export async function createPageNavigationEngine(
           throw error;
         }
       },
+    });
+    return true;
+  }
+  window.navigation.addEventListener('navigate', (event) => {
+    if (
+      routeNavigation(event) ||
+      !event.cancelable ||
+      event.destination.sameDocument ||
+      event.downloadRequest !== null ||
+      event.formData !== null
+    ) {
+      return;
+    }
+    // The browser loads another document, which outranks a visit still in flight: an action
+    // must not render or publish its redirect over it. Its request still runs to the end.
+    // Listeners after this one can still cancel the navigation.
+    queueMicrotask(() => {
+      const pending = _pendingResource;
+      if (!event.defaultPrevented && pending && pending.id !== documentVisitId) {
+        _pendingResource = null;
+        exposedResources.delete(pending);
+        retiredResources.add(pending);
+        // The latest visit recovers no entry: reloading would replace the document load.
+        _nextNavigationId++;
+      }
     });
   });
   // The browser has committed an entry. Its visit, if it has one, started from the
