@@ -1513,6 +1513,142 @@ export function registerSharedClientTests({
     }
   });
 
+  /**
+   * Holds the deferred page's component import, so a visit to it has its data but cannot
+   * render, and records every change to the home page's heading from then on.
+   */
+  async function holdDeferredVisit(page: Page, { prefetch = false } = {}) {
+    let holding = false;
+    const { ready: released, release } = gate();
+    const { ready: componentRequested, release: markComponentRequested } = gate();
+    await page.route('**/assets/deferred-*.js', async (route) => {
+      if (holding) {
+        markComponentRequested();
+        await released;
+      }
+      await route.continue();
+    });
+    // Deliver the page line and its deferred line in one response body.
+    await page.route('**/deferred', async (route) => {
+      const response = await route.fetch();
+      await route.fulfill({ response, body: await response.text() });
+    });
+    await page.goto(BASE + '/');
+    await waitForHydration(page);
+    // A prefetch imports the component too: hold that import as well.
+    holding = true;
+    if (prefetch) {
+      const prefetched = page.waitForResponse(
+        (response) =>
+          response.url() === BASE + '/deferred' &&
+          response.request().headers()['purpose'] === 'prefetch',
+      );
+      await page.hover('a[href="/deferred"]');
+      await (await prefetched).finished();
+    }
+    const heading = await page.evaluate(() => {
+      const h1 = document.querySelector('#app h1')!;
+      const changes: Array<string | null> = [];
+      (window as unknown as { __homeHeadingChanges: typeof changes }).__homeHeadingChanges =
+        changes;
+      new MutationObserver(() => changes.push(h1.textContent)).observe(h1, {
+        characterData: true,
+        childList: true,
+        subtree: true,
+      });
+      return h1.textContent;
+    });
+    const visitResponse = prefetch
+      ? null
+      : page.waitForResponse(
+          (response) =>
+            response.url() === BASE + '/deferred' &&
+            response.request().headers()['x-voidpages'] === 'true' &&
+            response.request().headers()['purpose'] !== 'prefetch',
+        );
+    await page
+      .locator('a[href="/deferred"]')
+      .first()
+      .evaluate((anchor) => (anchor as HTMLElement).click());
+    await componentRequested;
+    await (await visitResponse)?.finished();
+    // Let the client read the response body while the component import is held.
+    await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 200)));
+    const homeState = () =>
+      page.evaluate(() => ({
+        heading: document.querySelector('#app h1')?.textContent ?? null,
+        changes: (window as unknown as { __homeHeadingChanges: Array<string | null> })
+          .__homeHeadingChanges,
+      }));
+    return { heading, homeState, release };
+  }
+
+  it('keeps the page on screen when a pending visit’s deferred group arrives before it renders', async ({
+    expect,
+  }) => {
+    const page = await newPage();
+    try {
+      const { heading, homeState, release } = await holdDeferredVisit(page);
+      const beforeRender = { ...(await homeState()), path: new URL(page.url()).pathname };
+
+      release();
+      await page.getByRole('heading', { name: 'Deferred Page', exact: true }).waitFor();
+      await page.getByTestId('deferred-resolved').waitFor();
+      // B's data reaches B once B renders.
+      expect(await page.getByTestId('deferred-resolved').textContent()).toContain('42');
+      expect(beforeRender).toEqual({ heading, changes: [], path: '/' });
+    } finally {
+      await page.context().close();
+    }
+  });
+
+  it('keeps the page on screen and the next page when a superseded visit had deferred data', async ({
+    expect,
+  }) => {
+    const page = await newPage();
+    try {
+      const { heading, homeState, release } = await holdDeferredVisit(page);
+      await page
+        .locator('a[href="/users"]')
+        .first()
+        .evaluate((anchor) => (anchor as HTMLElement).click());
+      await page.getByRole('heading', { name: 'Users', exact: true }).waitFor();
+      const home = await homeState();
+      release();
+      // The superseded visit's import settles; nothing of it may render.
+      await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 300)));
+      const next = await page.evaluate(() => ({
+        path: window.location.pathname,
+        heading: document.querySelector('#app h1')?.textContent ?? null,
+        deferred: document.querySelector('[data-testid^="deferred-"]') !== null,
+      }));
+      expect({ home: home.changes, next }).toEqual({
+        home: [],
+        next: { path: '/users', heading: 'Users', deferred: false },
+      });
+      expect(heading).not.toBe('Users');
+    } finally {
+      await page.context().close();
+    }
+  });
+
+  it('keeps the page on screen while a prefetched deferred page loads its component', async ({
+    expect,
+  }) => {
+    const page = await newPage();
+    try {
+      const { heading, homeState, release } = await holdDeferredVisit(page, { prefetch: true });
+      const beforeRender = await homeState();
+
+      release();
+      await page.getByTestId('deferred-resolved').waitFor();
+      expect(await page.getByTestId('deferred-resolved').textContent()).toContain('42');
+      expect(beforeRender).toEqual({ heading, changes: [] });
+    } finally {
+      await page.context().close();
+    }
+  });
+
   // The longer journey also covers both forward navigation steps and their
   // rendered data, so separate list/detail browser contexts add no coverage.
   it('browser back/forward navigation', async () => {

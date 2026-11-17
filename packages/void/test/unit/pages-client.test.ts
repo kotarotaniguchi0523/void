@@ -4520,3 +4520,450 @@ describe('visits to the current URL and fragment', () => {
     expect(browser.currentEntry.key).toBe('initial-entry');
   });
 });
+
+/**
+ * A deferred group belongs to the page payload that declared it. Its value may only reach
+ * what is rendered once that payload is the page the adapter applied. Solid and Svelte
+ * replace the rendered page's props with the object `onDeferredUpdate` hands them, so every
+ * call must target the props object of the page on screen.
+ */
+describe('deferred group ownership across visits', () => {
+  type Props = Record<string, unknown>;
+  type Ref = { loading: boolean; value: unknown; error: unknown };
+
+  function ownershipAdapter() {
+    const state = {
+      /** The props object of the page on screen. */
+      applied: null as Props | null,
+      /** Each `onDeferredUpdate` call: the title of the props it targets and of the page on screen. */
+      updates: [] as Array<{ target: unknown; applied: unknown }>,
+      /** Each resolved value, with the title of the page on screen at that time. */
+      resolutions: [] as Array<{ value: unknown; applied: unknown }>,
+    };
+    const adapter: TestRouterConfig['adapter'] = {
+      applyUpdate(pageData) {
+        state.applied = pageData.props;
+      },
+      createDeferred: (): Ref => ({ loading: true, value: null, error: null }),
+      isLoading: (ref) => Boolean((ref as Ref | undefined)?.loading),
+      resolveDeferred(_ref, value): Ref {
+        state.resolutions.push({ value, applied: state.applied?.title });
+        return { loading: false, value, error: null };
+      },
+      rejectDeferred: (_ref, error): Ref => ({ loading: false, value: null, error }),
+      onDeferredUpdate(props) {
+        state.updates.push({ target: props.title, applied: state.applied?.title });
+      },
+    };
+    /** Updates whose props are not the props of the page on screen. */
+    const misdirected = () => state.updates.filter((update) => update.target !== update.applied);
+    return { state, adapter, misdirected };
+  }
+
+  function ndjson(first: Array<object>) {
+    const encoder = new TextEncoder();
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(c) {
+          controller = c;
+          // One chunk: the page line and any deferred lines that arrived with it.
+          c.enqueue(encoder.encode(first.map((line) => JSON.stringify(line) + '\n').join('')));
+        },
+      }),
+      { headers: { 'content-type': 'application/x-ndjson', 'X-VoidPages': 'true' } },
+    );
+    return {
+      response,
+      send(line: object) {
+        controller.enqueue(encoder.encode(JSON.stringify(line) + '\n'));
+      },
+    };
+  }
+
+  const pageB = {
+    component: 'b',
+    props: { title: 'B', stats: null, usage: null },
+    deferredKeys: { stats: 'stats', usage: 'usage' },
+    url: '/b',
+    errors: null,
+  };
+
+  const routes = (url: string) => (url === '/b' ? 'b' : url === '/c' ? 'c' : 'home');
+
+  function initialPage(payload: object) {
+    vi.mocked(document.getElementById).mockImplementation((id: string) => {
+      if (id === '__VOID_PAGE_DATA__') {
+        return { textContent: JSON.stringify(payload) } as HTMLElement;
+      }
+      if (id === 'app') {
+        return { getAttribute: vi.fn(() => null) } as unknown as HTMLElement;
+      }
+      return null;
+    });
+  }
+
+  /** Holds each history write of a direct visit until the test releases it. */
+  function holdHistoryWrites() {
+    const writes: Array<() => void> = [];
+    window.navigation.navigate = ((url: string) => {
+      const committed = new Promise<{ key: string }>((resolve) => {
+        writes.push(() => {
+          const target = new URL(url, 'http://localhost');
+          window.location.pathname = target.pathname;
+          window.location.search = target.search;
+          resolve({ key: `entry:${url}` });
+        });
+      });
+      return { committed, finished: committed };
+    }) as unknown as typeof window.navigation.navigate;
+    return writes;
+  }
+
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const resolveHtmlDeferred = (group: string, data: unknown) =>
+    (window as unknown as DeferredTestWindow).__resolveDeferred(group, data);
+
+  it('does not send a pending visit’s deferred group to the page on screen before it renders', async () => {
+    stubClientGlobals();
+    initialPage({ component: 'home', props: { title: 'A' } });
+    const stream = ndjson([pageB, { __deferred: 'stats', data: 42 }]);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => stream.response),
+    );
+    const component = controlledPromise<{ default: unknown }>();
+    const { state, adapter, misdirected } = ownershipAdapter();
+    const created = await createTestRouter({
+      adapter,
+      components: { home: loadComponent, b: () => component.promise },
+      matchRoute: routes,
+    });
+    state.applied = created.initialPageData.props;
+
+    const visit = created.router.visit('/b');
+    await vi.waitFor(() => expect(state.resolutions).toHaveLength(1));
+    await tick();
+
+    // A is still on screen: B's group may settle B's refs, but must not reach A.
+    expect(state.applied?.title).toBe('A');
+    expect(misdirected()).toEqual([]);
+
+    component.resolve({ default: {} });
+    await visit;
+    expect(state.applied?.title).toBe('B');
+    expect(state.applied?.stats).toEqual({ loading: false, value: 42, error: null });
+  });
+
+  it('sends a deferred group to its page once that page is on screen', async () => {
+    stubClientGlobals();
+    initialPage({ component: 'home', props: { title: 'A' } });
+    const stream = ndjson([pageB]);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => stream.response),
+    );
+    const { state, adapter, misdirected } = ownershipAdapter();
+    const created = await createTestRouter({
+      adapter,
+      components: { home: loadComponent, b: loadComponent },
+      matchRoute: routes,
+    });
+    state.applied = created.initialPageData.props;
+
+    await created.router.visit('/b');
+    stream.send({ __deferred: 'stats', data: 42 });
+    await vi.waitFor(() => expect(state.updates).toHaveLength(1));
+
+    expect(state.updates).toEqual([{ target: 'B', applied: 'B' }]);
+    expect(misdirected()).toEqual([]);
+    expect(state.applied?.stats).toEqual({ loading: false, value: 42, error: null });
+  });
+
+  it('does not send a superseded visit’s deferred groups to the page on screen or to its successor', async () => {
+    stubClientGlobals();
+    initialPage({ component: 'home', props: { title: 'A' } });
+    const stream = ndjson([pageB]);
+    const responseC = controlledPromise<Response>();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) => (url === '/b' ? Promise.resolve(stream.response) : responseC.promise)),
+    );
+    // B's shell resolves, and its render waits for a view transition frame.
+    const callbacks: Array<() => Promise<void>> = [];
+    Object.assign(document, {
+      startViewTransition(callback: () => unknown) {
+        const updateCallbackDone = new Promise<void>((resolve) => {
+          callbacks.push(async () => {
+            await callback();
+            resolve();
+          });
+        });
+        return { updateCallbackDone, ready: updateCallbackDone, finished: updateCallbackDone };
+      },
+    });
+    const writes = holdHistoryWrites();
+    const { state, adapter, misdirected } = ownershipAdapter();
+    const created = await createTestRouter({
+      adapter,
+      components: { home: loadComponent, b: loadComponent, c: loadComponent },
+      matchRoute: routes,
+    });
+    state.applied = created.initialPageData.props;
+
+    const visitB = created.router.visit('/b', { viewTransition: true }).catch(() => undefined);
+    await vi.waitFor(() => expect(callbacks).toHaveLength(1));
+    const visitC = created.router.visit('/c', { method: 'POST' });
+
+    // C is loading and A is on screen. B lost the navigation before it rendered.
+    stream.send({ __deferred: 'stats', data: 1 });
+    await vi.waitFor(() => expect(state.resolutions).toHaveLength(1));
+    await tick();
+    expect(state.applied?.title).toBe('A');
+    const whileLoading = misdirected();
+
+    await callbacks[0]!();
+    responseC.resolve(pageJson({ component: 'c', props: { title: 'C' }, url: '/c', errors: null }));
+    await vi.waitFor(() => expect(state.applied?.title).toBe('C'));
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+
+    // C is on screen and writes its history entry; B's stream is still open.
+    stream.send({ __deferred: 'usage', data: 2 });
+    await tick();
+    const whileCommitting = misdirected().slice(whileLoading.length);
+
+    writes[0]!();
+    await visitC;
+    await visitB;
+    // C's commit disposed B: B's later groups reach nothing.
+    const updates = state.updates.length;
+    stream.send({ __deferred: 'stats', data: 3 });
+    await tick();
+    expect(state.updates).toHaveLength(updates);
+    expect({ whileLoading, whileCommitting }).toEqual({ whileLoading: [], whileCommitting: [] });
+  });
+
+  it('does not send a committed page’s deferred groups to its successor before that commits', async () => {
+    stubClientGlobals();
+    initialPage({ component: 'home', props: { title: 'A' } });
+    const stream = ndjson([pageB]);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) =>
+        Promise.resolve(
+          url === '/b'
+            ? stream.response
+            : pageJson({ component: 'c', props: { title: 'C' }, url: '/c', errors: null }),
+        ),
+      ),
+    );
+    const writes = holdHistoryWrites();
+    const { state, adapter, misdirected } = ownershipAdapter();
+    const created = await createTestRouter({
+      adapter,
+      components: { home: loadComponent, b: loadComponent, c: loadComponent },
+      matchRoute: routes,
+    });
+    state.applied = created.initialPageData.props;
+
+    const visitB = created.router.visit('/b');
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    writes[0]!();
+    await visitB;
+    stream.send({ __deferred: 'stats', data: 1 });
+    await vi.waitFor(() => expect(state.updates).toHaveLength(1));
+    expect(misdirected()).toEqual([]);
+
+    // An action renders C, then writes its entry. B's stream is still open meanwhile.
+    const visitC = created.router.visit('/c', { method: 'POST' });
+    await vi.waitFor(() => expect(writes).toHaveLength(2));
+    expect(state.applied?.title).toBe('C');
+    stream.send({ __deferred: 'usage', data: 2 });
+    await tick();
+    const whileCommitting = misdirected();
+
+    writes[1]!();
+    await visitC;
+    expect(whileCommitting).toEqual([]);
+  });
+
+  it('does not send the initial page’s streamed HTML groups to the page that replaces it', async () => {
+    stubClientGlobals();
+    initialPage({
+      component: 'home',
+      props: { title: 'A', stats: null },
+      deferredKeys: { stats: 'stats' },
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        pageJson({ component: 'c', props: { title: 'C' }, url: '/c', errors: null }),
+      ),
+    );
+    const writes = holdHistoryWrites();
+    const { state, adapter, misdirected } = ownershipAdapter();
+    const created = await createTestRouter({
+      adapter,
+      components: { home: loadComponent, c: loadComponent },
+      matchRoute: routes,
+    });
+    state.applied = created.initialPageData.props;
+    created.start();
+
+    const visitC = created.router.visit('/c', { method: 'POST' });
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    expect(state.applied?.title).toBe('C');
+    // The document's inline script settles A's group while C writes its entry.
+    resolveHtmlDeferred('stats', 1);
+    const whileCommitting = misdirected();
+
+    writes[0]!();
+    await visitC;
+    expect(whileCommitting).toEqual([]);
+  });
+
+  it('sends preserved deferred values to the action’s page, not to the props it replaced', async () => {
+    stubClientGlobals();
+    initialPage({
+      component: 'home',
+      props: { title: 'A', stats: null },
+      deferredKeys: { stats: 'stats' },
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        pageJson({
+          component: 'home',
+          props: { title: 'A2', stats: null },
+          url: '/x',
+          errors: null,
+        }),
+      ),
+    );
+    const writes = holdHistoryWrites();
+    const { state, adapter, misdirected } = ownershipAdapter();
+    const created = await createTestRouter({ adapter, matchRoute: routes });
+    state.applied = created.initialPageData.props;
+    created.start();
+
+    // The action's page keeps A's pending `stats` ref, then writes its own entry.
+    const action = created.router.visit('/x', { method: 'POST' });
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    expect(state.applied?.title).toBe('A2');
+    resolveHtmlDeferred('stats', 7);
+    const whileCommitting = misdirected();
+
+    writes[0]!();
+    await action;
+    // Once committed, the preserved value reaches the action's page.
+    expect(state.applied?.stats).toEqual({ loading: false, value: 7, error: null });
+    expect(state.updates.at(-1)).toEqual({ target: 'A2', applied: 'A2' });
+    expect(whileCommitting).toEqual([]);
+  });
+
+  it('keeps preserved values flowing to the action’s page after it commits', async () => {
+    stubClientGlobals();
+    initialPage({
+      component: 'home',
+      props: { title: 'A', stats: null },
+      deferredKeys: { stats: 'stats' },
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        pageJson({ component: 'home', props: { title: 'A2', stats: null }, errors: null }),
+      ),
+    );
+    const { state, adapter, misdirected } = ownershipAdapter();
+    const created = await createTestRouter({ adapter, matchRoute: routes });
+    state.applied = created.initialPageData.props;
+    created.start();
+
+    await created.router.visit('/', { method: 'POST' });
+    resolveHtmlDeferred('stats', 7);
+
+    expect(state.applied?.title).toBe('A2');
+    expect(state.applied?.stats).toEqual({ loading: false, value: 7, error: null });
+    expect(state.updates.at(-1)).toEqual({ target: 'A2', applied: 'A2' });
+    expect(misdirected()).toEqual([]);
+  });
+
+  it('does not send a pending visit’s groups to a page that kept preserved values', async () => {
+    stubClientGlobals();
+    initialPage({
+      component: 'home',
+      props: { title: 'A', stats: null },
+      deferredKeys: { stats: 'stats' },
+    });
+    const stream = ndjson([pageB, { __deferred: 'stats', data: 42 }]);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) =>
+        url === '/b'
+          ? stream.response
+          : pageJson({ component: 'home', props: { title: 'A2', stats: null }, errors: null }),
+      ),
+    );
+    const component = controlledPromise<{ default: unknown }>();
+    const { state, adapter, misdirected } = ownershipAdapter();
+    const created = await createTestRouter({
+      adapter,
+      components: { home: loadComponent, b: () => component.promise },
+      matchRoute: routes,
+    });
+    state.applied = created.initialPageData.props;
+    await created.router.visit('/', { method: 'POST' });
+    expect(state.applied?.title).toBe('A2');
+
+    const visit = created.router.visit('/b');
+    await vi.waitFor(() => expect(state.resolutions.filter((r) => r.value === 42)).toHaveLength(1));
+    await tick();
+    const beforeRender = misdirected();
+    // The page that kept A's ref still receives its own group while B loads.
+    resolveHtmlDeferred('stats', 7);
+    expect(state.applied?.title).toBe('A2');
+    expect(state.applied?.stats).toEqual({ loading: false, value: 7, error: null });
+
+    component.resolve({ default: {} });
+    await visit;
+    expect(beforeRender).toEqual([]);
+  });
+
+  it('applies a prefetched page’s resolved deferred values without notifying the page on screen', async () => {
+    stubClientGlobals();
+    initialPage({ component: 'home', props: { title: 'A' } });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        pageJson({
+          component: 'b',
+          props: { title: 'B', stats: 42, usage: 1 },
+          deferredKeys: { stats: 'stats', usage: 'usage' },
+          url: '/b',
+          errors: null,
+        }),
+      ),
+    );
+    const component = controlledPromise<{ default: unknown }>();
+    const { state, adapter, misdirected } = ownershipAdapter();
+    const created = await createTestRouter({
+      adapter,
+      components: { home: loadComponent, b: () => component.promise },
+      matchRoute: routes,
+    });
+    state.applied = created.initialPageData.props;
+
+    await created.router.prefetch('/b');
+    const visit = created.router.visit('/b');
+    await vi.waitFor(() => expect(state.resolutions).toHaveLength(2));
+    await tick();
+    expect(state.applied?.title).toBe('A');
+    expect(state.updates).toEqual([]);
+
+    component.resolve({ default: {} });
+    await visit;
+    expect(state.applied?.title).toBe('B');
+    expect(state.applied?.stats).toEqual({ loading: false, value: 42, error: null });
+    expect(misdirected()).toEqual([]);
+  });
+});

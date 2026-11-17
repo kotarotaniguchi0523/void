@@ -263,6 +263,8 @@ export async function createPageNavigationEngine(
   let _committedResource: PageNavigationResource | null = null;
   let _committedDeferredRegistry: DeferredRegistry | null = null;
   let _htmlDeferredRegistry: DeferredRegistry | null = null;
+  /** The registry of the page the adapter has applied: the only one that notifies it. */
+  let _renderedDeferredRegistry: DeferredRegistry | null = null;
   let _currentFetchUrl = window.location.pathname + window.location.search;
   let browserVisitHandler: ApplyVisit | null = null;
   let locationHandler: (() => void) | null = null;
@@ -335,6 +337,15 @@ export async function createPageNavigationEngine(
     createPageComponentLoader(config);
 
   const _resourceDeferredRegistries = new WeakMap<PageNavigationResource, DeferredRegistry>();
+
+  function showDeferredRegistry(registry: DeferredRegistry | null): void {
+    if (_renderedDeferredRegistry === registry) {
+      return;
+    }
+    _renderedDeferredRegistry?.setOnScreen(false);
+    _renderedDeferredRegistry = registry;
+    registry?.setOnScreen(true);
+  }
   const _preservedDeferredResources = new WeakMap<DeferredRegistry, PageNavigationResource>();
 
   const staticPageData = createStaticPageDataLoader({ components, routeMeta, matchRoute });
@@ -769,6 +780,9 @@ export async function createPageNavigationEngine(
       if (!ownsCommit()) {
         return false;
       }
+      // The adapter applies a page before it commits it: from here this visit's
+      // Deferred values reach the page on screen, and no other registry's do.
+      showDeferredRegistry(deferredRegistry);
       // Mutations that update the current page keep scroll. A redirect's GET
       // response or an action that opens another page follows normal navigation.
       const preserveScroll =
@@ -794,9 +808,12 @@ export async function createPageNavigationEngine(
               ? window.navigation.currentEntry?.key
               : await publishEntry(historyUrl, replaceHistory);
           if (!ownsCommit()) {
+            // The adapter puts the committed page back, or renders the newer visit.
+            showDeferredRegistry(_committedDeferredRegistry);
             return false;
           }
         } catch (error) {
+          showDeferredRegistry(_committedDeferredRegistry);
           if (_pendingResource?.id === resourceId) {
             _pendingResource = null;
           }
@@ -841,6 +858,8 @@ export async function createPageNavigationEngine(
         _preservedDeferredResources.set(preservedDeferredRegistry, previousResource);
       }
       _committedDeferredRegistry = preservedDeferredRegistry ?? deferredRegistry;
+      // Preserved values now belong to this page's props: their registry notifies it.
+      showDeferredRegistry(_committedDeferredRegistry);
       const preservedDeferredResource = previousDeferredRegistry
         ? _preservedDeferredResources.get(previousDeferredRegistry)
         : undefined;
@@ -909,6 +928,7 @@ export async function createPageNavigationEngine(
   initialDeferredRegistry.setup(initialPageData);
   _committedDeferredRegistry = initialDeferredRegistry;
   _htmlDeferredRegistry = initialDeferredRegistry;
+  showDeferredRegistry(initialDeferredRegistry);
 
   function isClientPage(url: URL): boolean {
     if (!isSameOriginPageUrl(url)) {

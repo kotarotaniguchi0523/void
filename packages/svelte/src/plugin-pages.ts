@@ -162,6 +162,8 @@ const pageStore = writable(null);
 const boundaryGenerationStore = writable(0);
 const pageIdStore = writable("");
 const propsStore = writable({});
+// The props object of the page applied last. Deferred updates for other props are not this page's.
+let appliedProps = null;
 const layoutsStore = writable([]);
 const sharedStore = writable({});
 const paramsStore = writable({});
@@ -183,6 +185,7 @@ const { router, initialPageData, initialComponent, initialLayouts, start, commit
         flushSync(() => {
           boundaryGenerationStore.update(n => n + 1);
           pageIdStore.set(pageData.component);
+          appliedProps = pageData.props;
           propsStore.set(pageData.props);
           sharedStore.set(pageData.shared || {});
           routeParams = pageData.params || {};
@@ -192,6 +195,7 @@ const { router, initialPageData, initialComponent, initialLayouts, start, commit
         });
       },
       onDeferredUpdate(props) {
+        if (props !== appliedProps) return;
         propsStore.set({ ...props });
       },
     },
@@ -217,6 +221,7 @@ setActionRouter(router);
 
 pageIdStore.set(initialPageData.component);
 pageStore.set(initialComponent);
+appliedProps = initialPageData.props;
 propsStore.set(initialPageData.props);
 layoutsStore.set(initialLayouts);
 sharedStore.set(initialPageData.shared || {});

@@ -165,6 +165,8 @@ ${generateComponentManifest(scan, pagesDir)}
 // A new page object re-creates the page; props alone update it in place.
 const [page, setPage] = createSignal({ component: null });
 const [pageProps, setPageProps] = createSignal({});
+// The props object of the page applied last. Deferred updates for other props are not this page's.
+let appliedProps = null;
 const [boundaryGeneration, setBoundaryGeneration] = createSignal(0);
 const [layouts, setLayouts] = createSignal([]);
 const shared = createMutable({});
@@ -206,6 +208,7 @@ const { router, initialPageData, initialComponent, initialLayouts, start, commit
         batch(() => {
           setBoundaryGeneration(n => n + 1);
           if (!keep) setPage({ component: comp, id: pageData.component });
+          appliedProps = pageData.props;
           setPageProps(pageData.props);
           setLayouts(layoutComps);
           replaceInPlace(shared, pageData.shared);
@@ -215,6 +218,7 @@ const { router, initialPageData, initialComponent, initialLayouts, start, commit
         });
       },
       onDeferredUpdate(props) {
+        if (props !== appliedProps) return;
         batch(() => { setPageProps({ ...props }); });
       },
     },
@@ -239,6 +243,7 @@ setActionRouter(router);
 
 batch(() => {
   setPage({ component: initialComponent, id: initialPageData.component });
+  appliedProps = initialPageData.props;
   setPageProps(initialPageData.props);
   setLayouts(initialLayouts);
   replaceInPlace(shared, initialPageData.shared);

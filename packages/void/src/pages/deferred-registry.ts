@@ -18,6 +18,9 @@ export class DeferredRegistry {
   private groups: Record<string, Array<string>> = {};
   private preservedSource: DeferredRegistry | null = null;
   private preservedKeys: Set<string> | null = null;
+  /** Only the registry of the page on screen notifies the adapter; the others settle silently. */
+  private onScreen = false;
+  private missedUpdate = false;
 
   constructor(adapter: VoidRouterAdapter) {
     this.adapter = adapter;
@@ -46,6 +49,26 @@ export class DeferredRegistry {
       this.props[key] = value;
       (this.groups[group] ??= []).push(key);
     }
+  }
+
+  /**
+   * Whether this registry's props are the page the adapter has applied. A registry that
+   * settled values while off screen notifies once when its page is applied.
+   */
+  setOnScreen(onScreen: boolean): void {
+    this.onScreen = onScreen;
+    if (onScreen && this.missedUpdate && this.active) {
+      this.notify();
+    }
+  }
+
+  private notify(): void {
+    if (!this.onScreen) {
+      this.missedUpdate = true;
+      return;
+    }
+    this.missedUpdate = false;
+    this.adapter.onDeferredUpdate?.(this.props);
   }
 
   preserveValuesFrom(source: DeferredRegistry | null, pageData: PageData): void {
@@ -92,7 +115,7 @@ export class DeferredRegistry {
       this.rejectGroup(group, typeof error === 'string' ? error : String(error));
     }
 
-    this.adapter.onDeferredUpdate?.(this.props);
+    this.notify();
   }
 
   rejectPending(error: string, notify = true): void {
@@ -108,7 +131,7 @@ export class DeferredRegistry {
       }
     }
     if (notify) {
-      this.adapter.onDeferredUpdate?.(this.props);
+      this.notify();
     }
   }
 
@@ -134,7 +157,7 @@ export class DeferredRegistry {
     // Keys dropped from keyRefs are skipped when the group settles.
     this.props = props;
     this.keyRefs = keyRefs;
-    this.adapter.onDeferredUpdate?.(this.props);
+    this.notify();
   }
 
   /** A one-key group takes the raw value; a larger group takes each key from the object. */
